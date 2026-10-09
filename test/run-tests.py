@@ -7,11 +7,13 @@
   [1] moyu.parse     指令解析三态（识别 / 参数不认识 / 非指令）
   [2] moyu.draw      抽签、默认池、分类池、防重复、上限
   [3] store          状态机、统计、前缀查找、老库迁移
-  [4] bot            文本清洗、搜索打分、动态帮助、日志轮转、PID 判活
-  [5] send_file      文件类型识别、文本类判定
+  [4] bot            文本清洗、搜索打分、动态帮助、日志轮转、PID 判活、群/私聊会话标识
+  [5] send_file      文件类型识别、文本类判定、群/单聊目标路径、last_msg 兼容
   [6] md2img         依赖定位（node / 浏览器候选探测）
   [7] ideas-bubbles  页面生成、--serve API、--apply、防重叠源码护栏
   [8] extensions     扩展注册表、加载容错、example.py 模板不注册指令
+  [9] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
+ [10] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
 
 🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json**。
 """
@@ -24,9 +26,11 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -227,6 +231,71 @@ def test_bot():
     check("PID_FILE 在仓库目录下",
           os.path.dirname(bot.PID_FILE) == os.path.dirname(bot.LAST_MSG_FILE))
 
+    # 群 / 单聊统一会话标识
+    grp = SimpleNamespace(group_openid="G1", author=SimpleNamespace(member_openid="M1"))
+    c2c = SimpleNamespace(author=SimpleNamespace(user_openid="U1"))
+    gt = bot.chat_target(grp, bot.SCOPE_GROUP)
+    check("chat_target 群：key=group:<id>", gt["key"] == "group:G1", f"got={gt}")
+    check("chat_target 群：落库 id/发送目标/发送者",
+          gt["store_id"] == "G1" and gt["openid"] == "G1" and gt["sender_id"] == "M1",
+          f"got={gt}")
+    ct = bot.chat_target(c2c, bot.SCOPE_C2C)
+    check("chat_target 私聊：key=c2c:<id>", ct["key"] == "c2c:U1", f"got={ct}")
+    check("chat_target 私聊：落库 group_id/name 与发送目标",
+          ct["store_id"] == "c2c:U1" and ct["store_name"] == "私聊"
+          and ct["openid"] == "U1" and ct["sender_id"] == "U1",
+          f"got={ct}")
+    check("chat_target 群/私聊 key 不撞车", gt["key"] != ct["key"])
+
+    # save_last_msg 带 scope（写临时文件，不碰真实缓存）
+    _orig_last = bot.LAST_MSG_FILE
+    _tmpd = tempfile.mkdtemp(prefix="bot_lastmsg_")
+    try:
+        bot.LAST_MSG_FILE = os.path.join(_tmpd, "last.json")
+        bot.save_last_msg("U9", "MSG9", scope="c2c")
+        with open(bot.LAST_MSG_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        check("save_last_msg 记 scope/openid/msg_id",
+              d["scope"] == "c2c" and d["openid"] == "U9" and d["msg_id"] == "MSG9",
+              f"got={d}")
+        check("save_last_msg 兼容 group_openid 旧读法", d.get("group_openid") == "U9")
+        bot.save_last_msg("", "MSG", scope="c2c")
+        check("save_last_msg 空 openid 不写", json.load(open(bot.LAST_MSG_FILE, encoding="utf-8"))["msg_id"] == "MSG9")
+    finally:
+        bot.LAST_MSG_FILE = _orig_last
+        shutil.rmtree(_tmpd, ignore_errors=True)
+
+    # 私聊入口的源码级护栏
+    bot_src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("bot.py 注册了 on_c2c_message_create", "on_c2c_message_create" in bot_src)
+    check("bot.py 私聊走 SCOPE_C2C", "scope=SCOPE_C2C" in bot_src)
+    check("self_test 落盘走临时库（不污染真实 memos.db）",
+          "selftest.db" in bot_src and "_store.DB = orig_db" in bot_src)
+
+    # 私聊落库字段（handle_event 是模块级函数，可直接端到端验证）
+    import store as _store
+    _orig_db = _store.DB
+    _tmpd2 = tempfile.mkdtemp(prefix="bot_c2c_")
+    try:
+        _store.DB = os.path.join(_tmpd2, "t.db")
+        _store.init()
+        ct = bot.chat_target(c2c, bot.SCOPE_C2C)
+        r = bot.handle_event(ct["store_id"], ct["store_name"], ct["sender_id"], "",
+                             "备忘 私聊测试")
+        check("私聊「备忘」落库 kind=memo", bool(r) and r["kind"] == "memo", f"got={r}")
+        rows = _store.list_memos(10)
+        check("私聊记录 group_id=c2c:<openid> / group_name=私聊",
+              rows and rows[0]["group_id"] == "c2c:U1" and rows[0]["group_name"] == "私聊",
+              f"got={rows[:1]}")
+        idea = _store.add_memo(ct["store_id"], ct["store_name"], ct["sender_id"], "",
+                               "私聊随手一句", kind=_store.KIND_IDEA)
+        check("私聊灵感 kind=idea / status=open",
+              idea["kind"] == "idea"
+              and _store.list_ideas(_store.STATUS_OPEN)[0]["group_id"] == "c2c:U1")
+    finally:
+        _store.DB = _orig_db
+        shutil.rmtree(_tmpd2, ignore_errors=True)
+
 
 # ── [5] send_file ───────────────────────────────────────────────
 def test_send_file():
@@ -247,6 +316,39 @@ def test_send_file():
     check("is_text_file(.png) 假", not sf.is_text_file("a.png"))
     check("CLI_SEQ_BASE 避开 bot 的 1~3", sf.CLI_SEQ_BASE > 3,
           f"got={sf.CLI_SEQ_BASE}")
+
+    # 群 / 单聊目标路径
+    check("target_seg 群 → groups/<id>", sf.target_seg("group", "G1") == "groups/G1",
+          f"got={sf.target_seg('group', 'G1')}")
+    check("target_seg 单聊 → users/<id>", sf.target_seg("c2c", "U1") == "users/U1",
+          f"got={sf.target_seg('c2c', 'U1')}")
+
+    sf_src = open(os.path.join(ROOT, "send_file.py"), encoding="utf-8").read()
+    check("send_file.py 不再写死 /v2/groups/", "/v2/groups/" not in sf_src)
+
+    # load_last_msg：旧格式（只有 group_openid）按群处理；新格式认 scope
+    _orig = sf.LAST_MSG_FILE
+    _d = tempfile.mkdtemp(prefix="sf_last_")
+    try:
+        p = Path(_d) / "last.json"
+        sf.LAST_MSG_FILE = p
+        now = time.time()
+        p.write_text(json.dumps({"group_openid": "G1", "msg_id": "M1", "ts": now}),
+                     encoding="utf-8")
+        d = sf.load_last_msg()
+        check("load_last_msg 旧格式 → scope=group/openid=G1",
+              d and d["scope"] == "group" and d["openid"] == "G1", f"got={d}")
+        p.write_text(json.dumps({"scope": "c2c", "openid": "U1", "msg_id": "M2", "ts": now}),
+                     encoding="utf-8")
+        d = sf.load_last_msg()
+        check("load_last_msg 新格式 → scope=c2c/openid=U1",
+              d and d["scope"] == "c2c" and d["openid"] == "U1", f"got={d}")
+        p.write_text(json.dumps({"scope": "c2c", "openid": "U1", "msg_id": "M2", "ts": 0}),
+                     encoding="utf-8")
+        check("load_last_msg 过期返回 None", sf.load_last_msg() is None)
+    finally:
+        sf.LAST_MSG_FILE = _orig
+        shutil.rmtree(_d, ignore_errors=True)
 
 
 # ── [6] md2img ──────────────────────────────────────────────────
@@ -448,6 +550,204 @@ def _raises(fn):
         return True
 
 
+# ── [9] ignore（忽略表）─────────────────────────────────────────
+def test_ignore():
+    print("\n[9] 忽略表（抄海豹骰子 .botlist）")
+    import ignore
+
+    tmp = tempfile.mkdtemp(prefix="ignore_test_")
+    _orig_file = os.environ.get("MEMO_IGNORE_FILE")
+    _orig_env = os.environ.get("MEMO_IGNORE")
+    os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
+    os.environ["MEMO_IGNORE"] = "测试机器人， 别的bot ,"
+    try:
+        # env 解析：中英文逗号、去空白、丢空项
+        check("env_rules 解析中英逗号并去空",
+              ignore.env_rules() == ["测试机器人", "别的bot"], f"got={ignore.env_rules()}")
+
+        check("file_rules 文件不存在返回 []", ignore.file_rules() == [])
+
+        p = ignore.file_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"rules": ["A", " B ", ""]}, f, ensure_ascii=False)
+        check('file_rules 认 {"rules": [...]} 并去空白',
+              ignore.file_rules() == ["A", "B"], f"got={ignore.file_rules()}")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(["X", "Y"], f, ensure_ascii=False)
+        check("file_rules 认裸 list",
+              ignore.file_rules() == ["X", "Y"], f"got={ignore.file_rules()}")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{ 坏 json")
+        check("file_rules 坏文件不抛、返回 []", ignore.file_rules() == [])
+
+        # rules()：env 优先 + 忽略大小写去重 + 保序
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"rules": ["别的BOT", "新增"]}, f, ensure_ascii=False)
+        check("rules env 优先 + 忽略大小写去重",
+              ignore.rules() == ["测试机器人", "别的bot", "新增"], f"got={ignore.rules()}")
+
+        # match：子串（忽略大小写）/ 发送者 id / 未命中
+        check("match 子串命中",
+              ignore.match("【测试机器人】这个文件我没能收下") == "测试机器人")
+        check("match 子串忽略大小写（规则里是大写）",
+              ignore.match("【别的BOT】上线了") == "别的bot")
+        check("match 发送者 id 完全相等",
+              ignore.match("随便说点什么", sender_id="别的bot") == "别的bot")
+        check("match 未命中返回 None", ignore.match("今天天气不错") is None)
+
+        # is_command：收紧，避免「忽略这个 bug」被当成指令
+        check("is_command 裸「忽略」", ignore.is_command("忽略") is True)
+        check("is_command「忽略 空格」", ignore.is_command("忽略 测试机器人") is True)
+        check("is_command「忽略：冒号」", ignore.is_command("忽略：xx") is True)
+        check("is_command「忽略这个bug」不算", ignore.is_command("忽略这个bug") is False)
+        check("is_command 普通指令不算", ignore.is_command("备忘 xx") is False)
+
+        # 指令：列表 / 新增 / 删除 / 清空
+        check("handle 裸「忽略」→ 列表", "忽略表" in ignore.handle_command("忽略"))
+        check("handle「忽略 列表」→ 列表", "忽略表" in ignore.handle_command("忽略 列表"))
+        r = ignore.handle_command("忽略 循环机器人")
+        check("handle 新增写盘", "循环机器人" in ignore.file_rules(),
+              f"got={ignore.file_rules()}")
+        check("handle 新增回执含规则名", "循环机器人" in r)
+        check("新增后 match 生效", ignore.match("循环机器人说了一句话") == "循环机器人")
+        r = ignore.handle_command("忽略 删除 循环机器人")
+        check("handle 删除移除规则", "循环机器人" not in ignore.file_rules())
+        check("删除回执", "已移除" in r)
+
+        r = ignore.handle_command("忽略 a")
+        check("过短规则被拒", "太短" in r and "a" not in ignore.file_rules(), f"got={r!r}")
+
+        r = ignore.handle_command("忽略 删除 测试机器人")
+        check("env 规则指令删不掉",
+              "MEMO_IGNORE" in r and "测试机器人" in ignore.rules())
+
+        ignore.handle_command("忽略 加一条")
+        ignore.handle_command("忽略 清空")
+        check("清空只清 ignore.json，env 仍在",
+              ignore.file_rules() == [] and ignore.rules() == ["测试机器人", "别的bot"],
+              f"got={ignore.rules()}")
+    finally:
+        if _orig_file is None:
+            os.environ.pop("MEMO_IGNORE_FILE", None)
+        else:
+            os.environ["MEMO_IGNORE_FILE"] = _orig_file
+        if _orig_env is None:
+            os.environ.pop("MEMO_IGNORE", None)
+        else:
+            os.environ["MEMO_IGNORE"] = _orig_env
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # bot.py 接线护栏
+    import bot
+    bot_src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("bot.py 接入了忽略闸门", "_ignore.match(" in bot_src)
+    check("bot.py 放行「忽略」指令", "_ignore.is_command(" in bot_src)
+    check("帮助菜单含「忽略」", "忽略" in bot.help_text())
+
+
+# ── [10] route_message（真实路由）───────────────────────────────
+def test_route():
+    print("\n[10] route_message 路由（忽略闸门 / 指令分发端到端）")
+    import asyncio
+    import bot
+    import ignore
+    import store
+
+    class Msg:
+        """假消息：字段名与 botpy 的 GroupMessage / C2CMessage 对齐。"""
+
+        def __init__(self, content, gid="G1", mid="MSG1", sid="M1", uid=None):
+            self.content = content
+            self.id = mid
+            self.group_openid = gid
+            self.author = SimpleNamespace(member_openid=sid, user_openid=uid)
+            self.replies = []
+
+        async def reply(self, content=None, msg_seq=1):
+            self.replies.append(content)
+
+    class Client:
+        async def send_file_to_chat(self, *a, **k):
+            raise AssertionError("本用例不应走到发文件分支")
+
+    tmp = tempfile.mkdtemp(prefix="route_test_")
+    _env = {k: os.environ.get(k) for k in ("MEMO_IGNORE", "MEMO_IGNORE_FILE")}
+    _orig_db, _orig_last = store.DB, bot.LAST_MSG_FILE
+    os.environ["MEMO_IGNORE"] = "测试机器人"
+    os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
+    store.DB = os.path.join(tmp, "t.db")
+    bot.LAST_MSG_FILE = os.path.join(tmp, "last.json")
+    try:
+        store.init()
+        cli = Client()
+
+        def run(msg, mentioned=True, scope=bot.SCOPE_GROUP):
+            asyncio.run(bot.route_message(cli, msg, mentioned, scope))
+
+        # 1) 命中忽略规则 → 静默跳过（不收灵感、不回复）
+        m = Msg("【测试机器人】这个文件我没能收下")
+        run(m)
+        check("命中忽略：不回复", m.replies == [], f"got={m.replies}")
+        check("命中忽略：不收灵感", store.list_ideas(store.STATUS_OPEN) == [])
+
+        # 2) 「忽略」指令本身必须放行（否则会被自己的规则吃掉）
+        m = Msg("忽略 列表")
+        run(m)
+        check("「忽略 列表」有回复", bool(m.replies) and "忽略表" in m.replies[0],
+              f"got={m.replies}")
+        check("「忽略」指令不落库", store.list_ideas(store.STATUS_OPEN) == [])
+
+        # 3) 指令新增规则 → 立刻生效
+        m = Msg("忽略 循环机器人")
+        run(m)
+        check("指令新增规则写盘", "循环机器人" in ignore.file_rules(),
+              f"got={ignore.file_rules()}")
+        m = Msg("循环机器人说：大家好")
+        run(m, mentioned=False)
+        check("新规则立即拦下消息",
+              m.replies == [] and store.list_ideas(store.STATUS_OPEN) == [],
+              f"replies={m.replies}")
+
+        # 4) 非 @ 的普通群消息 → 静默收作灵感
+        m = Msg("下周三要交个东西")
+        run(m, mentioned=False)
+        ideas = store.list_ideas(store.STATUS_OPEN)
+        check("非 @ 普通消息静默收作灵感",
+              len(ideas) == 1 and ideas[0]["kind"] == "idea", f"got={ideas}")
+        check("非 @ 普通消息不回复", m.replies == [], f"got={m.replies}")
+
+        # 5) 「备忘」→ 落库 + 回执
+        m = Msg("备忘 明天确认最小实例数")
+        run(m)
+        memos = store.list_memos(10, store.KIND_MEMO)
+        check("「备忘」落库 kind=memo",
+              bool(memos) and memos[0]["kind"] == "memo", f"got={memos[:1]}")
+        check("「备忘」有回执", bool(m.replies) and "已记" in m.replies[0],
+              f"got={m.replies}")
+
+        # 6) @ 场景未识别 → 明确提示
+        m = Msg("这是一句没头没脑的话")
+        run(m)
+        check("@ 未识别给提示", bool(m.replies) and "没认出来" in m.replies[0],
+              f"got={m.replies}")
+
+        # 7) 私聊命中忽略 → 同样静默，不收灵感
+        n_before = len(store.list_ideas(store.STATUS_OPEN))
+        m = Msg("【测试机器人】私聊里也一样", uid="U1")
+        run(m, mentioned=True, scope=bot.SCOPE_C2C)
+        check("私聊命中忽略：静默", m.replies == [], f"got={m.replies}")
+        check("私聊命中忽略：不收灵感",
+              len(store.list_ideas(store.STATUS_OPEN)) == n_before)
+    finally:
+        store.DB, bot.LAST_MSG_FILE = _orig_db, _orig_last
+        for k, v in _env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -460,6 +760,8 @@ def main():
     test_md2img()
     test_ideas_bubbles()
     test_extensions()
+    test_ignore()
+    test_route()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

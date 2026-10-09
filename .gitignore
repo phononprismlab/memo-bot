@@ -9,8 +9,14 @@ last_group_msg.json
 memos.db
 *.db
 *.db-journal
+# 手工备份 / 临时副本（如 memos.db.bak-20261009）
+*.db.bak
+*.db.bak-*
+*.db.*
 # 个人使用状态
 moyu-recent.json
+# 忽略表（含真实群内昵称 / 发送者 openid）
+ignore.json
 
 # ── 运行时产物 ───────────────────────────────────────────────
 __pycache__/

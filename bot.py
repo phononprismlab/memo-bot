@@ -6,10 +6,12 @@
   python bot.py --list        打印最近记录的备忘（本地读取用）
   python bot.py              真实启动 bot（需配置 .env 里的 QQ 凭据）
 
-两条入口：
+三条入口（群与私聊共用同一套指令与识别逻辑）：
   - on_group_at_message_create 群内 @机器人（宽松指令，含「发」「发送」等别名）
   - on_group_message_create    群内全量消息（需群设置「消息范围=全部消息」；只认明确指令）
     注意：botpy 1.2.1 未注册该事件，由 install_group_message_parser() 运行时补上。
+  - on_c2c_message_create      私聊消息（QQ 开放平台需开启「单聊」；无需补解析器，
+    botpy 1.2.1 已注册 C2C_MESSAGE_CREATE）
 """
 import asyncio
 import atexit
@@ -35,6 +37,7 @@ from store import (
 )
 import moyu
 import extensions as _ext
+import ignore as _ignore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_MSG_FILE = os.path.join(HERE, "last_group_msg.json")
@@ -95,13 +98,22 @@ def release_pid_lock():
 
 
 
-def save_last_msg(group_openid, msg_id):
-    """记录最近一条群消息，供「被动回复」兜底用。"""
-    if not group_openid or not msg_id:
+def save_last_msg(openid, msg_id, scope="group"):
+    """记录最近一条消息（群 / 单聊），供「被动回复」兜底用。
+
+    `group_openid` 键保留：send_file.py 的旧读法仍可用。
+    """
+    if not openid or not msg_id:
         return
     try:
         with open(LAST_MSG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"group_openid": group_openid, "msg_id": msg_id, "ts": time.time()}, f)
+            json.dump({
+                "scope": scope,
+                "openid": openid,
+                "group_openid": openid,
+                "msg_id": msg_id,
+                "ts": time.time(),
+            }, f)
     except Exception as e:
         print("save_last_msg failed:", e, flush=True)
 
@@ -144,8 +156,10 @@ HELP_BASE = (
     "查灵感 —— 看还没处理的灵感\n"
     "发文件 <关键词> —— 搜文件并渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
+    "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
+    "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
     "帮助 —— 显示本菜单\n"
-    "（群里不带 @ 的普通发言会自动收作「灵感」，不打扰）"
+    "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰"
 )
 MEMO_LIST_CMDS = {"查备忘", "查看备忘", "备忘列表", "列备忘"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
@@ -168,6 +182,35 @@ def strip_at(text):
     t = _MENTION_ANGLE.sub(" ", text or "")
     t = _MENTION_AT_PREFIX.sub("", t)
     return re.sub(r"[ \t]+", " ", t).strip()
+
+
+# ── 会话标识：群 / 单聊统一 ──────────────────────────────────────
+SCOPE_GROUP = "group"
+SCOPE_C2C = "c2c"
+C2C_GROUP_NAME = "私聊"
+# 私聊里「非指令文本」的处理：True = 回一句「已收作灵感」；False = 静默收（同群内非 @ 语义）
+C2C_ACK_IDEA = False
+
+
+def chat_target(message, scope):
+    """统一群 / 单聊的会话标识，返回 dict：
+
+      key        —— 会话唯一键（PENDING 用；群 `group:<id>` / 单聊 `c2c:<id>`）
+      store_id   —— 落库的 group_id（群 = group_openid；单聊 = `c2c:<user_openid>`）
+      store_name —— 落库的 group_name（群为空；单聊固定「私聊」）
+      openid     —— 发送目标 openid（群 group_openid / 单聊 user_openid）
+      sender_id  —— 发送者 id（群 member_openid / 单聊 user_openid）
+    """
+    if scope == SCOPE_C2C:
+        author = getattr(message, "author", None)
+        openid = (getattr(author, "user_openid", "") or "") if author else ""
+        return {"key": f"c2c:{openid}", "store_id": f"c2c:{openid}",
+                "store_name": C2C_GROUP_NAME, "openid": openid, "sender_id": openid}
+    openid = getattr(message, "group_openid", "") or ""
+    author = getattr(message, "author", None)
+    sid = (getattr(author, "member_openid", "") or "") if author else ""
+    return {"key": f"group:{openid}", "store_id": openid, "store_name": "",
+            "openid": openid, "sender_id": sid}
 
 
 def memo_list_text(limit=10, kind=KIND_MEMO):
@@ -339,20 +382,33 @@ class _FakeEv:
 
 
 def self_test():
-    init()
-    samples = [
-        _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘 明天确认云托管最小实例数"),
-        _FakeEv("123", "示例开发群", "dominik", "dominik", "@机器人 备忘 备案变更还差营业执照"),
-        _FakeEv("123", "示例开发群", "dominik", "dominik", "这只是普通聊天不是备忘"),
-        _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘：把事件系统文档补完"),
-    ]
-    print("=== 模拟群消息识别 ===")
-    for s in samples:
-        r = handle_event(s.group_id, s.group_name, s.sender_id, s.sender_name, s.message)
-        print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非备忘）'}")
-    print("\n=== 当前库内记录 ===")
-    for m in list_memos():
-        print(f"  [{m['created_at']}] {m['group_name']}/{m['sender_name']}: {m['content']}")
+    """本地模拟群消息，验证识别 + 落库逻辑。
+
+    🔴 落盘走**临时库**，不碰真实 `memos.db`（否则每跑一次就污染真实备忘）。
+    """
+    import store as _store
+
+    orig_db = _store.DB
+    tmpdir = tempfile.mkdtemp(prefix="memo_selftest_")
+    _store.DB = os.path.join(tmpdir, "selftest.db")
+    try:
+        init()
+        samples = [
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘 明天确认云托管最小实例数"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "@机器人 备忘 备案变更还差营业执照"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "这只是普通聊天不是备忘"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘：把事件系统文档补完"),
+        ]
+        print("=== 模拟群消息识别 ===")
+        for s in samples:
+            r = handle_event(s.group_id, s.group_name, s.sender_id, s.sender_name, s.message)
+            print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非备忘）'}")
+        print("\n=== 本次模拟落库结果（临时库，已丢弃）===")
+        for m in list_memos():
+            print(f"  [{m['created_at']}] {m['group_name']}/{m['sender_name']}: {m['content']}")
+    finally:
+        _store.DB = orig_db
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def list_mode():
@@ -429,6 +485,148 @@ def setup_file_logging(path):
     return f
 
 
+# ── 路由：@ / 全量 / 私聊 共用 ────────────────────────────────────
+async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
+    """@ / 全量 / 私聊 共用路由。mentioned=False 时只认明确指令，避免误触。
+
+    抽成模块级函数（而非 MemoClient 的方法）是为了能被回归测试直接驱动：
+    `client` 只需提供 send_file_to_chat(message, scope, openid, full, rel, mid)。
+    """
+    t = chat_target(message, scope)
+    gid, mid = t["key"], (getattr(message, "id", "") or "")
+    save_last_msg(t["openid"], mid, scope)
+    raw = getattr(message, "content", "") or ""
+    text = strip_at(raw)
+    if mentioned:
+        # 留原始内容便于排查 @ 占位符的真实编码
+        print(f"[@消息] scope={scope} raw={raw!r} -> text={text!r}", flush=True)
+    if not text:
+        return
+
+    # 0) 忽略表：先放行「忽略」指令本身（否则指令会被自己的规则吃掉），
+    #    再对普通消息做闸门 —— 命中即整条跳过（不收灵感、不响应）。
+    #    抄海豹骰子 `.botlist`：两个 bot 同群时靠这个避免互相收集 / 循环响应。
+    if _ignore.is_command(text):
+        await message.reply(content=_ignore.handle_command(text), msg_seq=1)
+        return
+    hit = _ignore.match(text, t["sender_id"])
+    if hit:
+        print(f"[忽略] scope={scope} hit={hit!r} text={text!r}", flush=True)
+        return
+
+    # 0.5) 有待选文件时，优先解析「选哪个」（序号 / 文件名片段）
+    pend = PENDING.get(gid)
+    if pend and time.time() - pend["ts"] <= PENDING_TTL:
+        choice = resolve_choice(text, pend["matches"])
+        if choice:
+            PENDING.pop(gid, None)
+            await client.send_file_to_chat(
+                message, scope, t["openid"], choice[1], choice[0], mid
+            )
+            return
+
+    # 1) 发文件：搜工作区 → 唯一直接发 / 多个列出来问
+    bare_cmds = BARE_FILE_CMDS if mentioned else {"发文件", "找文件", "发送文件"}
+    if text in bare_cmds:
+        await message.reply(content="告诉我要发什么，例如「发文件 设计说明」", msg_seq=1)
+        return
+    fm = (FILE_SEND_RE if mentioned else EXPLICIT_FILE_RE).match(text)
+    if fm:
+        q = fm.group(1).strip()
+        matches = search_files(q)
+        if not matches:
+            await message.reply(
+                content=f"（没找到含「{q}」的文件，已搜配置的根目录）", msg_seq=1
+            )
+            return
+        if len(matches) == 1:
+            await client.send_file_to_chat(
+                message, scope, t["openid"], matches[0][1], matches[0][0], mid
+            )
+            return
+        PENDING[gid] = {"matches": matches, "ts": time.time()}
+        await message.reply(
+            content=file_list_text(matches, len(matches) >= SEARCH_LIMIT), msg_seq=1
+        )
+        return
+
+    # 1.5) 本地扩展指令（extensions/ 下；自定义指令不进公开仓库）
+    #      处理器同步执行（放线程，阻塞操作不卡心跳）；可返回多段消息
+    ext_handler = EXT.match(text)
+    if ext_handler:
+        try:
+            out = await asyncio.to_thread(ext_handler, text, mentioned)
+        except Exception as e:
+            out = f"（扩展指令执行失败：{type(e).__name__}: {e}）"
+        if out:
+            parts = out if isinstance(out, list) else [out]
+            for i, part in enumerate(parts, start=1):
+                await message.reply(content=part, msg_seq=i)
+            return
+
+    # 1.7) 摸鱼：随机来一条放松/摸鱼点子（`摸鱼 3` 多条、`摸鱼 冷知识` 换池）
+    my = moyu.parse(text)
+    if my is not None:
+        if my == "badarg":
+            # @ 场景：明确在跟机器人说话 → 给参数提示；
+            # 非 @ 场景：可能只是聊天（「摸鱼真爽」），不打扰 → 落回原流程
+            if mentioned:
+                await message.reply(content=MOYU_BADARG_HINT, msg_seq=1)
+                return
+        else:
+            n, cats = my
+            reply = moyu.format_moyu(moyu.draw(n, cats))
+            print(f"[摸鱼] {gid} text={text!r} n={n} cats={cats} -> {reply[:36]!r}", flush=True)
+            await message.reply(content=reply, msg_seq=1)
+            return
+
+    # 2) 查备忘 / 查灵感 / 帮助
+    if text in MEMO_LIST_CMDS:
+        await message.reply(content=memo_list_text(10, KIND_MEMO), msg_seq=1)
+        return
+    if text in IDEA_LIST_CMDS:
+        await message.reply(content=memo_list_text(10, KIND_IDEA), msg_seq=1)
+        return
+    if text in HELP_CMDS:
+        await message.reply(content=help_text(), msg_seq=1)
+        return
+
+    # 4) 记备忘（@ 或不 @ 都认「备忘」触发词）
+    result = handle_event(t["store_id"], t["store_name"], t["sender_id"], "", raw)
+    if result:
+        print(f"[备忘] {gid} -> {result['content']}", flush=True)
+        try:
+            await message.reply(content="已记到秘书会话 ✅", msg_seq=1)
+        except Exception as e:  # 回执失败不影响已记录
+            print("reply failed:", e, flush=True)
+        return
+
+    # 4.5) 兜底
+    #   私聊：一切非指令文本都收作灵感（私聊没有「打扰群」的顾虑）
+    #   @ 群消息：明确回一句，避免「@ 了却没反应」分不清是没识别还是挂了
+    #   非 @ 群消息：静默落灵感，不把群聊变成机器人频道
+    if scope == SCOPE_C2C:
+        idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
+                        text.strip(), kind=KIND_IDEA)
+        print(f"[灵感·私聊] {gid} -> {idea['content']}", flush=True)
+        if C2C_ACK_IDEA:
+            await message.reply(content="💡 已收作灵感", msg_seq=1)
+        return
+    if mentioned:
+        print(f"[未识别] @消息 text={text!r}", flush=True)
+        await message.reply(
+            content="（没认出来这条指令，发「帮助」看菜单）", msg_seq=1
+        )
+        return
+
+    # 5) 非 @ 的普通文本 → 自动收作「灵感」（静默，不打扰群）
+    if text.strip():
+        idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
+                        text.strip(), kind=KIND_IDEA)
+        print(f"[灵感] {gid} -> {idea['content']}", flush=True)
+
+
+
 def main():
     init()
     if not acquire_pid_lock():
@@ -469,14 +667,21 @@ def main():
                 except Exception as e:
                     print(f"[启动播报失败] {type(e).__name__}: {e}", flush=True)
 
-        async def send_file_to_group(self, message, gid, full, rel, mid, caption=None):
-            """发送一个工作区文件。文本类渲染成图片（手机可直接看）；其余走文件卡片。"""
+        async def send_file_to_chat(self, message, scope, openid, full, rel, mid, caption=None):
+            """发送一个文件到群 / 私聊。文本类渲染成图片（手机可直接看）；其余走文件卡片。"""
             import send_file as sf
 
             size = os.path.getsize(full)
             if size > MAX_SEND:
                 await message.reply(content=f"（{rel} 超过 200MB，发不了）", msg_seq=1)
                 return
+
+            # 私聊没有「主动发言」权限 → 一律被动回复（带触发消息的 msg_id）；
+            # 群优先主动推送，失败再降级为被动回复。
+            if scope == SCOPE_C2C:
+                attempts = [(mid, sf.CLI_SEQ_BASE)]
+            else:
+                attempts = [(None, 1), (mid, sf.CLI_SEQ_BASE)]
 
             # 文本类：渲染成图片发送（文件卡片在手机端打不开，拆文本又太碎）
             if sf.is_text_file(full) and size <= RENDER_MAX:
@@ -488,147 +693,42 @@ def main():
                     cap = (caption or f"📄 {rel}") + (
                         f"（共 {len(imgs)} 张）" if len(imgs) > 1 else ""
                     )
-                    await asyncio.to_thread(
-                        sf.send_images, imgs, gid, cap, sandbox, appid, secret, None, 1
-                    )
-                    print(f"[发图·主动] {rel} -> {gid}（{len(imgs)} 张）", flush=True)
-                    return
+                    last_err = None
+                    for msg_id, seq in attempts:
+                        try:
+                            await asyncio.to_thread(
+                                sf.send_images, imgs, openid, cap, sandbox, appid, secret,
+                                msg_id, seq, scope,
+                            )
+                            print(f"[发图] {rel} -> {scope}:{openid}（{len(imgs)} 张）", flush=True)
+                            return
+                        except Exception as e:
+                            last_err = e
+                    raise last_err
                 except Exception as e:
                     print(f"[发图·失败，退回文件卡片] {type(e).__name__}: {e}", flush=True)
                 finally:
                     shutil.rmtree(tmpdir, ignore_errors=True)
 
             ft = sf.detect_file_type(full)
-            try:
-                await asyncio.to_thread(
-                    sf.send_file, full, gid, caption or f"📎 {rel}", ft, sandbox, appid, secret, None
-                )
-                print(f"[发文件·主动] {rel} -> {gid}", flush=True)
-            except Exception as e:
-                # 主动推送失败 → 退回被动回复（seq 抬高，避开 bot 自己已用的 1~3）
+            last_err = None
+            for msg_id, seq in attempts:
                 try:
                     await asyncio.to_thread(
-                        sf.send_file, full, gid, f"📎 {rel}", ft, sandbox, appid, secret,
-                        mid, sf.CLI_SEQ_BASE,
+                        sf.send_file, full, openid, caption or f"📎 {rel}", ft,
+                        sandbox, appid, secret, msg_id, seq, scope,
                     )
-                    print(f"[发文件·被动] {rel} -> {gid}", flush=True)
-                except Exception as e2:
-                    await message.reply(
-                        content=f"（发送失败：{type(e2).__name__}: {e2}）", msg_seq=1
-                    )
-
-        async def route(self, message, mentioned):
-            """@ 与全量消息共用路由。mentioned=False 时只认明确指令，避免误触。"""
-            gid = getattr(message, "group_openid", "") or ""
-            mid = getattr(message, "id", "") or ""
-            save_last_msg(gid, mid)
-            author = getattr(message, "author", None)
-            sid = getattr(author, "member_openid", "") if author else ""
-            raw = getattr(message, "content", "") or ""
-            text = strip_at(raw)
-            if mentioned:
-                # 留原始内容便于排查 @ 占位符的真实编码
-                print(f"[@消息] raw={raw!r} -> text={text!r}", flush=True)
-            if not text:
-                return
-
-            # 0) 有待选文件时，优先解析「选哪个」（序号 / 文件名片段）
-            pend = PENDING.get(gid)
-            if pend and time.time() - pend["ts"] <= PENDING_TTL:
-                choice = resolve_choice(text, pend["matches"])
-                if choice:
-                    PENDING.pop(gid, None)
-                    await self.send_file_to_group(message, gid, choice[1], choice[0], mid)
+                    print(f"[发文件] {rel} -> {scope}:{openid}", flush=True)
                     return
-
-            # 1) 发文件：搜工作区 → 唯一直接发 / 多个列出来问
-            bare_cmds = BARE_FILE_CMDS if mentioned else {"发文件", "找文件", "发送文件"}
-            if text in bare_cmds:
-                await message.reply(content="告诉我要发什么，例如「发文件 设计说明」", msg_seq=1)
-                return
-            fm = (FILE_SEND_RE if mentioned else EXPLICIT_FILE_RE).match(text)
-            if fm:
-                q = fm.group(1).strip()
-                matches = search_files(q)
-                if not matches:
-                    await message.reply(
-                        content=f"（没找到含「{q}」的文件，已搜配置的根目录）", msg_seq=1
-                    )
-                    return
-                if len(matches) == 1:
-                    await self.send_file_to_group(message, gid, matches[0][1], matches[0][0], mid)
-                    return
-                PENDING[gid] = {"matches": matches, "ts": time.time()}
-                await message.reply(
-                    content=file_list_text(matches, len(matches) >= SEARCH_LIMIT), msg_seq=1
-                )
-                return
-
-            # 1.5) 本地扩展指令（extensions/ 下；自定义指令不进公开仓库）
-            #      处理器同步执行（放线程，阻塞操作不卡心跳）；可返回多段消息
-            ext_handler = EXT.match(text)
-            if ext_handler:
-                try:
-                    out = await asyncio.to_thread(ext_handler, text, mentioned)
                 except Exception as e:
-                    out = f"（扩展指令执行失败：{type(e).__name__}: {e}）"
-                if out:
-                    parts = out if isinstance(out, list) else [out]
-                    for i, part in enumerate(parts, start=1):
-                        await message.reply(content=part, msg_seq=i)
-                    return
+                    last_err = e
+            await message.reply(
+                content=f"（发送失败：{type(last_err).__name__}: {last_err}）", msg_seq=1
+            )
 
-            # 1.7) 摸鱼：随机来一条放松/摸鱼点子（`摸鱼 3` 多条、`摸鱼 冷知识` 换池）
-            my = moyu.parse(text)
-            if my is not None:
-                if my == "badarg":
-                    # @ 场景：明确在跟机器人说话 → 给参数提示；
-                    # 非 @ 场景：可能只是聊天（「摸鱼真爽」），不打扰 → 落回原流程
-                    if mentioned:
-                        await message.reply(content=MOYU_BADARG_HINT, msg_seq=1)
-                        return
-                else:
-                    n, cats = my
-                    reply = moyu.format_moyu(moyu.draw(n, cats))
-                    print(f"[摸鱼] {gid} text={text!r} n={n} cats={cats} -> {reply[:36]!r}", flush=True)
-                    await message.reply(content=reply, msg_seq=1)
-                    return
-
-            # 2) 查备忘 / 查灵感 / 帮助
-            if text in MEMO_LIST_CMDS:
-                await message.reply(content=memo_list_text(10, KIND_MEMO), msg_seq=1)
-                return
-            if text in IDEA_LIST_CMDS:
-                await message.reply(content=memo_list_text(10, KIND_IDEA), msg_seq=1)
-                return
-            if text in HELP_CMDS:
-                await message.reply(content=help_text(), msg_seq=1)
-                return
-
-            # 4) 记备忘（@ 或不 @ 都认「备忘」触发词）
-            result = handle_event(gid, "", sid, "", raw)
-            if result:
-                print(f"[备忘] group_openid={gid} -> {result['content']}", flush=True)
-                try:
-                    await message.reply(content="已记到秘书会话 ✅", msg_seq=1)
-                except Exception as e:  # 回执失败不影响已记录
-                    print("reply failed:", e, flush=True)
-                return
-
-            # 4.5) @ 场景兜底：指令没认出来就明确回一句，不再静默
-            #      （旧实现里 @ 了机器人却什么都不发生，分不清「没识别」还是「机器人挂了」）
-            #      非 @ 场景保持静默落灵感，避免把群聊打扰成机器人频道
-            if mentioned:
-                print(f"[未识别] @消息 text={text!r}", flush=True)
-                await message.reply(
-                    content="（没认出来这条指令，发「帮助」看菜单）", msg_seq=1
-                )
-                return
-
-            # 5) 非 @ 的普通文本 → 自动收作「灵感」（静默，不打扰群）
-            if not mentioned and text.strip():
-                idea = add_memo(gid, "", sid, "", text.strip(), kind=KIND_IDEA)
-                print(f"[灵感] {gid} -> {idea['content']}", flush=True)
+        async def route(self, message, mentioned, scope=SCOPE_GROUP):
+            # 实现在模块级 route_message()（便于回归测试直接驱动）
+            await route_message(self, message, mentioned, scope)
 
         async def on_group_at_message_create(self, message: GroupMessage):
             # 群消息的 openid 字段名是 group_openid；author 只有 member_openid。
@@ -638,7 +738,12 @@ def main():
             # 群内全量消息（需群设置「消息范围=全部消息」）
             await self.route(message, mentioned=False)
 
-    # 群聊消息对应 Intents.public_messages（不是 group_messages）
+        async def on_c2c_message_create(self, message):
+            # 私聊消息（QQ 开放平台需开启「单聊」）。私聊里没有 @ 概念，
+            # 一律按「用户在直接跟机器人说话」处理（mentioned=True）。
+            await self.route(message, mentioned=True, scope=SCOPE_C2C)
+
+    # 群聊 + 单聊消息都对应 Intents.public_messages（不是 group_messages）
     intents = Intents(public_messages=True)
     MemoClient(intents=intents).run(appid=appid, secret=secret)
 
