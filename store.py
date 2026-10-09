@@ -8,7 +8,7 @@
 """
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 DB = os.path.join(os.path.dirname(__file__), "memos.db")
@@ -52,6 +52,9 @@ def init():
         con.execute("ALTER TABLE memos ADD COLUMN note TEXT")
     if "processed_at" not in cols:
         con.execute("ALTER TABLE memos ADD COLUMN processed_at TEXT")
+    if "boomerang_at" not in cols:
+        # 回旋镖推过这条没有（非空 = 推过）—— 避免同一个用户反复收到同一条旧记录
+        con.execute("ALTER TABLE memos ADD COLUMN boomerang_at TEXT")
     con.commit()
     con.close()
 
@@ -172,3 +175,95 @@ def set_idea_status(ids, status, note=None):
     con.commit()
     con.close()
     return n
+
+
+# ── 备忘：只有「勾掉 / 没勾掉」两态 ──────────────────────────────
+# 备忘 = 我要做（kind='memo'），不需要灵感那套四态；复用 status 列：
+#   open = 没勾掉，done = 已勾掉，processed_at = 勾掉时间。
+# 勾掉 ≠ 删除：行还在表里，随时能取消（页面上的「✓ 已勾掉」列表里点「← 取消勾掉」）。
+
+def set_memo_done(ids, done=True):
+    """批量勾掉 / 取消勾掉备忘。返回实际改动条数。"""
+    if not ids:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    status = STATUS_DONE if done else STATUS_OPEN
+    con = sqlite3.connect(DB)
+    n = 0
+    for i in ids:
+        cur = con.execute(
+            "UPDATE memos SET status=?, processed_at=? WHERE id=? AND kind=?",
+            (status, now, i, KIND_MEMO),
+        )
+        n += cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+# ── 回旋镖：把「N 天以前」的旧记录翻出来推回给用户 ────────────────
+# 一次只推一条，推过的记上时间戳（boomerang_at），下次不再推同一条。
+# 可推范围由 settings 的 `boomerang_scope` 决定（备忘 + 灵感各状态），
+# 这里是纯数据层：只认 code，不读设置。
+
+_SCOPE_TO_STATUS = {
+    "open": STATUS_OPEN,
+    "done": STATUS_DONE,
+    "decided": STATUS_DECIDED,
+    "dropped": STATUS_DROPPED,
+}
+
+
+def _boomerang_where(days, scope, now=None):
+    """拼出回旋镖的 WHERE 子句 → (sql 片段, 参数列表)。没有可推范围时返回 (None, [])。"""
+    want_memo = "memo" in (scope or [])
+    statuses = [_SCOPE_TO_STATUS[s] for s in (scope or []) if s in _SCOPE_TO_STATUS]
+    if not want_memo and not statuses:
+        return None, []
+    cutoff = ((now or datetime.now()) - timedelta(days=int(days))).isoformat(timespec="seconds")
+    where = ["created_at <= ?", "boomerang_at IS NULL"]
+    args = [cutoff]
+    branches = []
+    if want_memo:
+        branches.append("kind = ?")
+        args.append(KIND_MEMO)
+    if statuses:
+        marks = ",".join("?" * len(statuses))
+        branches.append(f"(kind = ? AND status IN ({marks}))")
+        args.extend([KIND_IDEA, *statuses])
+    where.append("(" + " OR ".join(branches) + ")")
+    return " AND ".join(where), args
+
+
+def pick_boomerang(days, scope, now=None):
+    """随机挑一条「days 天以前、且还没推过」的记录；没有候选返回 None。"""
+    clause, args = _boomerang_where(days, scope, now)
+    if clause is None:
+        return None
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        f"SELECT * FROM memos WHERE {clause} ORDER BY RANDOM() LIMIT 1", args
+    ).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def count_boomerang(days, scope, now=None):
+    """还剩几条可推 —— 用来给「没候选」时一句更准的提示。"""
+    clause, args = _boomerang_where(days, scope, now)
+    if clause is None:
+        return 0
+    con = sqlite3.connect(DB)
+    n = con.execute(f"SELECT COUNT(*) FROM memos WHERE {clause}", args).fetchone()[0]
+    con.close()
+    return n
+
+
+def mark_boomerang(memo_id):
+    """记下「这条已经回旋镖过了」，下次不再推它。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    con = sqlite3.connect(DB)
+    con.execute("UPDATE memos SET boomerang_at=? WHERE id=?", (now, memo_id))
+    con.commit()
+    con.close()

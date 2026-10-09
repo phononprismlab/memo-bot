@@ -31,6 +31,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 默认 GBK，print 到编不出的字符
+#    （emoji / ⏻ / ⚙ 等）会抛 UnicodeEncodeError。本文件既作 CLI 用、又被 bot.py
+#    导入，一旦崩会连带影响调用方。errors="replace" 兜底，不让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 VIDEO_EXT = {".mp4"}
 VOICE_EXT = {".silk", ".mp3", ".wav", ".ogg"}

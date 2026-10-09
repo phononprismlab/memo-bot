@@ -30,8 +30,8 @@ bot.out.log
 bot.out.log.*
 botpy.log
 *.log
-# ideas-bubbles.py 的生成物（按需要手动保留）
-灵感泡泡.html
+# brain-drawer.py 的生成物（按需要手动保留）
+脑内抽屉.html
 
 # ── 私有扩展（本地自定义指令，绝不进公开仓库）────────────────
 extensions/local/

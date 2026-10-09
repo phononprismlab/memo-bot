@@ -1,17 +1,65 @@
 @echo off
-chcp 65001 >nul
-title æ‘¸é±¼bot é…ç½®ä¸­å¿ƒ
+chcp 936 >nul
+title ÃþÓãbot ÅäÖÃÖÐÐÄ
 cd /d "%~dp0"
 
 echo.
-echo   æ‘¸é±¼bot é…ç½®ä¸­å¿ƒ
-echo   ---------------------------------------------
-echo   æµè§ˆå™¨ä¼šè‡ªåŠ¨æ‰“å¼€ä¸€ä¸ªé…ç½®é¡µï¼›åœ¨è¿™ä¸ªçª—å£æŒ‰ Ctrl+C
-echo   æˆ–åœ¨é¡µé¢ä¸Šç‚¹ã€Œå…³é—­é…ç½®ä¸­å¿ƒã€å³å¯åœæ­¢ã€‚
+echo   ÃþÓãbot ÅäÖÃÖÐÐÄ
+echo   =============================================
 echo.
 
-python config-web.py
+rem ©¤©¤ 1) ÕÒ Python£¨ÓÅÏÈ PATH ÀïµÄ python£¬Æä´Î py Æô¶¯Æ÷£©©¤©¤©¤©¤©¤
+set "PY="
+where python >nul 2>&1 && set "PY=python"
+if not defined PY (
+  where py >nul 2>&1 && set "PY=py"
+)
+if not defined PY goto nopython
 
+rem ©¤©¤ 2) È±ÒÀÀµ¾Í×°£»×°¹ý¾ÍÖ±½ÓÌø¹ý ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+%PY% -c "import botpy, dotenv, markdown, PIL" >nul 2>&1
+if errorlevel 1 (
+  echo   [1/2] µÚÒ»´ÎÔËÐÐ£¬ÕýÔÚ°²×°ÒÀÀµ£¨´óÔ¼ 1 ·ÖÖÓ£¬ÇëÄÍÐÄµÈ£©...
+  echo.
+  %PY% -m pip install -r requirements.txt
+  if errorlevel 1 goto pipfail
+  echo.
+  echo   ÒÀÀµ×°ºÃÁË¡£
+) else (
+  echo   [1/2] ÒÀÀµÒÑ¾ÍÐ÷¡£
+)
 echo.
-echo   é…ç½®ä¸­å¿ƒå·²é€€å‡ºã€‚
+
+rem ©¤©¤ 3) ÆðÅäÖÃÖÐÐÄ ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+echo   [2/2] ÕýÔÚ´ò¿ªÅäÖÃÒ³¡£
+echo         ÒªÍ£Ö¹£ºÔÚ±¾´°¿Ú°´ Ctrl+C£¬»òµãÅäÖÃÒ³ÉÏµÄ¡¸¹Ø±ÕÅäÖÃÖÐÐÄ¡¹¡£
+echo.
+%PY% config-web.py
+
+rem Python Æô¶¯Ê±»á°Ñ¿ØÖÆÌ¨´úÂëÒ³ÇÐµ½ UTF-8£¬ÕâÀïÇÐ»ØÀ´£¬
+rem ·ñÔòÏÂÃæ¼¸ÐÐµÄÖÐÎÄ»á»¨ÆÁ¡£
+chcp 936 >nul
+echo.
+echo   ÅäÖÃÖÐÐÄÒÑÍË³ö¡£
 pause
+exit /b 0
+
+:nopython
+echo   [X] Ã»ÕÒµ½ Python¡£
+echo.
+echo   ÇëÏÈ°²×° Python£¨Ãâ·Ñ£©£ºhttps://www.python.org/downloads/
+echo.
+echo   °²×°Ê±Îñ±Ø¹´Ñ¡¡¸Add python.exe to PATH¡¹ÕâÒ»Ïî£¬
+echo   ×°Íêºó¹Øµô±¾´°¿Ú¡¢ÖØÐÂË«»÷±¾ÎÄ¼þ¼´¿É¡£
+echo.
+pause
+exit /b 1
+
+:pipfail
+echo.
+echo   [X] ÒÀÀµ°²×°Ê§°Ü¡£³£¼ûÔ­Òò£ºÍøÂç²»Í¨£¬»òÐèÒª´úÀí¡£
+echo.
+echo   ¿ÉÒÔÊÖ¶¯´ò¿ª¡¸ÃüÁîÌáÊ¾·û¡¹ÅÜ£ºpip install -r requirements.txt
+echo.
+pause
+exit /b 1

@@ -1,11 +1,11 @@
 """本机设置（键值对，JSON 落盘）—— 三个入口改的是同一份文件。
 
 这个文件是干嘛的：把「改配置」从「开编辑器改 `.env` + 重启 bot」变成点几下。
-存的是**非敏感**的行为配置（播报文案、泡泡展示范围），落 `settings.json`。
+存的是**非敏感**的行为配置（播报文案、抽屉展示范围），落 `settings.json`。
 
 三个入口：
   - 配置中心网页：`config-web.py` 起的那一页（推荐，能填能测能启停）
-  - 灵感泡泡页面：顶部「⚙ 设置」（只放跟页面相关的 `bubbles_show`）
+  - 脑内抽屉页面：顶部「⚙ 设置」（只放跟页面相关的 `bubbles_show`）
   - 机器人：`设置` / `设置 <键> <值>` / `设置 重置 <键>`
 
 🔴 **密钥不进这里**（AppID / AppSecret / 群 openid 仍留在 `.env`）——
@@ -25,7 +25,7 @@ FILE = os.path.join(HERE, "settings.json")
 _LOCK = threading.Lock()
 
 # ── 可设置的键 ───────────────────────────────────────────────────
-# kind: text（一行文本，留空 = 关掉该功能）/ multi（多选，值是一组 code）
+# kind: text（一行文本，留空 = 关掉该功能）/ multi（多选，值是一组 code）/ int（整数）
 KEYS = {
     "startup_msg": {
         "label": "启动播报",
@@ -42,13 +42,31 @@ KEYS = {
         "help": "关机时自动发到群里的话；留空 = 不发",
     },
     "bubbles_show": {
-        "label": "灵感泡泡展示范围",
+        "label": "脑内抽屉展示范围",
         "kind": "multi",
-        "default": ["open"],
-        "choices": ["open", "done", "decided", "dropped"],
-        "choice_labels": {"open": "待处理", "done": "已处理",
+        "default": ["memo", "open"],
+        "choices": ["memo", "memo_done", "open", "done", "decided", "dropped"],
+        "choice_labels": {"memo": "备忘", "memo_done": "已勾掉",
+                          "open": "待处理", "done": "已处理",
                           "decided": "已决议", "dropped": "已丢弃"},
-        "help": "打开灵感泡泡时，内容流里放哪几类（默认只放「待处理」）",
+        "help": "打开脑内抽屉时，内容流里放哪几类（默认：备忘 + 待处理灵感）",
+    },
+    "boomerang_days": {
+        "label": "回旋镖回溯天数",
+        "kind": "int",
+        "default": 3,
+        "min": 1,
+        "max": 365,
+        "help": "发「回旋镖」时，翻多少天**以前**的记录（默认 3 天；刚记的还不算）",
+    },
+    "boomerang_scope": {
+        "label": "回旋镖推送范围",
+        "kind": "multi",
+        "default": ["memo", "open", "done", "decided"],
+        "choices": ["memo", "open", "done", "decided", "dropped"],
+        "choice_labels": {"memo": "备忘", "open": "待处理灵感", "done": "已处理灵感",
+                          "decided": "已决议灵感", "dropped": "已丢弃灵感"},
+        "help": "发「回旋镖」时，从哪几类旧记录里挑一条推回来",
     },
 }
 
@@ -120,6 +138,18 @@ def normalize(key, raw):
     cfg = KEYS[key]
     if cfg["kind"] == "text":
         return str(raw if raw is not None else "").strip(), None
+    if cfg["kind"] == "int":
+        s = str(raw if raw is not None else "").strip()
+        try:
+            n = int(s)
+        except ValueError:
+            return None, f"要填一个整数（现在是「{s}」）"
+        lo, hi = cfg.get("min"), cfg.get("max")
+        if lo is not None and n < lo:
+            return None, f"不能小于 {lo}"
+        if hi is not None and n > hi:
+            return None, f"不能大于 {hi}"
+        return n, None
     # multi
     if isinstance(raw, (list, tuple)):
         parts = list(raw)
@@ -239,6 +269,8 @@ def display(key):
     val = get(key)
     if cfg["kind"] == "multi":
         return "、".join(cfg["choice_labels"].get(c, c) for c in val)
+    if cfg["kind"] == "int":
+        return str(val)
     return val if val else "（空 = 关掉）"
 
 

@@ -10,7 +10,7 @@
   [4] bot            文本清洗、搜索打分、动态帮助、日志轮转、PID 判活、群/私聊会话标识
   [5] send_file      文件类型识别、文本类判定、群/单聊目标路径、last_msg 兼容
   [6] md2img         依赖定位（node / 浏览器候选探测）
-  [7] ideas-bubbles  页面生成、--serve API、--apply、防重叠源码护栏
+  [7] brain-drawer  页面生成、--serve API、--apply、防重叠源码护栏
   [8] extensions     扩展注册表、加载容错、example.py 模板不注册指令
   [9] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
  [10] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
@@ -25,15 +25,27 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+# 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 默认 GBK，测试输出里的 ✅ / ⚙ 等
+#    字符在 GBK 下编不出来 → print 抛 UnicodeEncodeError 把整轮测试带崩。
+#    errors="replace" 兜底，不让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -421,17 +433,17 @@ def test_md2img():
     check("md2png.mjs 支持 MEMO_PLAYWRIGHT_CORE", "MEMO_PLAYWRIGHT_CORE" in mjs_src)
 
 
-# ── [7] ideas-bubbles ───────────────────────────────────────────
+# ── [7] brain-drawer ───────────────────────────────────────────
 def _load_bubbles():
     spec = importlib.util.spec_from_file_location(
-        "ib", os.path.join(ROOT, "ideas-bubbles.py"))
+        "ib", os.path.join(ROOT, "brain-drawer.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 def test_ideas_bubbles():
-    print("\n[7] ideas-bubbles 页面生成与页内处理")
+    print("\n[7] brain-drawer 页面生成与页内处理")
     import settings
     import store
 
@@ -463,7 +475,7 @@ def test_ideas_bubbles():
 
         # ── 布局防重叠的源码级护栏（这些是真机踩过的坑，回归必查）
         T = ib.TEMPLATE
-        py_src = open(os.path.join(ROOT, "ideas-bubbles.py"), encoding="utf-8").read()
+        py_src = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
         check("所有气泡同一下降速度（BASE_DUR，避免追尾）",
               "const BASE_DUR" in T and "const dur = BASE_DUR" in T)
         check("有最小间隔门 minGapMs（保证竖直等距）", "function minGapMs" in T)
@@ -582,15 +594,16 @@ def test_ideas_bubbles():
         check("内容流不再硬编码只取 open",
               "x.s === 'open'" not in T2)
         check("轮播队列只装待处理", "shuffle(streamItems().slice())" in T2)
-        check("归档三态常量", "const ARCHIVE = ['done', 'decided', 'dropped'];" in T2)
+        check("归档四个桶（含已勾掉的备忘）",
+              "const ARCHIVE = ['memo_done', 'done', 'decided', 'dropped'];" in T2)
         check("垃圾桶文案", "🗑 垃圾桶" in T2)
         check("已处理 / 已决议 各有列表入口",
               "✅ 已处理" in T2 and "📌 已决议" in T2)
         check("列表浮层 DOM（#list / #lbody / #ltitle）",
               'id="list"' in T2 and 'id="lbody"' in T2 and 'id="ltitle"' in T2)
         check("列表行带恢复按钮", "← 恢复" in T2 and "'open'" in T2)
-        check("改状态不删记录（moveIdea；dropIdea 已删除）",
-              "function moveIdea" in T2 and "function dropIdea" not in T2)
+        check("改状态不删记录（moveItem；dropIdea 已删除）",
+              "function moveItem" in T2 and "function dropIdea" not in T2)
         check("serve 模式定时拉最新（bot 新收的灵感自动进流）",
               "setInterval(refreshFromServer" in T2 and "async function refreshFromServer" in T2)
         check("停止服务入口在页面上", "/api/quit" in T2 and "btn-quit" in T2)
@@ -617,8 +630,8 @@ def test_ideas_bubbles():
         check("设置已内嵌进页面（占位符被替换）",
               "__SETTINGS__" not in doc and "let SETTINGS = [{" in doc)
         check("内容流按设置过滤", "IDEAS.filter(x => SHOW.includes(x.s))" in T2)
-        check("展示范围默认只放待处理",
-              "SHOW = settingValue('bubbles_show') || ['open']" in T2)
+        check("展示范围默认「备忘 + 待处理」",
+              "SHOW = settingValue('bubbles_show') || ['memo', 'open']" in T2)
         check("页脚改为 显示 / 共", '显示 <b id="n">' in T2 and '共 <b id="n-arch">' in T2)
         check("保存后重建内容流",
               "function rebuildStream" in T2 and "rebuildStream();" in T2)
@@ -682,6 +695,106 @@ def test_ideas_bubbles():
         check("正文与结论都走 wrappedLines",
               "wrappedLines(text, widthPx / fp)" in T2
               and "wrappedLines(note, widthPx / NOTE_FONT)" in T2)
+
+        # ── 备忘也上这一页（2026-10-09）───────────────────────────
+        # 🔴 备忘 = 我要做，只有「勾掉 / 没勾掉」；灵感 = 我的想法，有四态。
+        #    两条流混排在同一条内容流里，靠「桶」分流。
+        m1 = store.add_memo("g", "", "s", "", "买猫粮", kind=store.KIND_MEMO)
+        store.add_memo("g", "", "s", "", "换水", kind=store.KIND_MEMO)
+        memo_items = [x for x in ib.collect() if x["k"] == "memo"]
+        check("备忘进了同一条流", len(memo_items) == 2, f"got={len(memo_items)}")
+        check("没勾掉的备忘桶 = memo",
+              all(x["s"] == "memo" for x in memo_items), f"got={memo_items}")
+        check("备忘也会被 --open-only 带上",
+              any(x["k"] == "memo" for x in ib.collect(open_only=True)))
+        check("--no-memo 时流里没有备忘",
+              not any(x["k"] == "memo" for x in ib.collect(include_memo=False)))
+        check("bucket_of：备忘按 status 分桶、灵感按四态、乱值回落 open",
+              ib.bucket_of({"kind": "memo", "status": "open"}) == "memo"
+              and ib.bucket_of({"kind": "memo", "status": "done"}) == "memo_done"
+              and ib.bucket_of({"kind": "idea", "status": "decided"}) == "decided"
+              and ib.bucket_of({"kind": "idea", "status": "乱写"}) == "open")
+        check("BUCKET_ORDER / BUCKET_LABEL 覆盖六个桶",
+              set(ib.BUCKET_ORDER)
+              == {"memo", "memo_done", "open", "done", "decided", "dropped"}
+              and set(ib.BUCKET_LABEL) == set(ib.BUCKET_ORDER))
+
+        check("勾掉备忘 → 改动 1 条", store.set_memo_done([m1["id"]], True) == 1)
+        check("勾掉后桶变 memo_done",
+              any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
+        check("取消勾掉 → 回到 memo 桶",
+              store.set_memo_done([m1["id"]], False) == 1
+              and any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
+        check("勾不存在的 id 返回 0 不炸", store.set_memo_done(["nope"], True) == 0)
+        check("勾掉接口碰不到灵感（kind 过滤）",
+              store.set_memo_done([b["id"]], True) == 0)
+
+        # 离线导出的操作文件：备忘条目走 kind='memo'
+        ops2 = os.path.join(tmpdir, "ops2.json")
+        with open(ops2, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "done": True},
+                               {"id": b["id"], "status": "open", "note": "回到待处理"}]}, f,
+                      ensure_ascii=False)
+        check("apply_ops 支持备忘勾掉", ib.apply_ops(ops2) == 0)
+        check("apply_ops 勾掉了备忘",
+              any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
+        check("apply_ops 同时处理灵感状态", store.find_idea(b["id"])["status"] == "open")
+
+        # /api/memo —— 页面上的勾选框走这条
+        httpd2 = ThreadingHTTPServer(("127.0.0.1", 0), ib._make_handler(doc))
+        port2 = httpd2.server_address[1]
+        threading.Thread(target=httpd2.serve_forever, daemon=True).start()
+        base2 = f"http://127.0.0.1:{port2}"
+        try:
+            with urllib.request.urlopen(base2 + "/api/items") as r:
+                check("GET /api/items 与旧 /api/ideas 同源",
+                      len(json.load(r)["items"]) == len(ib.collect()))
+            req2 = urllib.request.Request(
+                base2 + "/api/memo",
+                data=json.dumps({"id": m1["id"], "done": False}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req2) as r:
+                check("POST /api/memo 取消勾掉", json.load(r).get("changed") == 1)
+            check("取消勾掉已落库",
+                  any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
+            for label, payload, want in [
+                ("不存在的 id", {"id": "deadbeef", "done": True}, 404),
+                ("空 id", {"id": "", "done": True}, 400),
+            ]:
+                try:
+                    urllib.request.urlopen(urllib.request.Request(
+                        base2 + "/api/memo",
+                        data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json"}))
+                    check(f"/api/memo {label} 应被拒绝", False)
+                except urllib.error.HTTPError as e:
+                    check(f"/api/memo {label} → HTTP {want}", e.code == want, f"got={e.code}")
+        finally:
+            httpd2.shutdown()
+            httpd2.server_close()
+
+        # 源码护栏：备忘在页面上是「一张带勾选框的卡片」
+        check("标题已换成「脑内抽屉」",
+              "🗂 脑内抽屉" in T2 and "灵感泡泡" not in T2)
+        check("<title> 同步改名", "<title>脑内抽屉" in T2)
+        check("备忘卡片挂勾选框",
+              "function makeChk" in T2
+              and "if(it.k === 'memo') hd.append(makeChk(it))" in T2)
+        check("勾选框用 CSS 画（方框 + ::after 对勾），不依赖字符字形",
+              ".bubble .chk{" in T2 and ".bubble .chk.on::after{" in T2)
+        check("勾掉走 /api/memo", "fetch('/api/memo'" in T2)
+        check("已勾掉的备忘有列表入口",
+              "✓ 已勾掉" in T2 and 'id="btn-memo_done"' in T2)
+        check("列表行也显示勾掉状态", "row.append(makeChk(it, renderList))" in T2)
+        check("浮层对备忘换一套动作（勾掉 / 取消勾掉）",
+              "modal.querySelectorAll('.ideaact button')" in T2
+              and "modal.querySelector('.memoact button')" in T2)
+        check("离线暂存区分备忘与灵感",
+              "v.k === 'memo'" in T2 and "kind: 'memo'" in T2)
+        check("旧导出文件名已改（抽屉操作.json）",
+              "抽屉操作.json" in T2 and "灵感操作.json" not in T2)
+        check("导出文件名/入口脚本名同步",
+              'os.path.join(WORKSPACE, "脑内抽屉.html")' in py_src)
     finally:
         store.DB = orig_db
         if _orig_set is None:
@@ -949,7 +1062,7 @@ def test_route():
         run(m)
         check("「设置」列全部键",
               bool(m.replies) and "关机通知文案" in m.replies[0]
-              and "灵感泡泡展示范围" in m.replies[0], f"got={m.replies}")
+              and "脑内抽屉展示范围" in m.replies[0], f"got={m.replies}")
         check("「设置」指令不落库灵感",
               len(store.list_ideas(store.STATUS_OPEN)) == n_ideas)
 
@@ -1048,7 +1161,7 @@ def test_settings():
         check("展示范围排在两个文案之后",
               _order.index("bubbles_show") > _order.index("offwork_msg"),
               f"got={_order}")
-        check("默认展示范围只有待处理", settings.get("bubbles_show") == ["open"])
+        check("默认展示范围是「备忘 + 待处理」", settings.get("bubbles_show") == ["memo", "open"])
         check("没写过文件时 is_set 为假", settings.is_set("startup_msg") is False)
         check("文件还不存在", not os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
 
@@ -1112,7 +1225,9 @@ def test_settings():
         check("describe 含 label/kind/value/help",
               all(k in d["bubbles_show"] for k in ("label", "kind", "value", "help")))
         check("describe 带 choices 与中文标签",
-              d["bubbles_show"]["choices"] == ["open", "done", "decided", "dropped"]
+              d["bubbles_show"]["choices"]
+              == ["memo", "memo_done", "open", "done", "decided", "dropped"]
+              and d["bubbles_show"]["choice_labels"]["memo"] == "备忘"
               and d["bubbles_show"]["choice_labels"]["open"] == "待处理")
     finally:
         if orig is None:
@@ -1212,15 +1327,16 @@ def test_config_web():
         check("AppSecret 不回显（value 为空）", sec["value"] == "" and sec["set"] is True)
         check("字段带 target（env / settings 分流）",
               {f["target"] for f in fields} == {"env", "settings"})
-        check("settings 的三个键都在字段表里",
+        check("settings 的五个键都在字段表里",
               {f["key"] for f in fields if f["target"] == "settings"}
-              == {"startup_msg", "offwork_msg", "bubbles_show"})
-        check("分组覆盖 6 个分区",
+              == {"startup_msg", "offwork_msg", "bubbles_show",
+                  "boomerang_days", "boomerang_scope"})
+        check("分组覆盖 7 个分区",
               {f["group"] for f in fields}
-              >= {"bot", "behavior", "files", "bubbles", "ignore"})
+              >= {"bot", "behavior", "files", "bubbles", "boomerang", "ignore"})
         check("页面渲染顺序 = GROUPS 顺序",
               [g["key"] for g in [{"key": k} for k, _, _ in cw.GROUPS]]
-              == ["bot", "behavior", "files", "bubbles", "runtime", "ignore"])
+              == ["bot", "behavior", "files", "bubbles", "boomerang", "runtime", "ignore"])
 
         # 6) 目录浏览：不存在 / 不是目录都给错误，别抛
         bad = cw.browse_dirs(os.path.join(tmpdir, "nope"))
@@ -1252,7 +1368,7 @@ def test_config_web():
         check(".env.example 覆盖全部可配置键", not missing, f"缺={missing}")
 
         # 10) 泡泡页只管展示范围（启动播报 / 关机文案搬去配置中心了）
-        bubbles = open(os.path.join(ROOT, "ideas-bubbles.py"), encoding="utf-8").read()
+        bubbles = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
         check("泡泡页设置浮层只渲染 bubbles_show",
               "const PAGE_KEYS = ['bubbles_show'];" in bubbles)
         check("泡泡页不再渲染通知文案项",
@@ -1260,6 +1376,230 @@ def test_config_web():
     finally:
         cw.ENV_PATH, cw.ENV_BAK = orig_env, orig_bak
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── [13] 控制台编码：GBK 环境下不许把进程带崩 ────────────────────
+def _free_port():
+    """要一个当前空闲的本地端口（起测试服务用）。"""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def test_console_encoding():
+    """🔴 中文 Windows 上 stdout 重定向到文件时按系统默认编码（GBK）写 —— 编不出的
+    字符会让 print 抛 UnicodeEncodeError，把**整个进程**带崩。
+
+    真凶案例（2026-10-09）：用户双击「脑内抽屉.bat」页面打不开。open_drawer.py 用
+    pythonw 后台拉起 brain-drawer.py，子进程 stdout 重定向到日志文件，而启动提示里的
+    ⏻(U+23FB) 在 GBK 里没有字形 → 异常在 serve_forever() 之前冒出来，服务根本没起来。
+    开发机终端是 UTF-8（PYTHONIOENCODING=utf-8），源码文本护栏**完全抓不到**这种崩溃，
+    所以这里必须真起一次子进程、把环境强制成 GBK 来验。
+    """
+    print("\n[13] 控制台编码（GBK 环境下不许把进程带崩）")
+
+    # 1) 源码护栏：每个可执行入口都要把 stdout / stderr 切成 UTF-8
+    entries = ["bot.py", "config-web.py", "brain-drawer.py",
+               "send_file.py", "ideas.py", os.path.join("test", "run-tests.py")]
+    for name in entries:
+        path = os.path.join(ROOT, name)
+        src = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
+        check(f"{name} 强制 UTF-8 输出", 'reconfigure(encoding="utf-8"' in src)
+
+    # 2) 工作区入口脚本给子进程也设好编码环境变量（双保险）。它不在仓库里，有才查。
+    ob_path = os.path.join(os.path.dirname(ROOT), "open_drawer.py")
+    if os.path.isfile(ob_path):
+        ob = open(ob_path, encoding="utf-8").read()
+        check("open_drawer.py 给子进程设 PYTHONIOENCODING", "PYTHONIOENCODING" in ob)
+    else:
+        check("open_drawer.py 存在（工作区入口脚本）", True, "跳过：不在仓库内")
+
+    # 3) 行为验证：强制 GBK 起一次 --serve，必须真能起来
+    port = _free_port()
+    env = dict(os.environ)
+    for k in ("PYTHONUTF8", "PYTHONIOENCODING", "LANG", "LC_ALL", "LC_CTYPE"):
+        env.pop(k, None)
+    env["PYTHONIOENCODING"] = "gbk"          # 模拟中文 Windows 双击环境
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "brain-drawer.py"),
+         "--serve", "--no-browser", "--port", str(port)],
+        cwd=ROOT, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    alive = False
+    try:
+        for _ in range(24):                  # 最多等 6 秒
+            time.sleep(0.25)
+            if proc.poll() is not None:
+                break                        # 崩了 —— 就是我们修的那个 bug
+            try:
+                with opener.open(f"http://127.0.0.1:{port}/api/ping", timeout=0.5) as r:
+                    alive = bool(json.load(r).get("ok"))
+                    if alive:
+                        break
+            except (OSError, ValueError, urllib.error.URLError):
+                pass
+        detail = ""
+        if not alive:
+            try:
+                out, _ = proc.communicate(timeout=2)
+                detail = (out or b"").decode("utf-8", "replace")[-400:]
+            except subprocess.TimeoutExpired:
+                pass
+        check("GBK 环境下 --serve 能起来（不被 ⏻ 编码问题带崩）", alive, detail)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+
+# ── [14] 回旋镖 + 导出 ──────────────────────────────────────────
+def test_boomerang_export():
+    """回旋镖：把「N 天以前」的旧记录翻一条推回给用户，推过的不重复推。
+    导出：把全部备忘 + 灵感导成 md / txt / json，群指令和泡泡页按钮共用同一套排版。
+    """
+    print("\n[14] 回旋镖（翻旧账）+ 导出（备忘/灵感 → 文件）")
+    import bot as _bot
+    import export as _export
+    import settings as _settings
+    import store
+
+    tmp = tempfile.mkdtemp(prefix="bm_export_test_")
+    orig_db = store.DB
+    orig_set = os.environ.get("MEMO_SETTINGS_FILE")
+    store.DB = os.path.join(tmp, "t.db")
+    os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
+    store.init()
+    try:
+        # 造数据：5 天前 1 备忘 + 1 灵感（带结论），今天 1 灵感
+        con = sqlite3.connect(store.DB)
+        old = (datetime.now() - timedelta(days=5)).isoformat(timespec="seconds")
+        today = datetime.now().isoformat(timespec="seconds")
+        con.execute("INSERT INTO memos (id,group_id,content,created_at,kind,status)"
+                    " VALUES (?,?,?,?,?,?)", ("a" * 8, "g1", "五天前的备忘", old, "memo", "open"))
+        con.execute("INSERT INTO memos (id,group_id,content,created_at,kind,status,note)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    ("b" * 8, "g1", "五天前的灵感", old, "idea", "decided", "当时的结论"))
+        con.execute("INSERT INTO memos (id,group_id,content,created_at,kind,status)"
+                    " VALUES (?,?,?,?,?,?)", ("c" * 8, "g1", "今天刚记的", today, "idea", "open"))
+        con.commit()
+        con.close()
+
+        # 1) 指令解析：只认完整写法，别把「回旋镖xx」当指令
+        check("parse_boomerang 裸指令", _bot.parse_boomerang("回旋镖") == (True, None))
+        check("parse_boomerang 带天数", _bot.parse_boomerang("回旋镖 7") == (True, 7))
+        check("parse_boomerang 别名", _bot.parse_boomerang("回旋标") == (True, None))
+        check("parse_boomerang 非指令不误判", _bot.parse_boomerang("回旋镖xx") == (False, None))
+        check("parse_boomerang 普通聊天不误判", _bot.parse_boomerang("今天摸鱼了") == (False, None))
+
+        # 2) 只翻「够天数」的：今天那条不算
+        scope = _settings.get("boomerang_scope")
+        check("未满天数的记录不进池子", store.count_boomerang(3, scope) == 2)
+        check("把回溯天数调到 0，今天那条才进池子", store.count_boomerang(0, scope) == 3)
+
+        # 3) 推一条 → 打标记 → 不重复推
+        #    先把范围锁死成一类，结果才是确定的（不然随机挑到备忘就没有「结论」了）
+        _settings.set_value("boomerang_scope", ["decided"])
+        first = _bot.boomerang_text()
+        check("回旋镖文案带头 🪃", "🪃" in first)
+        check("回旋镖带上当时的结论", "当时的结论" in first)
+        check("推过一条后池子少一条", store.count_boomerang(3, ["decided"]) == 0)
+        _settings.set_value("boomerang_scope", ["memo"])
+        second = _bot.boomerang_text()
+        check("换一类还能再推一条", "五天前的备忘" in second)
+        check("第二次推的不是同一条", second != first)
+        _settings.set_value("boomerang_scope", scope)
+        third = _bot.boomerang_text()
+        check("推完只剩没满天数的 → 提示再等等", "再等等" in third)
+
+        # 4) 范围配置真的生效（先把上一步打的标记清掉再按范围数一遍）
+        con = sqlite3.connect(store.DB)
+        con.execute("UPDATE memos SET boomerang_at = NULL")
+        con.commit()
+        con.close()
+        saved = _settings.get("boomerang_scope")
+        _settings.set_value("boomerang_scope", ["memo"])
+        check("范围只剩「备忘」→ 只数得到备忘",
+              store.count_boomerang(3, ["memo"]) == 1
+              and store.count_boomerang(3, ["decided"]) == 1)
+        check("范围里没有「已丢弃」→ 那条灵感不算",
+              store.count_boomerang(3, ["dropped"]) == 0)
+        _settings.set_value("boomerang_scope", saved)
+        check("范围恢复后两条都回来", store.count_boomerang(3, saved) == 2)
+
+        # 5) settings：新加的 int 类型要能校验
+        val, err = _settings.normalize("boomerang_days", "abc")
+        check("回溯天数拒绝非整数", val is None and "整数" in err)
+        val, _ = _settings.normalize("boomerang_days", "0")
+        check("回溯天数下限是 1", val is None)
+        val, _ = _settings.normalize("boomerang_days", "9999")
+        check("回溯天数上限是 365", val is None)
+        val, err = _settings.normalize("boomerang_days", "7")
+        check("回溯天数接受 7", val == 7 and err is None)
+        val, err = _settings.normalize("boomerang_scope", "备忘、待处理灵感")
+        check("推送范围认中文标签", val == ["memo", "open"] and err is None)
+        check("推送范围默认含备忘", "memo" in _settings.get("boomerang_scope"))
+        check("回溯天数默认 3", _settings.get("boomerang_days") == 3)
+
+        # 6) 导出：三种格式 + 格式名容错
+        check("normalize_format 认 markdown", _export.normalize_format("markdown") == "md")
+        check("normalize_format 认 .TXT", _export.normalize_format(".TXT") == "txt")
+        check("normalize_format 认不出回默认", _export.normalize_format("pdf") == "md")
+        fname, data = _export.render("md")
+        text = data.decode("utf-8")
+        check("导出文件名带时间戳", fname.startswith("摸鱼bot导出_") and fname.endswith(".md"))
+        check("md 导出有总标题与备忘段", "# 摸鱼bot 导出" in text and "## 备忘" in text)
+        check("md 导出有灵感分组", "## 灵感" in text and "已决议" in text)
+        check("md 导出带上结论", "当时的结论" in text)
+        check("md 导出把正文放进引用块（保留换行）", "> 五天前的备忘" in text)
+        _, jdata = _export.render("json")
+        payload = json.loads(jdata.decode("utf-8"))
+        check("json 导出结构完整",
+              set(payload) >= {"exported_at", "counts", "memos", "ideas"})
+        check("json 导出计数正确", payload["counts"] == {"memo": 1, "idea": 2})
+        _, tdata = _export.render("txt")
+        check("txt 导出有分组标题", "── 备忘" in tdata.decode("utf-8"))
+
+        # 7) 导出指令解析
+        check("parse_export 裸指令", _bot.parse_export("导出") == (True, None))
+        check("parse_export 带格式", _bot.parse_export("导出 json") == (True, "json"))
+        check("parse_export 非指令不误判", _bot.parse_export("导出xx") == (False, None))
+        check("parse_export 普通聊天不误判", _bot.parse_export("导出来看看") == (False, None))
+
+        # 8) 源码护栏：两个入口都接上了，且中文文件名不会乱码
+        T2 = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
+        check("泡泡页有「⬇ 导出」按钮", 'id="btn-export"' in T2)
+        check("导出按钮只在线模式显示", "btn-export').style.display = ''" in T2)
+        check("按钮走 /api/export", "/api/export?format=md" in T2)
+        check("服务端有 /api/export 路由", '"/api/export"' in T2)
+        check("导出响应带 filename*（中文名不乱码）", "filename*=UTF-8''" in T2)
+        CW = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+        check("配置中心有回旋镖分区", '("boomerang", "⑤ 回旋镖"' in CW)
+        check("回旋镖两个键都归到该分区",
+              '"boomerang_days": "boomerang"' in CW
+              and '"boomerang_scope": "boomerang"' in CW)
+        B2 = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+        check("导出强制走文件卡片（不渲染成图）", "as_file=True" in B2)
+        check("帮助菜单提到回旋镖与导出",
+              "回旋镖 [天数]" in B2 and "导出 [格式]" in B2)
+    finally:
+        store.DB = orig_db
+        if orig_set is None:
+            os.environ.pop("MEMO_SETTINGS_FILE", None)
+        else:
+            os.environ["MEMO_SETTINGS_FILE"] = orig_set
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -1278,6 +1618,8 @@ def main():
     test_route()
     test_settings()
     test_config_web()
+    test_console_encoding()
+    test_boomerang_export()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

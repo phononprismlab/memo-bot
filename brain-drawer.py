@@ -1,43 +1,46 @@
-"""把灵感库渲染成一个「思维泡泡」轮播页面，并支持在页面上直接处理灵感。
+"""把「我要做」和「我的想法」渲染成一个不停往上飘的卡片轮播页，并支持在页面上直接处理。
 
-这个文件是干嘛的：读 `memos.db` 里的灵感 → 生成一个不停往上飘的气泡轮播页，
-点气泡就能改状态（已处理 / 已决议 / 丢弃），**在页面上直接写库**，不用导出任何文件。
+这个文件是干嘛的：读 `memos.db` 里的**备忘 + 灵感** → 生成一个不停往上飘的气泡轮播页，
+点卡片就能处理（备忘勾掉 / 灵感改状态），**在页面上直接写库**，不用导出任何文件。
 
-来源：灵感 `[10-08 17:25] (decided) 我想起之前对于个人网站的设想，就是一个我，
-背后不断滚动？浮现那些天马行空的想法……` 的落地。
+🔴 两类内容的分工（这是这个页面存在的理由）：
+  - **备忘（`kind='memo'`）= 我要做**：只有「没勾掉 / 已勾掉」两种，卡片左上角一个勾选框，
+    点一下就勾掉；勾掉的进「✓ 已勾掉」列表，随时能取消。
+  - **灵感（`kind='idea'`）= 我的想法**：有 待处理 / 已处理 / 已决议 / 已丢弃 四个状态。
+  备忘以前只有群指令、没有界面，处理链路是断的 —— 这个页面把它补上。
 
-用法（推荐 --serve：页面直连灵感库，点一下即刻写库，不需要导出任何文件）：
-  python ideas-bubbles.py --serve               # 起本地服务 + 打开浏览器（桌面入口走的就是这条）
-  python ideas-bubbles.py                       # 只生成静态 HTML → 工作区根 灵感泡泡.html
-  python ideas-bubbles.py --apply 灵感操作.json  # 应用离线模式导出的操作
-  python ideas-bubbles.py -o out.html
-  python ideas-bubbles.py --open-only           # 不加载归档，只带「待处理」
-  python ideas-bubbles.py --include-memo        # 连备忘一起放
+用法（推荐 --serve：页面直连库，点一下即刻写库，不需要导出任何文件）：
+  python brain-drawer.py --serve               # 起本地服务 + 打开浏览器（桌面入口走的就是这条）
+  python brain-drawer.py                       # 只生成静态 HTML → 工作区根 脑内抽屉.html
+  python brain-drawer.py --apply 抽屉操作.json  # 应用离线模式导出的操作
+  python brain-drawer.py -o out.html
+  python brain-drawer.py --open-only           # 不加载归档，只带「没勾掉的备忘 + 待处理灵感」
+  python brain-drawer.py --no-memo             # 不带备忘，只看灵感
 
 视图：
-  - **内容流放哪几类由设置决定**（`bubbles_show`，默认只放「待处理」）。
+  - **内容流放哪几类由设置决定**（`bubbles_show`，默认「备忘 + 待处理」）。
     顶部「⚙ 设置」里勾选，改的是 `memo-bot/settings.json` ——
     和配置中心网页、机器人「设置」指令写的是同一份。
-  - 顶部三个按钮「✅ 已处理 / 📌 已决议 / 🗑 垃圾桶」，点开在列表里看，
+  - 顶部四个按钮「✓ 已勾掉 / ✅ 已处理 / 📌 已决议 / 🗑 垃圾桶」，点开在列表里看，
     列表里可以「← 恢复」把某条放回内容流。
   - **有结论的条目会把结论一起显示**（气泡里在正文下方、虚线隔开一段「结论：…」）。
-    没有结论就不显示 —— 和以前一样。已处理 / 已决议 / 已丢弃 通常带结论。
-  - 丢弃 ≠ 删除：记录还在库里，只是进垃圾桶（status=dropped）。
+    没有结论就不显示 —— 和以前一样。
+  - 勾掉 ≠ 删除、丢弃 ≠ 删除：记录还在库里，只是换个桶，随时可恢复。
 
 设计：
   - 气泡从底部升起、横向漂移、顶部淡出，循环不停。
   - 一轮内不重复；一轮放完自动重洗（所以每次打开顺序都不一样）。
-  - 按灵感状态配色；长文本气泡自动缩小字号，**正文完整显示、不截断**（结论同样不截断）；
+  - 按桶配色；长文本气泡自动缩小字号，**正文完整显示、不截断**（结论同样不截断）；
     **换行原样保留**（群里分几行写的，气泡与详情里就是几行）。
   - 悬停暂停单个气泡，点击展开浮层（全文 + 处理按钮 + 结论输入）。
   - 数据在生成时**内嵌**进 HTML —— file:// 下 fetch 本地 JSON 会被 CORS 拦，内嵌最稳。
 
 两种处理模式（页面自动探测）：
   - **在线（--serve，默认用法）**：`GET /api/ping` 通 → 点按钮直接 POST 写 memos.db，
-    并每 20s 拉一次 `/api/ideas`（bot 新收的灵感会自动进流）。顶部「⏻ 停止服务」可停。
-    设置读写走 `GET|POST /api/settings`。
+    并每 20s 拉一次 `/api/items`（bot 新收的灵感会自动进流）。顶部「⏻ 停止服务」可停。
+    设置读写走 `GET|POST /api/settings`；顶部「⬇ 导出」走 `GET /api/export`（浏览器另存为）。
   - **离线（file:// 直接双击 HTML）**：操作暂存 localStorage，顶部显示待提交数，
-    可导出 `灵感操作.json`，再跑 `--apply` 落地 —— 仅作降级（设置也只能看、不能存）。
+    可导出 `抽屉操作.json`，再跑 `--apply` 落地 —— 仅作降级（设置也只能看、不能存）。
 """
 import argparse
 import json
@@ -46,17 +49,34 @@ import re
 import sys
 import threading
 import time
+from urllib.parse import parse_qs, quote, urlparse
+
+# 🔴 把标准输出 / 错误强制切成 UTF-8 —— 这是「双击打不开页面」的真凶（2026-10-09）。
+#    场景：用户双击「脑内抽屉.bat」→ open_drawer.py 用 pythonw 后台拉起本脚本，
+#    子进程的 stdout 是**重定向到文件**的。这时 Python 按系统默认编码写
+#    （中文 Windows = GBK），而下面 serve() 的启动提示里有 ⏻(U+23FB) ——
+#    GBK 没有这个字形 → print 直接抛 UnicodeEncodeError → 异常在
+#    serve_forever() **之前**冒出来，服务根本没起来，页面自然打不开。
+#    开发机上一直测不出来，因为终端环境是 UTF-8（PYTHONIOENCODING=utf-8）。
+#    errors="replace" 兜底：万一还有编不出的字符，打成 ? 而不是让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import export  # noqa: E402  （导出：和机器人「导出」指令共用同一套排版）
 import settings  # noqa: E402  （设置：网页「⚙ 设置」与机器人「设置」指令共用）
 import store  # noqa: E402
 
 WORKSPACE = os.path.dirname(HERE)
-DEFAULT_OUT = os.path.join(WORKSPACE, "灵感泡泡.html")
+DEFAULT_OUT = os.path.join(WORKSPACE, "脑内抽屉.html")
 
-# 状态 → 展示名（颜色在 CSS 里）
+# ── 桶（bucket）= 页面上的一类卡片 ─────────────────────────────
+# 灵感（kind='idea'）的四个处理状态
 STATUS_LABEL = {
     "open": "待处理",
     "done": "已处理",
@@ -65,6 +85,30 @@ STATUS_LABEL = {
 }
 STATUS_ORDER = ("open", "done", "decided", "dropped")
 VALID_STATUS = set(STATUS_ORDER)
+
+# 🔴 备忘（kind='memo'）= 我要做，只有「没勾掉 / 已勾掉」两种；
+#    灵感 = 我的想法，有上面那四个状态。两条流共用一个页面，所以统一用「桶」来分流：
+#    桶名既是 `bubbles_show` 设置里的取值，也直接当卡片的 `data-s`（配色 / 文案都按它查）。
+BUCKET_MEMO = "memo"              # 备忘 · 没勾掉
+BUCKET_MEMO_DONE = "memo_done"    # 备忘 · 已勾掉
+BUCKET_LABEL = {
+    BUCKET_MEMO: "备忘",
+    BUCKET_MEMO_DONE: "备忘 · 已勾掉",
+    "open": "待处理",
+    "done": "已处理",
+    "decided": "已决议",
+    "dropped": "已丢弃",
+}
+BUCKET_ORDER = (BUCKET_MEMO, BUCKET_MEMO_DONE, "open", "done", "decided", "dropped")
+
+
+def bucket_of(row):
+    """一条库里的记录 → 它在页面上的桶名。"""
+    if (row.get("kind") or store.KIND_MEMO) == store.KIND_MEMO:
+        done = (row.get("status") or "") == store.STATUS_DONE
+        return BUCKET_MEMO_DONE if done else BUCKET_MEMO
+    st = row.get("status") or store.STATUS_OPEN
+    return st if st in STATUS_LABEL else store.STATUS_OPEN
 
 
 def clean(text):
@@ -88,26 +132,31 @@ def clean(text):
     return t.strip()
 
 
-def collect(open_only=False, include_memo=False):
-    """读灵感库 → 按时间正序的条目列表（带 id，供页面回写状态）。"""
+def collect(open_only=False, include_memo=True):
+    """读库 → 按时间正序的条目列表（**备忘 + 灵感**，带 id 供页面回写）。
+
+    🔴 备忘和灵感在这一条流里混排：备忘是「我要做」，灵感是「我的想法」。
+       每条带一个桶名 `s`（见 `BUCKET_LABEL`），页面按它分流 / 配色 / 计数。
+    """
+    rows = []
     if include_memo:
-        rows = list(reversed(store.list_memos(500)))
-    else:
-        rows = store.list_ideas(None, 500, newest_first=False)
+        rows += list(reversed(store.list_memos(500, kind=store.KIND_MEMO)))
+    rows += store.list_ideas(None, 500, newest_first=False)
+    rows.sort(key=lambda m: (m.get("created_at") or ""))
     items = []
     for m in rows:
         content = clean(m.get("content"))
         if not content:
             continue
-        status = m.get("status") or "open"
-        if open_only and status != "open":
+        b = bucket_of(m)
+        if open_only and b not in (BUCKET_MEMO, store.STATUS_OPEN):
             continue
         items.append({
             "id": m.get("id") or "",
             "t": content,
-            "s": status if status in STATUS_LABEL else "open",
+            "s": b,
             "d": (m.get("created_at") or "")[:16].replace("T", " "),
-            "k": m.get("kind") or "idea",
+            "k": m.get("kind") or store.KIND_IDEA,
             "note": m.get("note") or "",
         })
     return items
@@ -119,11 +168,12 @@ TEMPLATE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>灵感泡泡__BRAND__</title>
+<title>脑内抽屉__BRAND__</title>
 <style>
   :root{
     --ink:#e6edf3; --dim:#8b98a9; --line:rgba(255,255,255,.12);
     --open:#4fd1c5; --done:#68d391; --decided:#b794f4; --dropped:#7c8798;
+    --memo:#f6ad55; --memo-done:#8b98a9;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
@@ -160,6 +210,7 @@ TEMPLATE = r"""<!doctype html>
   header h1 span{color:var(--dim); font-weight:400; margin-left:8px; font-size:13px}
   .legend{display:flex; gap:12px; margin-left:auto; font-size:12px; color:var(--dim)}
   .legend i{display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px}
+  .legend .l-memo i{background:var(--memo)}
   .legend .l-open i{background:var(--open)}
   .legend .l-done i{background:var(--done)}
   .legend .l-decided i{background:var(--decided)}
@@ -180,13 +231,29 @@ TEMPLATE = r"""<!doctype html>
     border-left:3px solid var(--accent,var(--open));
   }
   .bubble:hover{animation-play-state:paused; background:rgba(255,255,255,.1)}
+  .bubble[data-s="memo"]{--accent:var(--memo)}
+  .bubble[data-s="memo_done"]{--accent:var(--memo-done)}
   .bubble[data-s="open"]{--accent:var(--open)}
   .bubble[data-s="done"]{--accent:var(--done)}
   .bubble[data-s="decided"]{--accent:var(--decided)}
   .bubble[data-s="dropped"]{--accent:var(--dropped)}
+  /* 卡头一行：备忘的勾选框 + 状态/时间 */
+  .bubble .hd{display:flex; align-items:center; gap:8px; margin-bottom:5px}
   .bubble .meta{
     display:block; font-size:10.5px; letter-spacing:.5px; color:var(--dim);
-    margin-bottom:5px; text-transform:uppercase;
+    margin-bottom:0; text-transform:uppercase;
+  }
+  /* 🔴 勾选框用 CSS 画，不用 ☐ / ☑ 字符 —— 字符字形在部分系统上会缺（踩过 🫧 的坑）。 */
+  .bubble .chk{
+    flex:0 0 auto; width:15px; height:15px; border-radius:4px; position:relative;
+    border:1.5px solid rgba(255,255,255,.34); background:rgba(255,255,255,.06);
+    cursor:pointer; transition:.15s;
+  }
+  .bubble .chk:hover{border-color:var(--memo); background:rgba(246,173,85,.18)}
+  .bubble .chk.on{background:var(--done); border-color:var(--done)}
+  .bubble .chk.on::after{
+    content:""; position:absolute; left:4px; top:1px; width:4px; height:8px;
+    border:solid #0d1a2b; border-width:0 2px 2px 0; transform:rotate(45deg);
   }
   .bubble .txt{word-break:break-word; white-space:pre-wrap}
   /* 结论 / 备注：只有这条**有**结论时才渲染（已处理 / 已决议 / 已丢弃 常见）。
@@ -267,6 +334,7 @@ TEMPLATE = r"""<!doctype html>
   .bar .pill.act[data-s="done"]:hover{border-color:var(--done); color:var(--done)}
   .bar .pill.act[data-s="decided"]:hover{border-color:var(--decided); color:var(--decided)}
   .bar .pill.act[data-s="dropped"]:hover{border-color:var(--dropped); color:var(--ink)}
+  .bar .pill.act[data-s="memo_done"]:hover{border-color:var(--memo); color:var(--memo)}
   .bar .pill.act.zero{opacity:.42}
   .bar .pill.quit{cursor:pointer}
   .bar .pill.quit:hover{color:#fc8181; border-color:rgba(252,129,129,.5)}
@@ -304,10 +372,23 @@ TEMPLATE = r"""<!doctype html>
     border-left:3px solid var(--accent,var(--dim));
   }
   #list .row:hover{background:rgba(255,255,255,.08); border-color:var(--line); border-left-color:var(--accent)}
+  #list .row[data-s="open"]{--accent:var(--open)}
   #list .row[data-s="done"]{--accent:var(--done)}
   #list .row[data-s="decided"]{--accent:var(--decided)}
   #list .row[data-s="dropped"]{--accent:var(--dropped)}
-  #list .row[data-s="open"]{--accent:var(--open)}
+  #list .row[data-s="memo"]{--accent:var(--memo)}
+  #list .row[data-s="memo_done"]{--accent:var(--memo-done)}
+  #list .row .chk{
+    flex:0 0 auto; margin-top:2px; width:15px; height:15px; border-radius:4px; position:relative;
+    border:1.5px solid rgba(255,255,255,.34); background:rgba(255,255,255,.06);
+    cursor:pointer; transition:.15s;
+  }
+  #list .row .chk:hover{border-color:var(--memo); background:rgba(246,173,85,.18)}
+  #list .row .chk.on{background:var(--done); border-color:var(--done)}
+  #list .row .chk.on::after{
+    content:""; position:absolute; left:4px; top:1px; width:4px; height:8px;
+    border:solid #0d1a2b; border-width:0 2px 2px 0; transform:rotate(45deg);
+  }
   #list .row .c{flex:1 1 auto; min-width:0}
   #list .row .m{font-size:10.5px; color:var(--dim); letter-spacing:.5px; margin-bottom:4px}
   #list .row .x{font-size:13.5px; line-height:1.65; white-space:pre-wrap; word-break:break-word}
@@ -420,8 +501,9 @@ TEMPLATE = r"""<!doctype html>
 <body>
 <div class="topbar">
   <header>
-    <h1>💭 灵感泡泡<span>__BRAND__</span></h1>
+    <h1>🗂 脑内抽屉<span>__BRAND__</span></h1>
     <div class="legend">
+      <span class="l-memo"><i></i>备忘</span>
       <span class="l-open"><i></i>待处理</span>
       <span class="l-done"><i></i>已处理</span>
       <span class="l-decided"><i></i>已决议</span>
@@ -431,27 +513,33 @@ TEMPLATE = r"""<!doctype html>
   <div class="bar">
     <span class="pill" id="mode">检测中…</span>
     <span class="pill pending" id="pending" style="display:none"></span>
+    <span class="pill act" id="btn-memo_done" data-s="memo_done">✓ 已勾掉<b>0</b></span>
     <span class="pill act" id="btn-done" data-s="done">✅ 已处理<b>0</b></span>
     <span class="pill act" id="btn-decided" data-s="decided">📌 已决议<b>0</b></span>
     <span class="pill act" id="btn-dropped" data-s="dropped">🗑 垃圾桶<b>0</b></span>
     <span class="pill act" id="btn-settings" title="内容流放哪几类">⚙ 设置</span>
+    <span class="pill act" id="btn-export" style="display:none"
+          title="把全部备忘 + 灵感导出成一个文件；想导 json / txt 就在群里发「导出 json」">⬇ 导出</span>
     <span class="pill quit" id="btn-quit" style="display:none">⏻ 停止服务</span>
   </div>
 </div>
 
 <div id="stage"></div>
 
-<div id="empty"><div class="big">🎉</div><div>灵感都处理完了</div></div>
+<div id="empty"><div class="big">🎉</div><div>抽屉里没有要处理的了</div></div>
 
 <div id="modal"><div class="card">
   <div class="meta"></div>
   <div class="body"></div>
   <textarea class="note" id="note" rows="2" placeholder="结论 / 备注（可选）"></textarea>
-  <div class="actions">
+  <div class="actions ideaact">
     <button data-act="done">✅ 已处理</button>
     <button data-act="decided">📌 已决议</button>
     <button data-act="dropped">🗑 丢弃</button>
     <button data-act="open">← 恢复待处理</button>
+  </div>
+  <div class="actions memoact" style="display:none">
+    <button data-memo="1">✓ 勾掉这条备忘</button>
   </div>
   <div class="hint">处理后会从轮播移出 · 点卡片外关闭 · 空格暂停/继续</div>
 </div></div>
@@ -506,19 +594,27 @@ const nArchEl = document.getElementById('n-arch');
 document.getElementById('gen').textContent = GEN;
 
 /* ── 分流 ────────────────────────────────────────────────────
-   🔴 内容流放哪几类由**设置**决定（`bubbles_show`，默认只放「待处理」）；
-      已处理 / 已决议 / 已丢弃 另有归档列表（点顶部按钮看）。
+   🔴 两类内容：备忘（`k='memo'`，我要做，只有勾掉/没勾掉）和灵感（`k='idea'`，我的想法）。
+      每条带一个**桶名** `s`，桶名进 `bubbles_show` 设置、也当卡片的 `data-s`。
+      内容流放哪几个桶由**设置**决定（默认「备忘 + 待处理」）；
+      其余桶各有归档列表（点顶部按钮看）。
       展示范围在页面上改：顶部「⚙ 设置」，和机器人「设置」指令是同一份。 */
-const ARCHIVE = ['done', 'decided', 'dropped'];
-const ARCHIVE_TITLE = { done: '✅ 已处理', decided: '📌 已决议', dropped: '🗑 垃圾桶' };
-const ARCHIVE_EMPTY = { done: '还没有处理完的灵感', decided: '还没有下过结论的灵感', dropped: '垃圾桶是空的' };
+const ARCHIVE = ['memo_done', 'done', 'decided', 'dropped'];
+const ARCHIVE_TITLE = {
+  memo_done: '✓ 已勾掉的备忘', done: '✅ 已处理',
+  decided: '📌 已决议', dropped: '🗑 垃圾桶',
+};
+const ARCHIVE_EMPTY = {
+  memo_done: '还没有勾掉过备忘', done: '还没有处理完的灵感',
+  decided: '还没有下过结论的灵感', dropped: '垃圾桶是空的',
+};
 
 let SETTINGS = __SETTINGS__;
 function settingValue(key){
   const s = SETTINGS.find(x => x.key === key);
   return s ? s.value : null;
 }
-let SHOW = settingValue('bubbles_show') || ['open'];
+let SHOW = settingValue('bubbles_show') || ['memo', 'open'];
 
 function streamItems(){ return IDEAS.filter(x => SHOW.includes(x.s)); }
 function countBy(s){ return IDEAS.filter(x => x.s === s).length; }
@@ -584,8 +680,9 @@ async function detectMode(){
   }
   if(MODE === 'serve'){
     modeEl.className = 'pill live';
-    modeEl.textContent = '● 已连灵感库 · 处理即刻写库';
+    modeEl.textContent = '● 已连本地库 · 处理即刻写库';
     document.getElementById('btn-quit').style.display = '';
+    document.getElementById('btn-export').style.display = '';
     await refreshSettings();                    // 展示范围以服务端为准（可能被指令改过）
     updateCounts();
     setInterval(refreshFromServer, 20000);      // 实时：bot 新收的灵感自动进流
@@ -603,7 +700,7 @@ async function refreshFromServer(){
   if(modal.classList.contains('on') || listEl.classList.contains('on')
      || settingsEl.classList.contains('on')) return;
   try{
-    const r = await fetch('/api/ideas', {cache:'no-store'});
+    const r = await fetch('/api/items', {cache:'no-store'});
     const j = await r.json();
     if(!j || !j.ok) return;
     const incoming = j.items || [];
@@ -621,9 +718,9 @@ async function refreshFromServer(){
 }
 
 // 🔴 改状态 ≠ 删记录：只把它从内容流挪到对应归档列表（丢弃也一样，进垃圾桶而不是消失）
-function moveIdea(id, status){
+function moveItem(id, bucket){
   const it = IDEAS.find(x=>x.id === id);
-  if(it) it.s = status;
+  if(it) it.s = bucket;
   queue = queue.filter(x=>x.id !== id);
   stage.querySelectorAll('.bubble').forEach(el=>{ if(el.dataset.id === id) el.remove(); });
   updateCounts();
@@ -645,23 +742,64 @@ async function applyStatus(it, status, note){
     renderPending();
   }
   if(note) it.note = note;
-  moveIdea(it.id, status);
+  moveItem(it.id, status);
   toast('已标记「' + (LABEL[status]||status) + '」'
         + (MODE === 'serve' ? '' : ' · 暂存中，记得导出'));
 }
 
+/* ── 备忘：只有「勾掉 / 没勾掉」两态 ──────────────────────
+   备忘 = 我要做，不需要「已决议 / 已丢弃」那一套；勾掉就进「✓ 已勾掉」列表。
+   🔴 勾掉 ≠ 删除：记录还在库里（status='done'），随时能取消。 */
+async function applyMemoDone(it, done){
+  if(MODE === 'serve'){
+    const r = await fetch('/api/memo', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: it.id, done: !!done}),
+    });
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || '写入失败');
+  } else {
+    pending[it.id] = {k:'memo', done: !!done, t: Date.now()};
+    lsSet(PENDING_KEY, pending);
+    renderPending();
+  }
+  moveItem(it.id, done ? 'memo_done' : 'memo');
+  toast((done ? '已勾掉 ✓' : '已取消勾掉')
+        + (MODE === 'serve' ? '' : ' · 暂存中，记得导出'));
+}
+
+/* 卡片上的勾选框（CSS 画的方框，勾上用对勾伪元素）。
+   `after` 是勾完之后要做的事 —— 气泡上不用传，列表里要重渲染一遍。 */
+function makeChk(it, after){
+  const cb = document.createElement('span');
+  cb.className = 'chk' + (it.s === 'memo_done' ? ' on' : '');
+  cb.title = it.s === 'memo_done' ? '已勾掉 —— 点一下取消' : '点一下勾掉';
+  cb.addEventListener('click', async (e)=>{
+    e.stopPropagation();                 // 别顺手把详情浮层也打开了
+    cb.style.pointerEvents = 'none';
+    try { await applyMemoDone(it, it.s !== 'memo_done'); if(after) after(); }
+    catch(err){ toast('写入失败：' + err.message); }
+    finally { cb.style.pointerEvents = ''; }
+  });
+  return cb;
+}
+
 pendEl.addEventListener('click', ()=>{
-  const ops = Object.entries(pending).map(([id, v])=>({id: id, status: v.s, note: v.note || ''}));
+  // 备忘的暂存记的是「勾掉没勾掉」，灵感的记的是「状态 + 结论」—— 导出时分开写
+  const ops = Object.entries(pending).map(([id, v]) => v.k === 'memo'
+      ? {id: id, kind: 'memo', done: !!v.done}
+      : {id: id, status: v.s, note: v.note || ''});
   if(!ops.length) return;
   const blob = new Blob([JSON.stringify({ops: ops}, null, 2)], {type:'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = '灵感操作.json';
+  a.download = '抽屉操作.json';
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
-  toast('已导出 ' + ops.length + ' 条 —— 再跑：python memo-bot/ideas-bubbles.py --apply 灵感操作.json');
+  toast('已导出 ' + ops.length + ' 条 —— 再跑：python memo-bot/brain-drawer.py --apply 抽屉操作.json');
 });
 
 /* ── 气泡 ───────────────────────────────────────────────── */
@@ -840,13 +978,17 @@ function spawn(warm){
   const amp = isLong ? 0.32 : 0.60;
   el.style.setProperty('--dx', (dir * (0.12 + Math.random() * amp) * cfg.gap).toFixed(2) + 'vw');
 
+  const hd = document.createElement('div');
+  hd.className = 'hd';
+  if(it.k === 'memo') hd.append(makeChk(it));   // 🔴 备忘卡片左上角一个勾选框（勾掉没勾掉一眼看到）
   const meta = document.createElement('span');
   meta.className = 'meta';
   meta.textContent = (LABEL[it.s]||'') + ' · ' + it.d;
+  hd.append(meta);
   const txt = document.createElement('div');
   txt.className = 'txt';
   txt.textContent = it.t;              // 🔴 全文不截断，且原样保留换行（容器是 pre-wrap）
-  el.append(meta, txt);
+  el.append(hd, txt);
   // 🔴 有结论就把结论一起显示（已处理 / 已决议 / 已丢弃 常见）；
   //    没有结论**不渲染**这个节点 —— 与以前完全一致。
   if(it.note){
@@ -865,14 +1007,21 @@ function openModal(it){
   current = it;
   modal.querySelector('.meta').textContent = (LABEL[it.s]||'') + ' · ' + it.d;
   modal.querySelector('.body').textContent = it.t;
+  const isMemo = it.k === 'memo';
+  // 备忘只有「勾掉 / 取消勾掉」一个动作，也没有「结论」这个概念 —— 换一套操作区
   noteEl.value = it.note || '';
+  noteEl.style.display = isMemo ? 'none' : '';
+  modal.querySelector('.ideaact').style.display = isMemo ? 'none' : '';
+  modal.querySelector('.memoact').style.display = isMemo ? '' : 'none';
+  modal.querySelector('.memoact button').textContent =
+      it.s === 'memo_done' ? '← 取消勾掉' : '✓ 勾掉这条备忘';
   modal.classList.add('on');
 }
 
 // 只有点「卡片外」才关 —— 否则点输入框也会误关
 modal.addEventListener('click', (e)=>{ if(e.target === modal) modal.classList.remove('on'); });
 
-modal.querySelectorAll('.actions button').forEach(btn=>{
+modal.querySelectorAll('.ideaact button').forEach(btn=>{
   btn.addEventListener('click', async (e)=>{
     e.stopPropagation();
     if(!current) return;
@@ -891,13 +1040,33 @@ modal.querySelectorAll('.actions button').forEach(btn=>{
   });
 });
 
-/* ── 归档列表：已处理 / 已决议 / 垃圾桶 ──────────────────── */
+// 备忘：浮层里那一个按钮（勾掉 / 取消勾掉）
+modal.querySelector('.memoact button').addEventListener('click', async (e)=>{
+  e.stopPropagation();
+  if(!current) return;
+  const btn = e.currentTarget;
+  const want = current.s !== 'memo_done';
+  btn.disabled = true;
+  try {
+    await applyMemoDone(current, want);
+    modal.classList.remove('on');
+    current = null;
+  } catch(err){
+    toast('写入失败：' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ── 归档列表：已勾掉的备忘 / 已处理 / 已决议 / 垃圾桶 ────── */
 let listStatus = null;
 
 function makeRow(it){
   const row = document.createElement('div');
   row.className = 'row';
   row.dataset.s = it.s;
+  const isMemo = it.k === 'memo';
+  if(isMemo) row.append(makeChk(it, renderList));   // 列表里也直接显示勾掉状态
   const c = document.createElement('div');
   c.className = 'c';
   const m = document.createElement('div');
@@ -916,14 +1085,26 @@ function makeRow(it){
   const ops = document.createElement('div');
   ops.className = 'ops';
   const b = document.createElement('button');
-  b.textContent = '← 恢复';
-  b.title = '放回内容流（变回待处理）';
-  b.addEventListener('click', async (e)=>{
-    e.stopPropagation();
-    b.disabled = true;
-    try { await applyStatus(it, 'open', it.note || ''); renderList(); }
-    catch(err){ toast('写入失败：' + err.message); b.disabled = false; }
-  });
+  if(isMemo){
+    const want = it.s !== 'memo_done';
+    b.textContent = want ? '✓ 勾掉' : '← 取消勾掉';
+    b.title = want ? '勾掉这条备忘' : '取消勾掉，放回内容流';
+    b.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      b.disabled = true;
+      try { await applyMemoDone(it, want); renderList(); }
+      catch(err){ toast('写入失败：' + err.message); b.disabled = false; }
+    });
+  } else {
+    b.textContent = '← 恢复';
+    b.title = '放回内容流（变回待处理）';
+    b.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      b.disabled = true;
+      try { await applyStatus(it, 'open', it.note || ''); renderList(); }
+      catch(err){ toast('写入失败：' + err.message); b.disabled = false; }
+    });
+  }
   ops.append(b);
   row.append(c, ops);
   row.addEventListener('click', ()=> openModal(it));
@@ -953,7 +1134,7 @@ async function openList(status){
   // 列表开着时轮询是停的 —— 打开前手动同步一次，保证看到的是库里的最新状态
   if(MODE === 'serve'){
     try{
-      const r = await fetch('/api/ideas', {cache:'no-store'});
+      const r = await fetch('/api/items', {cache:'no-store'});
       const j = await r.json();
       if(j && j.ok){
         const incoming = j.items || [];
@@ -1069,7 +1250,7 @@ function collectSettings(){
 function applySettingsPayload(keys){
   if(Array.isArray(keys) && keys.length){
     SETTINGS = keys;
-    SHOW = settingValue('bubbles_show') || ['open'];
+    SHOW = settingValue('bubbles_show') || ['memo', 'open'];
   }
 }
 
@@ -1101,7 +1282,7 @@ async function openSettings(){
   if(MODE === 'serve'){
     await refreshSettings();
   } else {
-    smsgEl.textContent = '离线模式：只能看，改动要用桌面「灵感泡泡」打开';
+    smsgEl.textContent = '离线模式：只能看，改动要用桌面「脑内抽屉」打开';
   }
   renderSettings();
   settingsEl.classList.add('on');
@@ -1109,7 +1290,7 @@ async function openSettings(){
 
 async function saveSettings(){
   if(MODE !== 'serve'){
-    smsgEl.textContent = '离线模式存不了 —— 用桌面「灵感泡泡」打开再改';
+    smsgEl.textContent = '离线模式存不了 —— 用桌面「脑内抽屉」打开再改';
     return;
   }
   try{
@@ -1139,6 +1320,13 @@ async function saveSettings(){
 }
 
 document.getElementById('btn-settings').addEventListener('click', openSettings);
+
+/* 「⬇ 导出」：让浏览器直接「另存为」。
+   走服务端 /api/export —— 和机器人「导出」指令共用 export.py 里同一套排版，
+   两边导出来的文件长得一模一样。想导 json / txt 就在群里发「导出 json」。 */
+document.getElementById('btn-export').addEventListener('click', ()=>{
+  location.href = '/api/export?format=md';
+});
 document.getElementById('sclose').addEventListener('click', ()=> settingsEl.classList.remove('on'));
 settingsEl.addEventListener('click', (e)=>{ if(e.target === settingsEl) settingsEl.classList.remove('on'); });
 document.getElementById('ssave').addEventListener('click', saveSettings);
@@ -1198,13 +1386,18 @@ def build_html(items):
         .replace("__BRAND__", _BRAND_SUFFIX if PAGE_BRAND else "")
         .replace("__SETTINGS__", cfg)
         .replace("__DATA__", data)
-        .replace("__LABEL__", json.dumps(STATUS_LABEL, ensure_ascii=False))
+        .replace("__LABEL__", json.dumps(BUCKET_LABEL, ensure_ascii=False))
         .replace("__GEN__", json.dumps(time.strftime("%Y-%m-%d %H:%M"), ensure_ascii=False))
     ), stats
 
 
 def apply_ops(path):
-    """应用离线模式导出的 `灵感操作.json`。"""
+    """应用离线模式导出的 `抽屉操作.json`。
+
+    两种条目：
+      - 灵感：`{"id":…, "status":"done|decided|dropped|open", "note":…}`
+      - 备忘：`{"id":…, "kind":"memo", "done":true|false}`
+    """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     ops = data.get("ops") if isinstance(data, dict) else data
@@ -1215,13 +1408,22 @@ def apply_ops(path):
     n = 0
     for op in ops:
         iid = (op.get("id") or "").strip()
-        status = (op.get("status") or "").strip()
-        if not iid or status not in VALID_STATUS:
+        if not iid:
             print(f"  跳过非法条目：{op}")
             continue
-        c = store.set_idea_status([iid], status, (op.get("note") or "").strip() or None)
+        if op.get("kind") == "memo" or "done" in op:
+            done = bool(op.get("done"))
+            c = store.set_memo_done([iid], done)
+            label = BUCKET_LABEL[BUCKET_MEMO_DONE] if done else BUCKET_LABEL[BUCKET_MEMO]
+        else:
+            status = (op.get("status") or "").strip()
+            if status not in VALID_STATUS:
+                print(f"  跳过非法条目：{op}")
+                continue
+            c = store.set_idea_status([iid], status, (op.get("note") or "").strip() or None)
+            label = STATUS_LABEL[status]
         n += c
-        print(f"  [{STATUS_LABEL[status]}] {iid[:8]} {'OK' if c else '（未找到）'}")
+        print(f"  [{label}] {iid[:8]} {'OK' if c else '（未找到）'}")
     print(f"已应用 {n} 条")
     return 0
 
@@ -1229,8 +1431,9 @@ def apply_ops(path):
 def _make_handler(doc):
     """本地服务的请求处理器。
 
-    静态页 + `GET /api/ping` / `GET /api/ideas` / `GET|POST /api/settings`
-    + `POST /api/status` / `POST /api/quit`。
+    静态页 + `GET /api/ping` / `GET /api/items`（备忘 + 灵感，`/api/ideas` 是旧别名）
+    + `GET /api/export` / `GET|POST /api/settings`
+    + `POST /api/status`（灵感改状态）/ `POST /api/memo`（备忘勾掉）/ `POST /api/quit`。
     """
     from http.server import BaseHTTPRequestHandler
 
@@ -1257,10 +1460,31 @@ def _make_handler(doc):
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}")
 
+        def _send_file(self, fname, data, ctype):
+            """给浏览器一个「另存为」响应（「⬇ 导出」用）。"""
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            # 文件名是中文 → 必须用 RFC 5987 的 filename*，否则浏览器拿到的是乱码
+            self.send_header("Content-Disposition",
+                             f"attachment; filename*=UTF-8''{quote(fname)}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             if self.path.startswith("/api/ping"):
                 return self._send(200, {"ok": True, "mode": "serve"})
-            if self.path.startswith("/api/ideas"):
+            if self.path.startswith("/api/export"):
+                q = parse_qs(urlparse(self.path).query)
+                fmt = (q.get("format") or ["md"])[0]
+                try:
+                    fname, data = export.render(fmt)
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                return self._send_file(fname, data, export.MIME[export.normalize_format(fmt)])
+            if self.path.startswith("/api/items") or self.path.startswith("/api/ideas"):
+                # `/api/ideas` 是旧路径，保留兼容（老的静态页/脚本还在用它）
                 return self._send(200, {"ok": True, "items": collect()})
             if self.path.startswith("/api/settings"):
                 return self._send(200, {"ok": True, "keys": settings.describe()})
@@ -1292,6 +1516,24 @@ def _make_handler(doc):
                     return self._send(400, {"ok": False, "error": "；".join(errs)})
                 print(f"  [设置] 已更新 {n_ok} 项", flush=True)
                 return self._send(200, {"ok": True, "keys": settings.describe()})
+            if self.path.startswith("/api/memo"):
+                # 备忘勾掉 / 取消勾掉 —— 备忘没有「已决议 / 已丢弃」那一套
+                try:
+                    payload = self._read_json()
+                except (ValueError, OSError) as e:
+                    return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
+                iid = (payload.get("id") or "").strip()
+                done = bool(payload.get("done"))
+                if not iid:
+                    return self._send(400, {"ok": False, "error": "id 不合法"})
+                try:
+                    changed = store.set_memo_done([iid], done)
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                if not changed:
+                    return self._send(404, {"ok": False, "error": "没找到这条备忘（可能已被删）"})
+                print(f"  [备忘{'已勾掉' if done else '取消勾掉'}] {iid[:8]}", flush=True)
+                return self._send(200, {"ok": True, "changed": changed})
             if not self.path.startswith("/api/status"):
                 return self._send(404, {"ok": False, "error": "not found"})
             try:
@@ -1335,8 +1577,11 @@ def serve(doc, port=8765, open_browser=True, tries=12):
         return 1
 
     url = f"http://127.0.0.1:{port}/"
-    print(f"灵感泡泡服务已启动：{url}")
-    print("  处理按钮**直接写入** memos.db；页面顶部「⏻ 停止服务」可停，Ctrl+C 也行。")
+    # 🔴 flush=True：stdout 被重定向到文件时是块缓冲的，不 flush 的话这几行会一直
+    #    卡在缓冲区里 —— 服务被 Ctrl+C 停掉时整段丢失，open_drawer_child.log 里
+    #    只剩一个「服务已退出」的空白，排错时看不到任何线索。
+    print(f"脑内抽屉服务已启动：{url}", flush=True)
+    print("  处理按钮**直接写入** memos.db；页面顶部「⏻ 停止服务」可停，Ctrl+C 也行。", flush=True)
     if open_browser:
         try:
             import webbrowser
@@ -1354,31 +1599,31 @@ def serve(doc, port=8765, open_browser=True, tries=12):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="灵感泡泡轮播页面（生成静态页 / 起本地服务）")
+    ap = argparse.ArgumentParser(description="脑内抽屉轮播页面（备忘 + 灵感；生成静态页 / 起本地服务）")
     ap.add_argument("-o", "--out", default=DEFAULT_OUT, help="静态 HTML 输出路径")
-    ap.add_argument("--serve", action="store_true", help="起本地服务，页面可直接处理灵感")
+    ap.add_argument("--serve", action="store_true", help="起本地服务，页面可直接处理备忘 / 灵感")
     ap.add_argument("--port", type=int, default=8765, help="--serve 的起始端口")
     ap.add_argument("--no-browser", action="store_true", help="--serve 时不自动打开浏览器")
     ap.add_argument("--apply", metavar="JSON", help="应用离线模式导出的操作文件")
-    ap.add_argument("--open-only", action="store_true", help="只放待处理的灵感")
-    ap.add_argument("--include-memo", action="store_true", help="连备忘一起放")
+    ap.add_argument("--open-only", action="store_true", help="只放「没勾掉的备忘 + 待处理灵感」")
+    ap.add_argument("--no-memo", action="store_true", help="不带备忘，只看灵感")
     args = ap.parse_args()
 
     if args.apply:
         sys.exit(apply_ops(args.apply))
 
     store.init()
-    items = collect(args.open_only, args.include_memo)
+    items = collect(args.open_only, not args.no_memo)
     if not items and not args.serve:
         # 静态快照模式：空库确实没东西可放。
-        # 🔴 但 --serve 不能退 —— 页面还得能打开去看归档（已处理/已决议/垃圾桶），
+        # 🔴 但 --serve 不能退 —— 页面还得能打开去看归档（已勾掉/已处理/已决议/垃圾桶），
         #    否则「库一空，服务就起不来」= 一个完全静默的失败（2026-10-09 修）。
-        print("（灵感库是空的，没有可放的内容）")
+        print("（库里是空的，没有可放的内容）")
         sys.exit(1)
 
     doc, stats = build_html(items)
     brief = f"共 {len(items)} 条 · " + " / ".join(
-        f"{STATUS_LABEL[k]} {stats.get(k, 0)}" for k in STATUS_ORDER if stats.get(k)
+        f"{BUCKET_LABEL[k]} {stats.get(k, 0)}" for k in BUCKET_ORDER if stats.get(k)
     )
 
     if args.serve:

@@ -31,6 +31,15 @@ import re
 import sys
 from datetime import datetime
 
+# 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 默认 GBK，print 到编不出的字符
+#    （emoji / ⏻ / ⚙ 等）会抛 UnicodeEncodeError 把进程带崩。
+#    errors="replace" 兜底，不让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 

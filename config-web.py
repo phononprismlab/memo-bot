@@ -5,7 +5,7 @@
   ① 填 QQ 机器人凭据（AppID / AppSecret / 目标群 openid / 沙箱）  → 写 `.env`
   ② 改备忘触发词、启动播报、关机通知文案                        → 写 `.env` / `settings.json`
   ③ 选「发文件」的搜索根目录（带目录浏览器 + 实测：多少文件、搜一次多久）
-  ④ 勾灵感泡泡的展示范围                                        → 写 `settings.json`
+  ④ 勾脑内抽屉的展示范围                                        → 写 `settings.json`
   ⑤ 一键开关「开机自启」（注册 / 删除 Windows 计划任务 `MoyuBot`）
   ⑥ 启动 / 停止 / 重启机器人，并自检依赖是否装齐
   ⑦ 管理忽略表（别把同群其他机器人当内容收）
@@ -34,6 +34,15 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 默认 GBK，终端里编不出的字符
+#    （emoji / ⏻ / ⚙ 等）会让 print 抛 UnicodeEncodeError 把服务带崩。
+#    errors="replace" 兜底：编不出的打成 ?，不让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -534,9 +543,10 @@ GROUPS = [
     ("bot", "① 连接 QQ", "在 https://q.qq.com 创建机器人后，把凭据填进来。必填。"),
     ("behavior", "② 群内行为", "备忘触发词与两句播报文案。"),
     ("files", "③ 发文件", "「发文件」功能的检索范围。"),
-    ("bubbles", "④ 灵感泡泡", "轮播页里放哪几类灵感。"),
-    ("runtime", "⑤ 运行方式", "开机自启、机器人进程、依赖自检。"),
-    ("ignore", "⑥ 忽略表", "别把同群里其他机器人的话当内容收进来。"),
+    ("bubbles", "④ 脑内抽屉", "轮播页里放哪几类（备忘 / 灵感）。"),
+    ("boomerang", "⑤ 回旋镖", "把 N 天前的旧记录翻出来推回给用户（发「回旋镖」触发）。"),
+    ("runtime", "⑥ 运行方式", "开机自启、机器人进程、依赖自检。"),
+    ("ignore", "⑦ 忽略表", "别把同群里其他机器人的话当内容收进来。"),
 ]
 
 
@@ -566,7 +576,8 @@ def state_fields():
             "default": spec.get("default", ""),
         })
 
-    group_of = {"startup_msg": "behavior", "offwork_msg": "behavior", "bubbles_show": "bubbles"}
+    group_of = {"startup_msg": "behavior", "offwork_msg": "behavior", "bubbles_show": "bubbles",
+                "boomerang_days": "boomerang", "boomerang_scope": "boomerang"}
     for s in _settings.describe():
         out.append({
             "target": "settings", "key": s["key"], "label": s["label"], "help": s["help"],
@@ -1268,10 +1279,12 @@ def serve(port=DEFAULT_PORT, open_browser=True, tries=PORT_TRIES):
         return 1
 
     url = f"http://127.0.0.1:{port}/"
-    print(f"配置中心已启动：{url}")
+    # 🔴 flush=True：stdout 被重定向到文件 / 管道时是块缓冲的，不 flush 会一直卡在
+    #    缓冲区里 —— 用户双击 .bat 时看不到「已启动」提示，排错时也没有任何线索。
+    print(f"配置中心已启动：{url}", flush=True)
     print("  改完点页面底部「保存」；凭据写 .env（自动备份 .env.bak），"
-          "文案与展示范围写 settings.json。")
-    print("  页面底部「关闭配置中心」或 Ctrl+C 可停。")
+          "文案与展示范围写 settings.json。", flush=True)
+    print("  页面底部「关闭配置中心」或 Ctrl+C 可停。", flush=True)
     if open_browser:
         try:
             webbrowser.open(url)

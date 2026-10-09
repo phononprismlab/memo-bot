@@ -34,7 +34,18 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from types import SimpleNamespace
+
+# 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 上默认是 GBK，一旦日志或回执文案里
+#    出现 GBK 编不出的字符（emoji / ⏻ / ⚙ 等），print 会抛 UnicodeEncodeError。
+#    本进程是常驻的（计划任务 + pythonw 无窗口），崩了用户完全看不到 —— 必须防住。
+#    errors="replace" 兜底：编不出的字符打成 ?，不让进程挂掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 
 from store import (
     init,
@@ -45,11 +56,15 @@ from store import (
     KIND_MEMO,
     KIND_IDEA,
     STATUS_OPEN,
+    pick_boomerang,
+    count_boomerang,
+    mark_boomerang,
 )
 import moyu
 import extensions as _ext
 import ignore as _ignore
 import settings as _settings
+import export as _export
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_MSG_FILE = os.path.join(HERE, "last_group_msg.json")
@@ -168,6 +183,8 @@ HELP_BASE = (
     "查灵感 —— 看还没处理的灵感\n"
     "发文件 <关键词> —— 搜文件并渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
+    "回旋镖 [天数] —— 把 N 天前（默认 3 天）记过的旧账翻一条回来\n"
+    "导出 [格式] —— 把全部备忘 + 灵感导成一个文件发给你（格式 md / txt / json）\n"
     "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
     "设置 —— 看/改本机设置（网页「配置中心」改的是同一份）；\n"
@@ -178,6 +195,11 @@ HELP_BASE = (
 MEMO_LIST_CMDS = {"查备忘", "查看备忘", "备忘列表", "列备忘"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
 HELP_CMDS = {"帮助", "菜单", "指令", "help"}
+# ── 回旋镖：把 N 天以前的旧记录翻一条推回给用户 ───────────────────
+# 指令词只认完整写法，不用「镖」「回旋」这种短词 —— 否则「飞镖」「回旋踢」会被误判。
+BOOMERANG_CMDS = ("回旋镖", "回旋标")
+# ── 导出：把全部备忘 + 灵感导成一个文件发回来 ─────────────────────
+EXPORT_CMDS = ("导出",)
 # ── 「摸鱼」：随机抽一条放松/摸鱼/冷知识 ───────────────────────────
 # 指令识别在 moyu.parse() 里（归一化 + 前缀匹配），这里不重复写正则。
 MOYU_BADARG_HINT = "（摸鱼后面可以写：条数 1~5 / 放松 / 冷知识 / 全部）"
@@ -225,6 +247,77 @@ def chat_target(message, scope):
     sid = (getattr(author, "member_openid", "") or "") if author else ""
     return {"key": f"group:{openid}", "store_id": openid, "store_name": "",
             "openid": openid, "sender_id": sid}
+
+
+# ── 回旋镖：把旧记录翻一条推回来 ──────────────────────────────────
+def parse_boomerang(text):
+    """`回旋镖` / `回旋镖 7` → (True, None) / (True, 7)；不是这个指令 → (False, None)。
+
+    天数可以写在指令后面，临时改这一次的回溯范围（不用去配置中心改设置）。
+    """
+    t = (text or "").strip()
+    for c in BOOMERANG_CMDS:
+        if not t.startswith(c):
+            continue
+        rest = t[len(c):]
+        if not rest.strip():
+            return True, None
+        m = re.match(r"^[ ：:　\t]*(\d{1,4})", rest)
+        if m:
+            return True, max(1, min(3650, int(m.group(1))))
+        return False, None          # 「回旋镖xx」这种不是指令，落回普通流程
+    return False, None
+
+
+def boomerang_text(days=None, now=None):
+    """回旋镖的回复文案：从「N 天以前」的旧记录里随机挑一条。
+
+    🔴 **哪发的指令就推回哪** —— 这里只生成文本，具体发到群还是私聊由
+    route_message 用当前这条 message 决定。挑过的会打上 boomerang_at，不再重复推。
+    """
+    now = now or datetime.now()
+    if days is None:
+        days = int(_settings.get("boomerang_days"))
+    scope = _settings.get("boomerang_scope")
+
+    item = pick_boomerang(days, scope, now)
+    if not item:
+        # 区分「还没攒够天数」和「都推完了」—— 否则用户分不清是没记录还是推过一轮了
+        if count_boomerang(0, scope, now):
+            return (f"🪃 还没有满 {days} 天的旧记录，再等等。\n"
+                    f"（可推范围在「配置中心 → ⑤ 回旋镖」里改）")
+        return ("🪃 旧记录都推过一遍了。\n"
+                "（同一条不会推第二次；新记的满天数后会再进池子）")
+
+    mark_boomerang(item["id"])
+    created = item.get("created_at") or ""
+    try:
+        ago = (now - datetime.fromisoformat(created)).days
+    except ValueError:
+        ago = days
+    verb = "记过一条备忘" if item.get("kind") == KIND_MEMO else "冒出过一个想法"
+    note = (item.get("note") or "").strip()
+    tail = f"\n\n【当时的结论】{note}" if note else ""
+    return (f"🪃 回旋镖！\n"
+            f"你 {ago} 天前（{created[:10]}）{verb}：\n"
+            f"{(item.get('content') or '').strip()}{tail}\n\n"
+            f"…还有后续吗？")
+
+
+# ── 导出：把全部备忘 + 灵感导成一个文件发回来 ─────────────────────
+def parse_export(text):
+    """`导出` / `导出 md` / `导出 json` → (True, 格式或 None)；不是指令 → (False, None)。"""
+    t = (text or "").strip()
+    for c in EXPORT_CMDS:
+        if not t.startswith(c):
+            continue
+        rest = t[len(c):].strip(" ：:　\t")
+        if not rest:
+            return True, None
+        if rest.lower().lstrip(".") in ("md", "markdown", "txt", "text", "json"):
+            return True, rest
+        return False, None
+    return False, None
 
 
 def memo_list_text(limit=10, kind=KIND_MEMO):
@@ -613,6 +706,33 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
             await message.reply(content=reply, msg_seq=1)
             return
 
+    # 1.8) 回旋镖：把 N 天以前的旧记录翻一条推回**当前这个会话**
+    #      （哪发的指令推哪：群里发就回群里，私聊发就回私聊）
+    is_bm, bm_days = parse_boomerang(text)
+    if is_bm:
+        reply = boomerang_text(bm_days)
+        print(f"[回旋镖] {gid} days={bm_days} -> {reply[:40]!r}", flush=True)
+        await message.reply(content=reply, msg_seq=1)
+        return
+
+    # 1.9) 导出：把全部备忘 + 灵感导成一个文件发回来（群 / 私聊都可用）
+    is_ex, ex_fmt = parse_export(text)
+    if is_ex:
+        fname, data = _export.render(ex_fmt)
+        tmpdir = tempfile.mkdtemp(prefix="memo_export_")
+        try:
+            path = os.path.join(tmpdir, fname)
+            with open(path, "wb") as fh:
+                fh.write(data)
+            # as_file=True：导出要的是文件本身，别被当成文本渲染成图片
+            await client.send_file_to_chat(
+                message, scope, t["openid"], path, fname, mid, as_file=True
+            )
+            print(f"[导出] {gid} {fname}（{len(data)} bytes）", flush=True)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
     # 2) 查备忘 / 查灵感 / 帮助
     if text in MEMO_LIST_CMDS:
         await message.reply(content=memo_list_text(10, KIND_MEMO), msg_seq=1)
@@ -702,8 +822,13 @@ def main():
                 except Exception as e:
                     print(f"[启动播报失败] {type(e).__name__}: {e}", flush=True)
 
-        async def send_file_to_chat(self, message, scope, openid, full, rel, mid, caption=None):
-            """发送一个文件到群 / 私聊。文本类渲染成图片（手机可直接看）；其余走文件卡片。"""
+        async def send_file_to_chat(self, message, scope, openid, full, rel, mid,
+                                    caption=None, as_file=False):
+            """发送一个文件到群 / 私聊。文本类渲染成图片（手机可直接看）；其余走文件卡片。
+
+            `as_file=True` 跳过图片渲染、强制走文件卡片 —— 「导出」要的是**文件本身**
+            （用户拿去存起来 / 导进别处），渲染成图就没法用了。
+            """
             import send_file as sf
 
             size = os.path.getsize(full)
@@ -719,7 +844,8 @@ def main():
                 attempts = [(None, 1), (mid, sf.CLI_SEQ_BASE)]
 
             # 文本类：渲染成图片发送（文件卡片在手机端打不开，拆文本又太碎）
-            if sf.is_text_file(full) and size <= RENDER_MAX:
+            # as_file=True（导出）例外：要的就是文件本身。
+            if not as_file and sf.is_text_file(full) and size <= RENDER_MAX:
                 tmpdir = tempfile.mkdtemp(prefix="memoimg_")
                 try:
                     import md2img
