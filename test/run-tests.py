@@ -14,8 +14,11 @@
   [8] extensions     扩展注册表、加载容错、example.py 模板不注册指令
   [9] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
  [10] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
+ [11] settings       本机设置：默认值/env 回退/校验归一化/批量回滚/中文标签/指令识别
+ [12] config-web     配置中心：.env 按行写入（注释与顺序保留/备份）、白名单校验、
+                     secret 不回显、字段表分组、页面护栏、文档同步
 
-🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json**。
+🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json / .env**。
 """
 import importlib.util
 import json
@@ -211,6 +214,50 @@ def test_bot():
     finally:
         bot.SEARCH_ROOT = _orig_root
 
+    # 🔴 排序：匹配分降序 → 同分时**修改时间倒序（最新在前）** → 再同分时路径短的在前
+    _srt = tempfile.mkdtemp(prefix="sort_test_")
+    _orig_root = bot.SEARCH_ROOT
+    try:
+        now = time.time()
+        # 三个同分（文件名都含 hit）但 mtime 不同的文件
+        for name, age in (("hit-old.txt", 3000), ("hit-new.txt", 10), ("hit-mid.txt", 600)):
+            p = os.path.join(_srt, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+            os.utime(p, (now - age, now - age))
+        # 一个分更低（只有路径含 hit）的文件，但 mtime 最新
+        os.makedirs(os.path.join(_srt, "hit-dir"))
+        p = os.path.join(_srt, "hit-dir", "zzz.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(p, (now, now))
+        bot.SEARCH_ROOT = _srt
+        got = [rel for rel, _ in bot.search_files("hit")]
+        check("同分时按 mtime 倒序（最新在前）",
+              got[:3] == ["hit-new.txt", "hit-mid.txt", "hit-old.txt"], f"got={got}")
+        check("时间不越权：低分文件排在所有高分之后",
+              got[-1].endswith("zzz.txt"), f"got={got}")
+
+        # 同 mtime 时用路径长度兜底（保证结果稳定、可复现）
+        for name in ("hit-bbbbbbbbbb.txt", "hit-a.txt"):
+            p = os.path.join(_srt, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+            os.utime(p, (now, now))
+        got2 = [rel for rel, _ in bot.search_files("hit")]
+        check("同分同时间时路径短的在前",
+              got2.index("hit-a.txt") < got2.index("hit-bbbbbbbbbb.txt"), f"got={got2}")
+    finally:
+        bot.SEARCH_ROOT = _orig_root
+        shutil.rmtree(_srt, ignore_errors=True)
+
+    # 🔴 搜索可能跑几十秒（搜索根 = 整个用户目录）→ 必须丢线程，不能卡事件循环
+    _src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("search_files 走 asyncio.to_thread（不卡事件循环）",
+          "await asyncio.to_thread(search_files, q)" in _src)
+    check("没有残留的同步 search_files 调用",
+          "\n        matches = search_files(q)" not in _src)
+
     check("help_text 含内置指令", "备忘" in bot.help_text())
     check("help_text 追加了扩展帮助行",
           all(h in bot.help_text() for h in bot.EXT.help_lines()))
@@ -385,12 +432,16 @@ def _load_bubbles():
 
 def test_ideas_bubbles():
     print("\n[7] ideas-bubbles 页面生成与页内处理")
+    import settings
     import store
 
     orig_db = store.DB
+    _orig_set = os.environ.get("MEMO_SETTINGS_FILE")
     tmpdir = tempfile.mkdtemp(prefix="ib_test_")
     try:
         store.DB = os.path.join(tmpdir, "t.db")
+        # 🔴 设置也要指到临时文件，否则会写真实的 memo-bot/settings.json
+        os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmpdir, "settings.json")
         store.init()
         store.add_memo("g", "", "s", "", "测试灵感一", kind=store.KIND_IDEA)
         b = store.add_memo("g", "", "s", "", "测试灵感二", kind=store.KIND_IDEA)
@@ -426,7 +477,8 @@ def test_ideas_bubbles():
               "location.protocol !== 'file:'" in T)
         check("页脚渐隐底色（气泡从黑暗升起，不糊页脚字）",
               "linear-gradient(0deg,#080b14" in T)
-        check("预热等距（i / boot.maxB），无随机抖动", "spawn(i / boot.maxB)" in T)
+        check("预热等距（i / cnt，按实际条目数），无随机抖动",
+              "spawn(i / cnt)" in T and "const cnt = Math.min(cfg.maxB" in T)
 
         # --apply：离线导出的操作
         ops_path = os.path.join(tmpdir, "ops.json")
@@ -481,11 +533,161 @@ def test_ideas_bubbles():
                     check(f"{label} 应被拒绝", False)
                 except urllib.error.HTTPError as e:
                     check(f"{label} → HTTP {want}", e.code == want, f"got={e.code}")
+
+            # 设置接口（网页「⚙ 设置」用；和机器人「设置」指令写同一份）
+            with urllib.request.urlopen(base + "/api/settings") as r:
+                sj = json.load(r)
+            check("GET /api/settings 返回全部键",
+                  sj.get("ok") is True and {k["key"] for k in sj["keys"]} == set(settings.KEYS),
+                  f"got={sj}")
+            sreq = urllib.request.Request(
+                base + "/api/settings",
+                data=json.dumps({"values": {"bubbles_show": ["open", "done"]}}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(sreq) as r:
+                check("POST /api/settings 返回 ok", json.load(r).get("ok") is True)
+            check("POST /api/settings 已落库",
+                  settings.get("bubbles_show") == ["open", "done"],
+                  f"got={settings.get('bubbles_show')}")
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/settings",
+                    data=json.dumps({"values": {"bubbles_show": ["乱写"]}}).encode(),
+                    headers={"Content-Type": "application/json"}))
+                check("非法设置值应被拒绝", False)
+            except urllib.error.HTTPError as e:
+                check("非法设置值 → HTTP 400", e.code == 400, f"got={e.code}")
+
+            # 停止服务（页面顶部「⏻ 停止服务」用的就是这个）
+            q = urllib.request.Request(base + "/api/quit", data=b"{}",
+                                       headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(q) as r:
+                check("POST /api/quit 返回 ok", json.load(r).get("ok") is True)
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+        # ── 视图：内容流只放「待处理」，其余进归档列表 ──────────
+        d = store.add_memo("g", "", "s", "", "已丢弃的一条", kind=store.KIND_IDEA)
+        store.set_idea_status([d["id"]], "dropped", "验收")
+        items2 = ib.collect()
+        _, stats2 = ib.build_html(items2)
+        check("collect 带上了归档条目", len(items2) == 3, f"got={len(items2)}")
+        check("stats 统计含 dropped", stats2.get("dropped") == 1, f"got={stats2}")
+        only = ib.collect(open_only=True)
+        check("collect(open_only=True) 只返回待处理",
+              bool(only) and all(x["s"] == "open" for x in only), f"got={only}")
+
+        T2 = ib.TEMPLATE
+        check("内容流不再硬编码只取 open",
+              "x.s === 'open'" not in T2)
+        check("轮播队列只装待处理", "shuffle(streamItems().slice())" in T2)
+        check("归档三态常量", "const ARCHIVE = ['done', 'decided', 'dropped'];" in T2)
+        check("垃圾桶文案", "🗑 垃圾桶" in T2)
+        check("已处理 / 已决议 各有列表入口",
+              "✅ 已处理" in T2 and "📌 已决议" in T2)
+        check("列表浮层 DOM（#list / #lbody / #ltitle）",
+              'id="list"' in T2 and 'id="lbody"' in T2 and 'id="ltitle"' in T2)
+        check("列表行带恢复按钮", "← 恢复" in T2 and "'open'" in T2)
+        check("改状态不删记录（moveIdea；dropIdea 已删除）",
+              "function moveIdea" in T2 and "function dropIdea" not in T2)
+        check("serve 模式定时拉最新（bot 新收的灵感自动进流）",
+              "setInterval(refreshFromServer" in T2 and "async function refreshFromServer" in T2)
+        check("停止服务入口在页面上", "/api/quit" in T2 and "btn-quit" in T2)
+        check("浮层打开时不刷新（避免读的时候列表跳）",
+              "modal.classList.contains('on') || listEl.classList.contains('on')" in T2)
+        check("页脚区分待处理与归档", 'id="n-arch"' in T2)
+
+        # 🔴 空库护栏（2026-10-09 修）：--serve 不能因为「没有可放的内容」就退出，
+        #    否则库一空服务就静默起不来，页面都打不开（也就看不到归档）。
+        empty_doc, empty_stats = ib.build_html([])
+        check("空库也能生成页面", isinstance(empty_doc, str) and "streamItems" in empty_doc)
+        check("空库 stats 全 0", all(v == 0 for v in empty_stats.values()), f"got={empty_stats}")
+        check("--serve 下空库不硬退出", "if not items and not args.serve:" in py_src)
+        check("起服务失败时报真实错误（不吞 OSError）",
+              "last_err = e" in py_src and "都起不来：" in py_src)
+
+        # ── 设置：展示范围 + 网页设置入口（2026-10-09）────────────
+        check("思维源占位已删除", "思维源" not in T2 and 'class="source"' not in T2)
+        check(".source / pulse 相关 CSS 已删",
+              ".source{" not in T2 and "@keyframes pulse" not in T2)
+        check("顶部有「⚙ 设置」入口", 'id="btn-settings"' in T2 and "⚙ 设置" in T2)
+        check("设置浮层 DOM",
+              'id="settings"' in T2 and 'id="sbody"' in T2 and 'id="ssave"' in T2)
+        check("设置已内嵌进页面（占位符被替换）",
+              "__SETTINGS__" not in doc and "let SETTINGS = [{" in doc)
+        check("内容流按设置过滤", "IDEAS.filter(x => SHOW.includes(x.s))" in T2)
+        check("展示范围默认只放待处理",
+              "SHOW = settingValue('bubbles_show') || ['open']" in T2)
+        check("页脚改为 显示 / 共", '显示 <b id="n">' in T2 and '共 <b id="n-arch">' in T2)
+        check("保存后重建内容流",
+              "function rebuildStream" in T2 and "rebuildStream();" in T2)
+        check("离线模式不允许存设置", "离线模式存不了" in T2)
+        check("Esc 也关设置浮层", "settingsEl.classList.remove('on')" in T2)
+        check("轮询避开设置浮层", "settingsEl.classList.contains('on')" in T2)
+        # 🔴 内嵌的 __SETTINGS__ 是「渲染那一刻」的快照，服务进程却是常驻的 ——
+        #    启动/刷新必须重新拉一次，否则别人（或「设置」指令）改过范围后刷新看不到变化
+        check("启动时从服务端拉设置", "async function refreshSettings" in T2)
+        check("serve 启动会等设置拉回来",
+              "await refreshSettings()" in T2 and "await detectMode()" in T2)
+        check("轮询里也同步设置", "await refreshSettings();" in T2)
+        _boot = T2.index("await detectMode()")
+        check("气泡在设置拉回来之后才铺",
+              T2.index("refill();\n", _boot) > _boot
+              and T2.index("prewarm();", _boot) > _boot)
+        # 🔴 同一条灵感不能同时出现两个气泡（用户截图：同一条 19:10 出现两次）——
+        #    条目数少于 maxB 时队列会被 refill 循环复用，必须排除「已经在屏幕上的」
+        check("取条目时排除在屏条目", "function onStageIds" in T2 and "on.has(it.id)" in T2)
+        check("全在屏时返回 null 而不是复用", "return null;" in T2)
+        check("spawn 拿到 null 就不补位", "if(!it) return;" in T2)
+        check("unPick 容忍 null", "function unPick(it){ if(it)" in T2)
+        check("预热按实际条目数均分（不按 maxB）",
+              "Math.min(cfg.maxB, streamItems().length)" in T2)
+        check("只有一处铺气泡入口（prewarm）",
+              T2.count("prewarm();") == 2 and "spawn(i / boot.maxB)" not in T2)
+        check("设置只提交改动过的键",
+              "JSON.stringify(v) !== JSON.stringify(s.value)" in T2)
+        check("没改动就不发请求", "没有改动" in T2)
+        # 🔴 有结论的条目要把结论一起显示（已处理/已决议/已丢弃 常带结论）；
+        #    没结论就不渲染那个节点 —— 与以前一致
+        check("气泡渲染结论节点", "nt.className = 'note'" in T2 and "'结论：' + it.note" in T2)
+        check("没结论就不渲染（条件判断）", "if(it.note){" in T2)
+        check("结论样式已定义", ".bubble .note{" in T2)
+        check("结论高度算进布局估算",
+              "function noteHeight" in T2 and "noteHeight(note, widthPx)" in T2)
+        check("长文本判据带上结论",
+              "estHeight(it.t, laneW, it.note)" in T2
+              and "estHeight(it.t, fullW, it.note)" in T2)
+        check("保存设置发的是 {values:...} 契约",
+              "JSON.stringify({values: vals})" in T2)
+
+        # 🔴 换行必须保留（2026-10-09 用户发现：群里分几行写的记录，页面上全挤成一行）
+        check("clean 保留换行",
+              ib.clean("第一行\n第二行\n第三行") == "第一行\n第二行\n第三行",
+              repr(ib.clean("第一行\n第二行\n第三行")))
+        check("clean 只压空格 / 制表符，不压换行",
+              ib.clean("a  \t b") == "a b" and ib.clean("a\nb") == "a\nb",
+              repr(ib.clean("a  \t b")))
+        check("clean 统一 CRLF / CR 换行符",
+              ib.clean("a\r\nb\rc") == "a\nb\nc", repr(ib.clean("a\r\nb\rc")))
+        check("clean 去掉行首尾多余空格",
+              ib.clean("a   \n   b") == "a\nb", repr(ib.clean("a   \n   b")))
+        check("clean 连续空行压成一个",
+              ib.clean("a\n\n\n\nb") == "a\n\nb", repr(ib.clean("a\n\n\n\nb")))
+        check("clean 仍会剥掉 @ 占位符",
+              ib.clean("<C9> 你好") == "你好", repr(ib.clean("<C9> 你好")))
+        check("clean 不再用 \\s+ 压掉换行", 're.sub(r"\\s+", " ", t)' not in T2)
+        check("折行按显式换行分段算（wrappedLines）",
+              "function wrappedLines" in T2 and ".split('\\n')" in T2)
+        check("正文与结论都走 wrappedLines",
+              "wrappedLines(text, widthPx / fp)" in T2
+              and "wrappedLines(note, widthPx / NOTE_FONT)" in T2)
     finally:
         store.DB = orig_db
+        if _orig_set is None:
+            os.environ.pop("MEMO_SETTINGS_FILE", None)
+        else:
+            os.environ["MEMO_SETTINGS_FILE"] = _orig_set
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -552,7 +754,7 @@ def _raises(fn):
 
 # ── [9] ignore（忽略表）─────────────────────────────────────────
 def test_ignore():
-    print("\n[9] 忽略表（抄海豹骰子 .botlist）")
+    print("\n[9] 忽略表")
     import ignore
 
     tmp = tempfile.mkdtemp(prefix="ignore_test_")
@@ -671,10 +873,12 @@ def test_route():
             raise AssertionError("本用例不应走到发文件分支")
 
     tmp = tempfile.mkdtemp(prefix="route_test_")
-    _env = {k: os.environ.get(k) for k in ("MEMO_IGNORE", "MEMO_IGNORE_FILE")}
+    _env = {k: os.environ.get(k)
+            for k in ("MEMO_IGNORE", "MEMO_IGNORE_FILE", "MEMO_SETTINGS_FILE")}
     _orig_db, _orig_last = store.DB, bot.LAST_MSG_FILE
     os.environ["MEMO_IGNORE"] = "测试机器人"
     os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
+    os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
     store.DB = os.path.join(tmp, "t.db")
     bot.LAST_MSG_FILE = os.path.join(tmp, "last.json")
     try:
@@ -738,6 +942,83 @@ def test_route():
         check("私聊命中忽略：静默", m.replies == [], f"got={m.replies}")
         check("私聊命中忽略：不收灵感",
               len(store.list_ideas(store.STATUS_OPEN)) == n_before)
+
+        # 8) 「设置」指令走通真实路由（与网页「⚙ 设置」写同一份文件）
+        n_ideas = len(store.list_ideas(store.STATUS_OPEN))
+        m = Msg("设置")
+        run(m)
+        check("「设置」列全部键",
+              bool(m.replies) and "关机通知文案" in m.replies[0]
+              and "灵感泡泡展示范围" in m.replies[0], f"got={m.replies}")
+        check("「设置」指令不落库灵感",
+              len(store.list_ideas(store.STATUS_OPEN)) == n_ideas)
+
+        m = Msg("设置 关机通知文案 收工，明天见")
+        run(m)
+        check("「设置 <键> <值>」落盘",
+              bot._settings.get("offwork_msg") == "收工，明天见",
+              f"got={bot._settings.get('offwork_msg')!r}")
+        check("改完有回执", bool(m.replies) and "收工，明天见" in m.replies[0],
+              f"got={m.replies}")
+
+        m = Msg("设置 bubbles_show 待处理,已处理")
+        run(m)
+        check("multi 键认中文标签",
+              bot._settings.get("bubbles_show") == ["open", "done"],
+              f"got={bot._settings.get('bubbles_show')}")
+
+        m = Msg("设置 bubbles_show 乱写")
+        run(m)
+        check("非法值被拒且给提示",
+              bot._settings.get("bubbles_show") == ["open", "done"]
+              and bool(m.replies) and "认不出" in m.replies[0], f"got={m.replies}")
+
+        # 9) 不是指令的普通话（「设置好了」）不能被吃掉
+        m = Msg("设置好了")
+        run(m, mentioned=False)
+        ideas2 = store.list_ideas(store.STATUS_OPEN)
+        check("「设置好了」当普通灵感收下",
+              len(ideas2) == n_ideas + 1 and m.replies == [], f"got={m.replies}")
+
+        # 10) 🔴 慢搜索不能卡事件循环 —— 搜索根是百万级目录时一次要几十秒，
+        #     同步跑会把 bot 冻住（收不到消息、心跳停摆）。用慢速假搜索驱动真实路由，
+        #     期间起一个 50ms 的 ticker，看它还能不能跑。
+        _real_search = bot.search_files
+        try:
+            def _slow_search(q, limit=bot.SEARCH_LIMIT):
+                time.sleep(0.6)
+                return [("a.md", "C:/x/a.md")]
+            bot.search_files = _slow_search
+
+            class _OkClient:
+                sent = []
+
+                async def send_file_to_chat(self, *a, **k):
+                    _OkClient.sent.append(a)
+
+            async def _probe():
+                ticks = 0
+
+                async def ticker():
+                    nonlocal ticks
+                    while True:
+                        await asyncio.sleep(0.05)
+                        ticks += 1
+
+                t = asyncio.create_task(ticker())
+                mm = Msg("发文件 测试")
+                await bot.route_message(_OkClient(), mm, True, bot.SCOPE_GROUP)
+                t.cancel()
+                return ticks, mm.replies
+
+            ticks, replies = asyncio.run(_probe())
+            check("慢搜索期间事件循环仍可调度（不卡心跳）", ticks >= 5,
+                  f"0.6s 内只跑了 {ticks} 次 ticker")
+            check("慢搜索后唯一命中仍直接发出（不回列表）",
+                  len(_OkClient.sent) == 1 and replies == [],
+                  f"sent={len(_OkClient.sent)} replies={replies}")
+        finally:
+            bot.search_files = _real_search
     finally:
         store.DB, bot.LAST_MSG_FILE = _orig_db, _orig_last
         for k, v in _env.items():
@@ -746,6 +1027,239 @@ def test_route():
             else:
                 os.environ[k] = v
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── [11] settings（本机设置：网页 + 机器人指令共用）──────────────
+def test_settings():
+    print("\n[11] settings 本机设置（网页「⚙ 设置」+ 机器人「设置」指令）")
+    import settings
+
+    tmpdir = tempfile.mkdtemp(prefix="settings_test_")
+    orig = os.environ.get("MEMO_SETTINGS_FILE")
+    os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmpdir, "settings.json")
+    try:
+        check("默认值：三个键都在",
+              set(settings.all_values()) == set(settings.KEYS), f"got={settings.all_values()}")
+        # 🔴 面板与指令列表都按 KEYS 的顺序排 —— 用户要求「启动播报」在「关机通知文案」之前
+        _order = [x["key"] for x in settings.describe()]
+        check("设置项顺序：启动播报在关机通知文案之前",
+              _order.index("startup_msg") < _order.index("offwork_msg"),
+              f"got={_order}")
+        check("展示范围排在两个文案之后",
+              _order.index("bubbles_show") > _order.index("offwork_msg"),
+              f"got={_order}")
+        check("默认展示范围只有待处理", settings.get("bubbles_show") == ["open"])
+        check("没写过文件时 is_set 为假", settings.is_set("startup_msg") is False)
+        check("文件还不存在", not os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
+
+        ok, info = settings.set_value("startup_msg", "  起来干活  ")
+        check("set text 会去空白", ok and info == "起来干活", f"got={info!r}")
+        check("写入后 is_set 为真", settings.is_set("startup_msg") is True)
+        check("文件已落盘", os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
+
+        ok, info = settings.set_value("bubbles_show", "待处理, done")
+        check("multi 认中文标签 + code", ok and info == ["open", "done"], f"got={info}")
+        ok, info = settings.set_value("bubbles_show", ["open", "open", "decided"])
+        check("multi 去重", ok and info == ["open", "decided"], f"got={info}")
+
+        ok, info = settings.set_value("bubbles_show", ["乱写"])
+        check("multi 非法值被拒", ok is False and "认不出" in info, f"got={info}")
+        ok, info = settings.set_value("bubbles_show", "")
+        check("multi 空值被拒", ok is False, f"got={info}")
+        ok, info = settings.set_value("不存在的键", "x")
+        check("未知键被拒", ok is False and "没有这个设置项" in info, f"got={info}")
+        check("被拒后值没变", settings.get("bubbles_show") == ["open", "decided"])
+
+        # 批量写：先全量校验，再一次性落盘（一个坏 → 整批不写）
+        n, errs = settings.apply_values(
+            {"startup_msg": "AAA", "bubbles_show": ["bogus"]})
+        check("批量写：有错就整批不写",
+              n == 0 and bool(errs) and settings.get("startup_msg") == "起来干活", f"got={errs}")
+        n, errs = settings.apply_values(
+            {"startup_msg": "BBB", "bubbles_show": ["open", "dropped"]})
+        check("批量写：全对才落盘", n == 2 and not errs, f"got={n},{errs}")
+
+        ok, info = settings.reset("startup_msg")
+        check("reset 后 is_set 为假", ok and settings.is_set("startup_msg") is False)
+        check("reset 后取值等于回退值", info == settings.get("startup_msg") and bool(info))
+
+        check("is_command 裸「设置」", settings.is_command("设置") is True)
+        check("is_command「配置」也算", settings.is_command("配置") is True)
+        check("is_command「设置 x y」", settings.is_command("设置 关机通知文案 早") is True)
+        check("is_command「设置好了」不算", settings.is_command("设置好了") is False)
+        check("is_command「配置一下」不算", settings.is_command("配置一下") is False)
+        check("is_command 普通聊天不算", settings.is_command("今天天气不错") is False)
+
+        txt = settings.handle_command("设置")
+        check("「设置」列出全部键",
+              all(k["label"] in txt for k in settings.KEYS.values()), f"got={txt[:80]}")
+        check("「设置」带改法提示", "设置 <键> <值>" in txt)
+
+        settings.handle_command("设置 关机通知文案 我要下班了")
+        check("用中文标签也能改", settings.get("offwork_msg") == "我要下班了")
+        settings.handle_command("设置 offwork_msg 明天见")
+        check("用键名也能改", settings.get("offwork_msg") == "明天见")
+        out = settings.handle_command("设置 重置 关机通知文案")
+        check("重置后 is_set 为假",
+              settings.is_set("offwork_msg") is False and "恢复默认" in out, f"got={out}")
+        out = settings.handle_command("设置 不存在的项 x")
+        check("未知键给提示", "这个设置项" in out and "看列表" in out, f"got={out}")
+        settings.handle_command("设置 bubbles_show 待处理、已处理")
+        check("multi 也能用指令改",
+              settings.get("bubbles_show") == ["open", "done"])
+
+        d = {x["key"]: x for x in settings.describe()}
+        check("describe 含 label/kind/value/help",
+              all(k in d["bubbles_show"] for k in ("label", "kind", "value", "help")))
+        check("describe 带 choices 与中文标签",
+              d["bubbles_show"]["choices"] == ["open", "done", "decided", "dropped"]
+              and d["bubbles_show"]["choice_labels"]["open"] == "待处理")
+    finally:
+        if orig is None:
+            os.environ.pop("MEMO_SETTINGS_FILE", None)
+        else:
+            os.environ["MEMO_SETTINGS_FILE"] = orig
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── [12] config-web（配置中心）──────────────────────────────────
+def _load_configweb():
+    spec = importlib.util.spec_from_file_location(
+        "cweb", os.path.join(ROOT, "config-web.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _raises(fn, *a):
+    try:
+        fn(*a)
+        return False
+    except Exception:  # noqa: BLE001 —— 只关心「有没有抛」
+        return True
+
+
+def test_config_web():
+    print("\n[12] config-web 配置中心（.env 写入 / 白名单 / 字段表 / 页面护栏）")
+    cw = _load_configweb()
+
+    tmpdir = tempfile.mkdtemp(prefix="cweb_test_")
+    orig_env, orig_bak = cw.ENV_PATH, cw.ENV_BAK
+    try:
+        cw.ENV_PATH = os.path.join(tmpdir, ".env")
+        cw.ENV_BAK = os.path.join(tmpdir, ".env.bak")
+
+        # 1) 值字面量：空 / 含空格 / 裸值 / Windows 路径 / 双引号
+        check("空值写成两个引号", cw._env_literal("") == '""')
+        check("含空格的值加双引号", cw._env_literal("a b") == '"a b"')
+        check("普通值不加引号", cw._env_literal("abc") == "abc")
+        check("Windows 路径反斜杠转正斜杠",
+              cw._env_literal(r"C:\Users\x") == "C:/Users/x",
+              cw._env_literal(r"C:\Users\x"))
+        check("值里含双引号直接拒绝", _raises(cw._env_literal, 'a"b'))
+
+        # 2) 按行改 .env：注释与顺序保留、已有键只换值、新键追加
+        SRC = ("# 我的注释\nQQ_BOT_APPID=123456\n\n# 备忘触发词\n"
+               "MEMO_TRIGGER=备忘\nMEMO_SEARCH_ROOT=\"C:/tmp\"\n")
+        with open(cw.ENV_PATH, "w", encoding="utf-8", newline="\n") as f:
+            f.write(SRC)
+        keys, err = cw.write_env({"MEMO_TRIGGER": "记一下", "QQ_BOT_SANDBOX": "true"})
+        after = open(cw.ENV_PATH, encoding="utf-8").read()
+        check("写 .env 无错误", err is None, err)
+        check("注释原样保留", "# 我的注释" in after and "# 备忘触发词" in after)
+        check("已有键只换值", "MEMO_TRIGGER=记一下" in after)
+        check("新键追加到末尾", after.rstrip().endswith("QQ_BOT_SANDBOX=true"))
+        check("键顺序未乱",
+              after.index("QQ_BOT_APPID") < after.index("MEMO_TRIGGER")
+              < after.index("MEMO_SEARCH_ROOT"))
+        check("写前备份 .env.bak", os.path.exists(cw.ENV_BAK))
+        check("备份 = 写入前内容",
+              open(cw.ENV_BAK, encoding="utf-8").read() == SRC)
+        check("返回值列出写入的键",
+              sorted(keys) == ["MEMO_TRIGGER", "QQ_BOT_SANDBOX"], keys)
+
+        # 再写一次：替换而不是重复追加
+        cw.write_env({"MEMO_TRIGGER": "备忘"})
+        again = open(cw.ENV_PATH, encoding="utf-8").read()
+        check("重复写不追加新行", again.count("MEMO_TRIGGER=") == 1)
+        check("第二次备份 = 第一次写入后的内容",
+              open(cw.ENV_BAK, encoding="utf-8").read() == after)
+
+        # 3) 白名单与校验
+        k, e = cw.write_env({"NOT_ALLOWED_KEY": "x"})
+        check("非白名单键被拒", k == [] and "不允许" in (e or ""), e)
+        k, e = cw.write_env({"QQ_BOT_APPID": "abc"})
+        check("AppID 非数字被拒", k == [] and "数字" in (e or ""), e)
+        k, e = cw.write_env({"MEMO_TRIGGER": "有 空格"})
+        check("触发词含空格被拒", k == [] and "空格" in (e or ""), e)
+        k, e = cw.write_env({"MEMO_SEARCH_ROOT": os.path.join(tmpdir, "no-such-dir")})
+        check("不存在的目录被拒", k == [] and "不存在" in (e or ""), e)
+        check("被拒时整批不写（AppID 没被改成 abc）",
+              cw.read_env_file()["QQ_BOT_APPID"] == "123456")
+        k, e = cw.write_env({"QQ_BOT_SANDBOX": "yes"})
+        check("bool 归一化成 true", cw.read_env_file()["QQ_BOT_SANDBOX"] == "true")
+
+        # 4) 密钥留空 = 不改（页面不回显它，留空不能理解成清空）
+        cw.write_env({"QQ_BOT_SECRET": "SECRET-VALUE-123456"})
+        before_secret = cw.read_env_file()["QQ_BOT_SECRET"]
+        k, e = cw.write_env({"QQ_BOT_SECRET": ""})
+        check("密钥留空不写", k == [] and e is None, (k, e))
+        check("密钥保持原值", cw.read_env_file()["QQ_BOT_SECRET"] == before_secret)
+
+        # 5) 字段表：secret 不回显、分组与 target 齐全
+        fields = cw.state_fields()
+        sec = [f for f in fields if f["key"] == "QQ_BOT_SECRET"][0]
+        check("AppSecret 不回显（value 为空）", sec["value"] == "" and sec["set"] is True)
+        check("字段带 target（env / settings 分流）",
+              {f["target"] for f in fields} == {"env", "settings"})
+        check("settings 的三个键都在字段表里",
+              {f["key"] for f in fields if f["target"] == "settings"}
+              == {"startup_msg", "offwork_msg", "bubbles_show"})
+        check("分组覆盖 6 个分区",
+              {f["group"] for f in fields}
+              >= {"bot", "behavior", "files", "bubbles", "ignore"})
+        check("页面渲染顺序 = GROUPS 顺序",
+              [g["key"] for g in [{"key": k} for k, _, _ in cw.GROUPS]]
+              == ["bot", "behavior", "files", "bubbles", "runtime", "ignore"])
+
+        # 6) 目录浏览：不存在 / 不是目录都给错误，别抛
+        bad = cw.browse_dirs(os.path.join(tmpdir, "nope"))
+        check("browse 不存在的目录返回 ok=false", bad["ok"] is False and bad.get("error"))
+        good = cw.browse_dirs(tmpdir)
+        check("browse 正常目录返回 ok=true", good["ok"] is True and "dirs" in good)
+
+        # 7) 页面护栏
+        check("只监听 127.0.0.1",
+              'ThreadingHTTPServer(("127.0.0.1"' in
+              open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read())
+        check("写操作要求自定义请求头（CSRF 防护）",
+              cw.HEADER_FLAG == "X-Memo-Config" and cw.HEADER_FLAG in cw.PAGE)
+        check("页面有「保存并重启机器人」", "保存并重启机器人" in cw.PAGE)
+        check("页面有目录浏览器", "浏览…" in cw.PAGE)
+        check("页面有搜索目录实测按钮", "check-root" in cw.PAGE)
+        check("页面有开机自启开关", "autostart" in cw.PAGE)
+        check("页面有依赖自检", "依赖自检" in cw.PAGE)
+
+        # 8) sync_env：写完 .env 立刻让本进程看到新值
+        cw.sync_env()
+        check("sync_env 把 .env 灌进 os.environ",
+              os.environ.get("MEMO_TRIGGER") == "备忘",
+              os.environ.get("MEMO_TRIGGER"))
+
+        # 9) 文档同步：每个可配置键都要在 .env.example 里出现过
+        example = open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
+        missing = [k for k in cw.ENV_SPEC if k not in example]
+        check(".env.example 覆盖全部可配置键", not missing, f"缺={missing}")
+
+        # 10) 泡泡页只管展示范围（启动播报 / 关机文案搬去配置中心了）
+        bubbles = open(os.path.join(ROOT, "ideas-bubbles.py"), encoding="utf-8").read()
+        check("泡泡页设置浮层只渲染 bubbles_show",
+              "const PAGE_KEYS = ['bubbles_show'];" in bubbles)
+        check("泡泡页不再渲染通知文案项",
+              "startup_msg" not in bubbles.split("const PAGE_KEYS")[1].split("</script>")[0])
+    finally:
+        cw.ENV_PATH, cw.ENV_BAK = orig_env, orig_bak
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():
@@ -762,6 +1276,8 @@ def main():
     test_extensions()
     test_ignore()
     test_route()
+    test_settings()
+    test_config_web()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

@@ -3,34 +3,54 @@
 本地运行的 QQ 机器人，走 QQ 官方机器人（**WebSocket 收 / HTTP 发**），只需出网，**无需公网 IP / 公网回调**。
 **群聊与私聊共用同一套指令与识别逻辑。**
 
+## 三步跑起来
+
+```bash
+pip install -r requirements.txt
+python config-web.py            # 起「配置中心」→ 浏览器自动打开一个配置页
+```
+
+1. 在配置中心填 **AppID / AppSecret**（在 [q.qq.com](https://q.qq.com) 创建机器人后，从「开发设置」拿）；
+2. 点页面底部 **「保存并重启机器人」**；
+3. 把机器人拉进你的群（群设置里开那两个开关，见下文）→ 群里发一条 `备忘 测试` 就有回执了。
+
+其余配置——触发词、发文件的搜索目录、开机自启、忽略表——**都在配置中心那一页上**，不用碰 `.env`，也不用记命令。
+
 ## 能力
 1. **备忘**：群消息以触发词（默认「备忘」）开头 → 记为 `memo`，落本地 SQLite，并回执。
 2. **灵感**：群里**非 @** 的普通发言、以及**私聊里的任意非指令文本** → 自动收作 `idea`（**静默记录，不打扰**）。
 3. **发**：把本地文件经机器人发送到指定**群 / 私聊**；文本类文件**渲染成图片**发送。
-4. **启动播报**：每次启动在群里发一句「我上班了，开摸！」（文案见 `.env` 的 `QQ_STARTUP_MSG`）。
+4. **启动播报**：每次启动在群里发一句「我上班了，开摸！」（文案可改，见 [配置](#配置三个入口)）。
 5. **摸鱼**：发「摸鱼」→ 从内置库里随机抽一条放松动作 / 摸鱼点子，帮忙从工位上分神 30 秒。
-6. **指令（群 / 私聊通用）**：
+6. **配置中心**：一条命令起一个本地网页（`config-web.py`），填凭据 / 选目录 / 开自启 / 启停机器人 / 看依赖，
+   **不用碰 `.env`、不用记命令**（见 [配置中心](#配置中心本地网页)）。
+7. **设置**：`设置` / `设置 <键> <值>` —— 在群里也能改本机配置（关机通知文案、启动播报、灵感泡泡展示范围），
+   **与配置中心网页写同一份文件**。
+8. **指令（群 / 私聊通用）**：
 
    | 指令 | 作用 | 群内是否需 @ |
    |---|---|---|
    | `备忘 <内容>` | 记一条备忘 | 否 |
    | `查备忘` | 看最近 10 条备忘 | 否 |
    | `查灵感` | 看**还没处理**的灵感（含待处理/已处理/已决议/已丢弃计数） | 否 |
-   | `发文件 <关键词>` | 搜**配置的根目录**（默认你的用户主目录，可用 `MEMO_SEARCH_ROOT` 改）的文件、渲染成图片发送；命中多个列出来让你回复序号选 | 否 |
+   | `发文件 <关键词>` | 搜**配置的根目录**（默认你的用户主目录，可在配置中心改）的文件、渲染成图片发送；命中多个列出来让你回复序号选 | 否 |
    | `摸鱼`（可加条数 / 分类） | 随机来一条**放松动作 / 摸鱼点子**，歇一下 | 否 |
    | `忽略 <内容>` | 含该内容的消息**一律跳过**（不收灵感、不响应）；`忽略 列表` / `忽略 删除 <内容>` / `忽略 清空` 管理 | 否 |
+   | `设置 [<键> [<值>]]` | 看 / 改本机设置；`设置 重置 <键>` 恢复默认 | 否 |
    | `帮助` | 显示指令菜单 | 否 |
 
    - **@机器人**时可简写（`发 设计说明`、`发送 xxx`）；**私聊**里不需要 @，同样按宽松写法识别。
    - **群里不 @** 时只认明确写法（`发文件` / `找文件` / `发送文件`），避免「发工资了吗」这类误触。
    - 「发文件」支持模糊匹配（如「设计说明」能命中「设计风格参考说明-2026-10-08.md」），回复**序号**或**文件名片段**即可选定。
+   - 🔴 **命中多个时的列表顺序 = 匹配分降序 → 同分时修改时间倒序（最新在前）→ 再同分时路径短的在前**。
+     所以「最相关的排最前」优先于「最新的排最前」：模糊查询的最佳命中不会被一堆无关的新文件压下去。
    - 以上是**内置指令**。想加自己的指令（天气、运势、系统状态…）→ 见 [可扩展性](#可扩展性加你自己的指令)：
      自定义指令放 `extensions/local/`，**不会进公开仓库**。
 
 ### 忽略表：别把别的机器人当内容收
 
 两个机器人待在一个群里时会**互相把对方说的话收作灵感**，极端情况下还会形成互相响应的循环。
-机制抄自海豹骰子的 `.botlist`（它的原话是「避免机器人互相响应造成的危险的循环」），实现见 `ignore.py`。
+把对方的昵称 / openid 记进忽略表即可打断，实现见 `ignore.py`。
 
 - **两种规则语义**，命中任一即跳过整条消息（不收灵感、不回复）：
   1. **子串** —— 消息文本（剥掉 @ 标记后）含该串即命中，**忽略大小写**；
@@ -40,6 +60,78 @@
   - `ignore.json`（同目录，可用 `MEMO_IGNORE_FILE` 改路径）—— 由「忽略」指令维护。
 - 「忽略」指令本身**永远放行**（否则会被自己的规则吃掉）；`忽略这个bug` 这类没分隔符的普通聊天**不算指令**。
 - 规则长度下限 2 字（太短会误伤一大片，直接拒绝）。
+
+## 配置中心（本地网页）
+
+以前改配置只能动 `memo-bot/.env`：要开编辑器、要记住变量名、还得重启 bot。现在有一条命令：
+
+```bash
+python config-web.py            # 起服务并自动打开浏览器
+python config-web.py --port 8770 --no-browser
+```
+
+> **Windows 用户**：直接双击 `配置中心.bat` 也行（装好 Python 就可以，不用敲命令）。
+
+页面上能做这些事，**每一项都有中文说明，填错会告诉你错在哪**：
+
+| 分区 | 能改什么 | 写去哪 |
+|---|---|---|
+| ① 连接 QQ | AppID / AppSecret / 目标群 openid / 沙箱开关 | `.env` |
+| ② 群内行为 | 备忘触发词、启动播报文案、关机通知文案 | `.env` / `settings.json` |
+| ③ 发文件 | 「发文件」的搜索根目录（带**目录浏览器** + **实测按钮**：这个目录有多少文件、扫一遍要多久） | `.env` |
+| ④ 灵感泡泡 | 内容流放哪几类 | `settings.json` |
+| ⑤ 运行方式 | **开机自启开关**、**启动 / 停止 / 重启机器人**、**依赖自检** | 计划任务 / 进程 |
+| ⑥ 忽略表 | 忽略关键词 + 规则列表（可增删） | `.env` / `ignore.json` |
+
+页面顶部常驻状态：机器人是否在跑（含 pid）、开机自启是否已开。凭据没填全时会有一条醒目提示。
+
+### 🔴 三条硬规则
+
+- **只监听 `127.0.0.1`** —— 这个页面能读写 `.env`（含密钥），绝不对外暴露。
+- **AppSecret 不回显** —— 已保存的密钥只显示「已设置 ✓」，留空 = 不改；要换就重新填一遍。
+- **写 `.env` 是按行改** —— 你手写的注释与顺序原样保留，已有键只换值，新键追加到末尾；
+  写前自动备份成 `.env.bak`（已 gitignore）。路径里的反斜杠会自动转成正斜杠。
+
+所有写操作都要求自定义请求头 `X-Memo-Config: 1` —— 别的网页跨域打过来会先触发 preflight，
+而我们不回任何 CORS 头，浏览器直接拒发，等于天然的 CSRF 防护。
+
+> 改完**凭据 / 触发词 / 搜索目录**要重启机器人才生效 —— 页面上直接有「保存并重启机器人」按钮。
+> 改**文案 / 展示范围**同样建议重启（文案是 bot 启动时读的）。
+
+## 配置：三个入口
+
+`settings.json` 是「非敏感的行为配置」，三个入口改的都是它：
+
+| 入口 | 怎么用 | 放哪些 |
+|---|---|---|
+| **配置中心** | `python config-web.py` → 网页上填 | 全部（含 `.env` 里的凭据与路径） |
+| **灵感泡泡页** | 页面顶部「⚙ 设置」 | 只有「内容流放哪几类」（跟当前页面强相关） |
+| **机器人** | `设置` 看全部 · `设置 <键> <值>` 改 · `设置 重置 <键>` 恢复默认 | `settings.json` 里的三个键 |
+
+- **取值优先级**：`settings.json` → 同名环境变量（`.env`）→ 内置默认值。
+  只把**显式改过**的键写进文件，所以老配置（`.env` 里的 `QQ_STARTUP_MSG` / `OFFWORK_MSG`）不会失效，继续当回退值。
+- 🔴 **密钥不进 `settings.json`** —— AppID / AppSecret / 群 openid 仍留在 `.env`。
+  这个文件的内容会经网页和群消息来回传，不放秘密。
+- 🔴 **`settings.json` 已 gitignore**（含本机文案 / 群内信息）。
+
+`settings.json` 里的键：
+
+| 键 | 中文名 | 类型 | 默认值 |
+|---|---|---|---|
+| `startup_msg` | 启动播报 | 文本 | `我上班了，开摸！`（留空 = 不播报） |
+| `offwork_msg` | 关机通知文案 | 文本 | `现在开始，我要下班了！`（留空 = 不发） |
+| `bubbles_show` | 灵感泡泡展示范围 | 多选 | 只选「待处理」 |
+
+> 配置中心的分区顺序、`设置` 指令列出的顺序，都按上表排。
+
+- 文本类：直接写值；`设置 重置 <键>` 从文件里删掉该键 → 回到 env / 默认值。
+- 多选类：值可写 code 或**中文标签**（`设置 bubbles_show 待处理,已处理`），认不出会拒绝并列出可选项。
+- 指令词后面**必须有分隔符**（空格 / `：` / `:`）—— 否则「设置好了」「配置一下」这种普通聊天会被误判成指令（这类消息照常当灵感收下）。
+- 网页侧是**批量提交、先全量校验再一次性落盘**：改 5 项、第 3 项填错 → 整批不写，不会留半成品。
+  且**只提交改动过的键** —— 只动展示范围就不会顺手把两个文案键也写进文件（`.env` 的回退一直有效）；什么都没改会提示「没有改动」并跳过请求。
+- HTTP 接口（两个网页服务各自提供）：`GET /api/settings`（读全部键与选项）· `POST /api/settings`（批量写；有非法值返 `400` + 中文原因）。
+
+> 关机自动发「下班了」的文案就是 `offwork_msg` —— 配置中心改、群里改、留空关掉，都不需要碰代码或 `.env`。
 
 ## 群内需开启的两个开关（QQ 群设置 → 机器人）
 1. **机器人可获取的群聊消息范围 = 获取群内全部消息** → 机器人能收到**非 @** 的群消息（`GROUP_MESSAGE_CREATE`）。
@@ -60,27 +152,42 @@
 - **技术**：`C2C_MESSAGE_CREATE` 由 botpy 1.2.1 **原生解析**（无需像群全量消息那样补解析器）；intents 仍是 `public_messages=True`（它同时覆盖群与 C2C）。
 - **命令行发私聊**：`python send_file.py --file <路径> --user <user_openid>`（单聊无主动权限，自动走被动回复）。
 
-## 文件
-- `bot.py` — 收端（WebSocket）：识别 + 落库 + 回执 + 指令；**群与私聊共用 `route_message()`**；含 `--self-test` / `--list` / `--log <文件>`。
+## 文件：每个文件是干嘛的
+
+| 文件 | 干嘛的 | 谁调用它 |
+|---|---|---|
+| `bot.py` | **收端（常驻）**：WebSocket 收 QQ 群 / 私聊消息 → 识别指令 → 落库 → 回执。含 `--self-test` / `--list` / `--log <文件>` | 计划任务 `MoyuBot`（`python bot.py`） |
+| `send_file.py` | **发端（纯 HTTP）**：把本地文件发到群 / 单聊。零第三方依赖，含 `--self-test` | `bot.py`、命令行、任何本机脚本 |
+| `config-web.py` | **配置中心（本地网页）**：凭据 / 文案 / 搜索目录 / 展示范围 / 开机自启 / 启停机器人 / 依赖自检 / 忽略表 | 你（`python config-web.py`） |
+| `配置中心.bat` | **Windows 一键启动**：双击就等于跑 `python config-web.py`（装好 Python 就行） | 你（双击） |
+| `settings.py` | **本机设置**：`settings.json` 的读写、校验、指令解析。三个入口共用的一份键值 | `bot.py`、`config-web.py`、`ideas-bubbles.py` |
+| `ignore.py` | **忽略表**：命中规则的群 / 私聊消息一律跳过（不收灵感、不响应） | `bot.py`、`config-web.py` |
+| `store.py` | **存储层**：SQLite 单文件 `memos.db`，`kind` = memo/idea、`status` = open/done/decided/dropped | `bot.py`、`ideas.py`、`ideas-bubbles.py` |
+| `ideas.py` | **灵感池入口**：导出 / 列出 / 标记灵感处理结果（给「专门处理灵感的会话」用） | 你 / 工作区的助手 |
+| `ideas-bubbles.py` | **灵感泡泡**：读 `memos.db` 渲染成气泡轮播页；`--serve` 时页面上点一下直接写库 | 桌面「灵感泡泡.bat」 |
+| `moyu.py` | **摸鱼库抽签**：指令解析（归一化 + 前缀匹配）+ 抽签 + 防重复 | `bot.py`、命令行 |
+| `moyu-data.json` | 摸鱼库内容（65 条）。**改这个文件即可增删内容，不用动代码** | `moyu.py` |
+| `md2img.py` | Markdown / 纯文本 → PNG：Python 转 HTML，再调 `md2png.mjs` 截图 | `bot.py`、命令行 |
+| `md2png.mjs` | Node + `playwright-core` 用系统 Chrome 渲染截图（超高时纵向切片） | `md2img.py` |
+| `extensions/__init__.py` | **扩展加载器**：依次加载 `extensions/*.py` 与 `extensions/local/*.py` | `bot.py` |
+| `extensions/example.py` | 扩展示例模板（**不注册任何指令**），复制到 `extensions/local/` 改 | 你 |
+| `extensions/local/` | **你的私有指令**（已 gitignore，不进公开仓库） | 你 |
+| `test/run-tests.py` | **回归测试**（纯 stdlib，不依赖 pytest） | 你（`python test/run-tests.py`） |
+| `.env` | **凭据与路径**（已 gitignore）：AppID / AppSecret / 群 openid / 搜索根… | 所有模块 |
+| `.env.example` | `.env` 的模板与注释说明 | 你（`cp` 一份改） |
+| `requirements.txt` | Python 依赖清单 | `pip install -r` |
+| `package.json` | Node 侧依赖（`playwright-core`，只在渲染成图片时用到） | `npm install` |
+
+### 几个文件的内部要点
+
+- `bot.py`
   - 路由主体是**模块级** `route_message(client, message, mentioned, scope)`（不在 `main()` 内的类里），便于回归测试直接驱动；`MemoClient.route()` 只是转发。
   - 运行时用 `install_group_message_parser()` 给 botpy 补上 `GROUP_MESSAGE_CREATE` 解析器（官方 1.2.1 未注册该事件，会被网关丢弃）；`C2C_MESSAGE_CREATE` 官方已注册，无需补。
   - `--log <文件>` 把 stdout/stderr 与 logging 重定向到文件，供 `pythonw.exe` 无控制台常驻运行。
-- `ignore.py` — **忽略表**（抄海豹骰子 `.botlist`）：命中规则的群 / 私聊消息一律跳过。规则来自 `MEMO_IGNORE`（`.env`）+ `ignore.json`（指令维护）。
-- `send_file.py` — 发文件（纯 HTTP）：**零第三方依赖**，含 `--self-test`。群 / 单聊由 `scope` 切换（`--group` / `--user`）；群默认主动推送、失败自动降级被动回复，单聊一律被动回复。上传带 `file_name`（否则 QQ 文件卡片显示「未命名」），并对 `305013`（审核服务超时）/ `850027`（发送超时）/ `40093001`（上传失败）**自动重试 2 次**。
-- `md2img.py` — Markdown/纯文本 → PNG（Python `markdown` 转 HTML，调 `md2png.mjs` 截图）。含 CLI：`python md2img.py <文件> [输出目录]`。
-- `md2png.mjs` — Node + `playwright-core` 用系统 Chrome 渲染截图（可纵向切片）。
-- `ideas.py` — **灵感池入口**：导出 / 列出 / 标记灵感处理结果（供「处理灵感的专用会话」用）。
-- `ideas-bubbles.py` — 把灵感库渲染成**单文件 HTML** 的「思维泡泡」轮播页（`灵感泡泡.html`）。
-- `moyu.py` — 摸鱼库抽签（指令解析 + 防重复），供「摸鱼」指令调用。含 CLI。
-- `moyu-data.json` — 摸鱼库内容（65 条），**改这个文件即可增删内容，不用动代码**。
-- `store.py` — SQLite 存储层（单文件 `memos.db`，含 `kind` = memo/idea、`status` = open/done/decided/dropped）。
-- `extensions/` — **扩展机制**：`__init__.py` 加载器 + `example.py` 模板（不注册任何指令）。
-- `extensions/local/` — **私有扩展目录（已 gitignore，不进公开仓库）**，放你自己的自定义指令。
-- `ignore.py` / `ignore.json` — **忽略表**：规则文件 `ignore.json` 由指令维护（已 gitignore，含真实群内昵称 / openid）。
-- `test/run-tests.py` — 回归测试（纯 stdlib，183 项）。
-- `requirements.txt` — Python 依赖：`qq-botpy`（官方 SDK，导入名 `botpy`）/ `python-dotenv` / `markdown` / `pillow`。
-- `package.json` — Node 侧依赖：`playwright-core`（仅渲染成图片时用到）。
-- `.env.example` — 凭据与配置模板。
+- `send_file.py`：群 / 单聊由 `scope` 切换（`--group` / `--user`）；群默认主动推送、失败自动降级被动回复，单聊一律被动回复。上传带 `file_name`（否则 QQ 文件卡片显示「未命名」），并对 `305013`（审核服务超时）/ `850027`（发送超时）/ `40093001`（上传失败）**自动重试 2 次**。
+- `config-web.py`：`ENV_SPEC` 是**白名单** —— 页面只能改表里列出的键；写 `.env` 按行改（注释与顺序保留）；`_powershell()` 强制 UTF-8 输出且 `ErrorActionPreference='Stop'`（否则注册计划任务失败会被误报成成功）。
+- `ideas-bubbles.py`：内容流放哪几类由设置 `bubbles_show` 决定（默认只放「待处理」）；顶部「⚙ 设置」只放这一项。
+  `--serve` 起本地服务后页面上直接写库（桌面入口走这条）；不带参数则只生成静态快照 `灵感泡泡.html`。
 
 ## 发送格式：文本类文件渲染成图片
 **手机端文件卡片常打不开**（尤其 `.md` 这类无默认应用的类型），而把内容拆成多条文本消息又太碎。因此：
@@ -162,38 +269,65 @@ python memo-bot/ideas.py --stats               # 只看计数
 - 加内容：直接编辑 `moyu-data.json` 的 `items` 数组，`id` 不重复即可（`relax-21`、`slack-26`…），**不用改代码**。
 - CLI：`python moyu.py` / `python moyu.py 3` / `python moyu.py --cat trivia` / `python moyu.py --parse "摸鱼！"` / `python moyu.py --stats`。
 
-## 灵感泡泡：把灵感库放成一个轮播页面
-`ideas-bubbles.py` 读 `memos.db`，生成**单文件 HTML**（数据内嵌，`file://` 直接打开，无需服务器）。
+## 灵感泡泡：把灵感库放成一个轮播页面（实时处理端）
+`ideas-bubbles.py` 读 `memos.db`，渲染成「思维泡泡」轮播页。
 
 ```bash
-python memo-bot/ideas-bubbles.py              # → 工作区根目录 灵感泡泡.html
-python memo-bot/ideas-bubbles.py --open-only  # 只放待处理的
+python memo-bot/ideas-bubbles.py --serve      # 【推荐】起本地服务 + 打开浏览器：点一下直接写库
+python memo-bot/ideas-bubbles.py              # 只生成静态 HTML → 工作区根目录 灵感泡泡.html
+python memo-bot/ideas-bubbles.py --open-only  # 不加载归档，只带「待处理」
 python memo-bot/ideas-bubbles.py --include-memo
-python memo-bot/ideas-bubbles.py --serve      # 起本地服务，页面里点一下**直接写库**
 python memo-bot/ideas-bubbles.py --apply 灵感操作.json   # 应用离线模式导出的操作
 ```
 
-- 气泡从底部「思维源」升起、横向漂移、顶部淡出，循环不停；一轮内不重复，放完自动重洗。
-- **全文展示**：每条灵感的正文完整渲染在气泡里，永不截断（长文本自动缩小字号、必要时横跨整个舞台）。
-- **页内处理**：点击气泡 → 浮层显示全文 + 结论输入 + 四个按钮（已处理 / 已决议 / 丢弃 / 恢复待处理）。
-  - `--serve` 直连模式：点按钮**直接写 `memos.db`**（适合本机用）。
-  - 双击 HTML（离线）：操作暂存浏览器 localStorage，顶部显示「待提交 N 条」，点它导出 `灵感操作.json`，再跑 `--apply` 落地（适合拿到别人的 HTML 文件时）。
-- 悬停暂停单个气泡；**空格**暂停/继续生成；**Esc** 关浮层。
+### 视图：内容流放哪几类由设置决定
+- **默认只放「待处理」**。已处理 / 已决议 / 已丢弃**默认不进流**，去各自的列表里看。
+  想同时看到别的类别 → 顶部「⚙ 设置」勾选（或配置中心网页、或群里发 `设置 bubbles_show 待处理,已处理`），存完内容流立刻重建。
+  展示范围以服务端为准：**刷新页面会重新拉一次**，所以别人（或机器人指令）改过之后刷新就能看到。
+- 顶部三个按钮：**`✅ 已处理 N` / `📌 已决议 N` / `🗑 垃圾桶 N`**，点开是一个列表浮层：
+  每条显示时间 + 全文 + 结论，右侧「← 恢复」把它放回内容流。
+- **丢弃 ≠ 删除**：记录仍在 `memos.db`（`status=dropped`），只是从流里挪进垃圾桶，随时可恢复。
+- 点列表里的某一条 → 打开详情浮层，可以改成任意状态（含填结论）。
+
+### 实时：页内处理直接写库
+- **`--serve` 直连模式（推荐）**：点按钮**直接 POST 写 `memos.db`**，不需要导出任何文件。
+  另外每 20 秒拉一次 `/api/ideas` —— **群里 bot 新收的灵感会自动进流**。
+  页面顶部「⏻ 停止服务」可停（也可 Ctrl+C）。
+- **离线（直接双击 HTML）**：操作暂存浏览器 localStorage，顶部显示「待提交 N 条」，
+  点它导出 `灵感操作.json`，再跑 `--apply` 落地 —— **仅作降级**（静态页是快照，数据不会自己更新）。
+- 悬停暂停单个气泡；**空格**暂停/继续生成；**Esc** 关浮层（详情浮层与设置浮层都关）。
+- 🔴 **同一条灵感同时最多一个气泡**：取条目时会跳过「已经在屏幕上的」，条目数比最大气泡数（宽屏 8 / 窄屏 5）少时不会把同一条重复铺开。开局按**实际条目数**均分飞行进度（不按最大气泡数），条目少也不会全挤在底部。
+- 🔴 **有结论的条目会把结论一起显示**：气泡里正文下方用虚线隔开一段「结论：…」（已处理 / 已决议 / 已丢弃 通常带结论）。**没有结论就不显示**，和以前完全一样。结论算进了气泡高度估算，长文本判据也带上它，不会因为多了一段就撞上邻居。
+- 🔴 **换行原样保留**：群里分几行写的记录，气泡和详情浮层里就是几行（容器 `white-space: pre-wrap`，
+  `clean()` 只压空格 / 制表符、**不压 `\n`**）。连续空行最多留一个；气泡高度与「长文本」判据都按
+  **显式换行 + 宽度折行**逐段算，不会因为多几行就撞上邻居。
 - 防重叠布局：所有气泡同一下降速度 + 补位卡最小间隔 ⇒ 竖直永久等距；长文本按**估算高度**（非固定字数）决定是否横跨舞台。桌面 3 泳道 / 窄屏 2 泳道，边界泳道只向内漂。
-- 数据是生成时**快照**：灵感库更新后重新跑一次脚本即可。
+- HTTP 接口：`GET /api/ping`（探活）· `GET /api/ideas`（全部灵感）· `POST /api/status`（改状态）· `GET|POST /api/settings`（读 / 写设置）· `POST /api/quit`（停服务）。
+
+> 桌面快捷方式「灵感泡泡」走的就是 `--serve`：探测到服务没跑就用 `pythonw` 后台起一个（无窗口），
+> 已在跑就复用，然后开浏览器 —— 所以双击永远是**实时**的，不是快照。
 
 ## 回归测试
 ```bash
 python test/run-tests.py
 ```
-纯 stdlib（不依赖 pytest），**183 项**，覆盖：`moyu.parse` 三态解析、`moyu.draw` 抽签/防重复/分类池、
+纯 stdlib（不依赖 pytest），**335 项**，覆盖：`moyu.parse` 三态解析、`moyu.draw` 抽签/防重复/分类池、
 `store` 状态机与老库迁移、`bot` 文本清洗/搜索打分/动态帮助/日志轮转/PID 判活/**群与私聊会话标识**、
 `send_file` 类型识别/**群与单聊目标路径**/`last_msg` 兼容、`md2img` 依赖定位、
-`ideas-bubbles` 页面生成 + `--serve` API + `--apply` + 防重叠源码护栏、
+`search_files` 排序（**匹配分降序 → mtime 倒序 → 路径短优先**，且时间不越权压过低分命中）+ **慢搜索不卡事件循环**（走线程的行为验证）、
+`ideas-bubbles` 页面生成 + `--serve` API（含 `/api/quit`、`/api/settings`）+ `--apply` + 防重叠源码护栏
++ **归档分流护栏**（按设置过滤、三态列表、恢复按钮、改状态不删记录、定时刷新、设置浮层与轮询互不打扰、
+**启动时重新拉设置再铺气泡**、**气泡去重**（同一条同时只有一个气泡 / 预热按实际条目数均分 / 设置只提交改动过的键）、
+**有结论才显示结论**（条件渲染 + 高度算进布局估算）、**设置浮层只管展示范围**、
+**换行原样保留**（`clean()` 不压 `\n` / 逐段折行算高度 / 容器 `pre-wrap`））、
+`settings` 本机设置（默认值 / env 回退 / 校验与归一化 / 批量写整批回滚 / 中文标签 / 指令识别与收紧）、
+`config-web` 配置中心（**`.env` 按行写入**：注释与顺序保留 / 已有键只换值 / 新键追加 / 写前备份、
+白名单与逐项校验、**密钥留空 = 不改**、**AppSecret 不回显**、字段表分组与 env/settings 分流、
+目录浏览容错、页面护栏（只监听 127.0.0.1 / CSRF 请求头 / 各分区控件齐全）、`.env.example` 文档同步）、
 `extensions` 注册表 / 加载容错 / `example.py` 模板不注册指令、
 `ignore` 忽略表（env/file 双来源、子串与发送者双语义、四种指令、来源保护）、
-`route_message` 真实路由（忽略闸门群/私聊、指令放行、指令分发、灵感兜底）。
-所有落盘用例都改写到临时目录，**不碰真实数据**。
+`route_message` 真实路由（忽略闸门群/私聊、指令放行、指令分发、灵感兜底、**「设置」指令端到端**）。
+所有落盘用例都改写到临时目录，**不碰真实数据（`memos.db` / `moyu-recent.json` / `.env`）**。
 
 ## 配置项一览（全部走环境变量，见 `.env.example`）
 
@@ -211,9 +345,11 @@ python test/run-tests.py
 |---|---|---|
 | `QQ_BOT_SANDBOX` | `false` | 是否走沙箱域名（本地联调设 `true`） |
 | `MEMO_TRIGGER` | `备忘` | 备忘触发词 |
-| `QQ_STARTUP_MSG` | `我上班了，开摸！` | 启动播报文案（留空不播报） |
-| `MEMO_SEARCH_ROOT` | 你的用户主目录 `~` | 「发文件」搜索根；**不要指向含凭据的目录**（`.ssh`/`.aws`/`.config` 等已被强制排除） |
+| `QQ_STARTUP_MSG` | `我上班了，开摸！` | 启动播报文案（留空不播报）。**建议改用配置中心网页、或 `设置 startup_msg <值>`**（写进 `settings.json`，优先级更高） |
+| `OFFWORK_MSG` | `现在开始，我要下班了！` | 关机自动播报文案（留空不发）。**建议改用配置中心网页、或 `设置 offwork_msg <值>`** |
+| `MEMO_SEARCH_ROOT` | 你的用户主目录 `~` | 「发文件」搜索根；**不要指向含凭据的目录**（`.ssh`/`.aws`/`.config` 等已被强制排除）。⚠️ 主目录常有百万级文件（实测 216 万 → 一次搜索约 1 分钟），**建议指向你真正放文档的目录** |
 | `MEMO_WORKSPACE_ROOT` | memo-bot 目录 | 搜索里加权的目录（一般无需改） |
+| `MEMO_SETTINGS_FILE` | `settings.json` | 本机设置文件路径（配置中心网页与「设置」指令写的就是它） |
 | `MEMO_IGNORE` | 空 | **忽略表种子**（逗号分隔，中英文逗号都认）。命中规则的群 / 私聊消息一律跳过。改 `.env` 即生效，**「忽略」指令删不掉**（防误删把循环放出来） |
 | `MEMO_IGNORE_FILE` | `ignore.json` | 忽略表规则文件路径（由「忽略」指令维护） |
 
@@ -279,10 +415,11 @@ def handle(text, mentioned) -> str | list[str] | None
 
 ## 本地验证（无需 QQ 凭据）
 ```bash
+python config-web.py            # 起配置中心网页（改配置 / 看依赖自检 / 开关自启）
 python bot.py --self-test       # 模拟群消息，验证识别+落库
 python bot.py --list            # 打印已记录的备忘（本地读取用）
 python send_file.py --self-test # 验证文件类型识别/编码/凭据
-python test/run-tests.py        # 全量回归测试（183 项）
+python test/run-tests.py        # 全量回归测试（335 项）
 python moyu.py 3                # 摸鱼库抽 3 条
 python moyu.py --stats          # 摸鱼库计数
 python ideas-bubbles.py         # 生成灵感泡泡页面
@@ -291,15 +428,24 @@ python ideas-bubbles.py         # 生成灵感泡泡页面
 ## 真实部署（在你的本机，电脑需开机）
 1. 安装依赖：`pip install -r requirements.txt`
    - 注意包名是 **`qq-botpy`**（`pip install botpy` 会失败）；导入名是 `botpy`。
-2. `cp .env.example .env`，填入 QQ 机器人 **AppID / AppSecret**（从 https://q.qq.com 创建机器人获取）。
+2. **配置**（两条路选一条）：
+   - ✅ **推荐**：`python config-web.py` → 网页上填 AppID / AppSecret → 点「保存并重启机器人」；
+   - 手动：`cp .env.example .env`，自己填 QQ 机器人 **AppID / AppSecret**（从 https://q.qq.com 创建机器人获取）。
    - botpy 登录用 **AppSecret（机器人密钥）**，不是 Token。
-3. 把机器人加入你的群，并在**群设置**里打开上面那两个开关。想用**私聊**，还要在 QQ 开放平台 → 功能配置里开启「单聊」。
-4. `python bot.py` 启动常驻。**启动后每条备忘会打印 `group_openid=...`**，把它填进 `.env` 的 `QQ_GROUP_OPENID`（发文件要用）。
+3. 把机器人加入你的群，并在**群设置**里打开下面那两个开关。想用**私聊**，还要在 QQ 开放平台 → 功能配置里开启「单聊」。
+4. 启动常驻：`python bot.py`（或配置中心里点「启动」）。
+   **启动后每条备忘会打印 `group_openid=...`**，把它填进 `.env` 的 `QQ_GROUP_OPENID`（发文件要用）——
+   配置中心里也有这一栏，日志里抄到后粘进去即可。
 5. 发文件（默认主动推送，无需先 @）：
    `python send_file.py --file <路径> --caption "说明"`
 
 ### 开机自启（不绑定任何会话）
-用 Windows 计划任务托管，登录即启动，且**不显示控制台窗口**（`pythonw.exe` + `--log` 写文件）：
+用 Windows 计划任务托管，登录即启动，且**不显示控制台窗口**（`pythonw.exe` + `--log` 写文件）。
+
+> ✅ **最省事的做法**：打开配置中心 → 「⑤ 运行方式」→ 拨一下「开机自启」开关。
+> 它做的就是下面这段 PowerShell（等价），而且会实时显示当前是开还是关。
+
+<details><summary>等价的手动命令</summary>
 
 ```powershell
 # pythonw 路径：优先取 PATH 上的；否则改成你本机的 pythonw.exe 绝对路径
@@ -314,9 +460,11 @@ $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnB
 Register-ScheduledTask -TaskName 'MoyuBot' -Action $act -Trigger $trg -Settings $set -Force
 ```
 
+</details>
+
 - 任务名 `MoyuBot`；查看状态：`Get-ScheduledTask -TaskName MoyuBot`；立刻跑：`Start-ScheduledTask -TaskName MoyuBot`。
 - 日志：`memo-bot/bot.out.log`。
-- 🔴 **同一时刻只能跑一个实例**（两个进程会各建一条 WS 连接、事件被抢）。改代码后要 `Stop-ScheduledTask` 再 `Start-ScheduledTask`。
+- 🔴 **同一时刻只能跑一个实例**（两个进程会各建一条 WS 连接、事件被抢）。改代码后要 `Stop-ScheduledTask` 再 `Start-ScheduledTask`（或配置中心点「重启」）。
 
 ## 与外部助手集成（可选）
 bot 是纯本地进程，任何能在本机执行命令的程序都可以驱动它：
@@ -347,9 +495,11 @@ bot 是纯本地进程，任何能在本机执行命令的程序都可以驱动�
 本项目**不写死任何本机路径、不含任何凭据、不含个人自定义指令**。提交前确认以下都已进 `.gitignore`（已配好）：
 
 - `.env` —— 你的 QQ 凭据（**绝不进仓库**）
+- `.env.bak` —— 配置中心写 `.env` 前的自动备份（同样是凭据）
 - `memos.db` / `*.db` / `*.db.bak*` —— 个人备忘 / 灵感库（含备份）
 - `last_group_msg.json` / `moyu-recent.json` —— 含真实群 openid / 使用状态
 - `ignore.json` —— 忽略表（含真实群内昵称 / 发送者 openid）
+- `settings.json` —— 本机设置（含本机文案；密钥不放这里，但仍是个人配置）
 - `*.log` / `bot.pid` / `灵感泡泡.html` —— 运行时产物
 - `extensions/local/` —— **你的私有指令**（查运势 / 自检 / 资源点等），不进公开仓库
 

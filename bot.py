@@ -1,4 +1,15 @@
-"""群备忘 + 发文件机器人（最小可用版）
+"""摸鱼bot 的**收端**（常驻进程）：监听 QQ 群 / 私聊消息 → 识别指令 → 落库 → 回执。
+
+这个文件是干嘛的：
+  - 常驻跑着（由计划任务 `MoyuBot` 托管），用 QQ 官方机器人 WebSocket 长连接收消息；
+  - 群消息与私聊消息都进 `route_message()`，依次过：
+    忽略表 → 「设置」指令 → 扩展指令 → 内置指令（备忘 / 查备忘 / 查灵感 / 发文件 /
+    摸鱼 / 帮助）→ 都没命中就兜底**静默收作灵感**；
+  - 数据落 `store.py`（SQLite）；发文件走 `send_file.py`（纯 HTTP，不占长连接）；
+  - 配置读两处：`settings.py`（本机设置，可网页改）+ `.env`（凭据 / 路径）。
+
+跑起来的入口：`python bot.py`（真实启动，需 `.env` 里的 QQ 凭据）。
+
 本地运行，走 QQ 官方机器人 WebSocket 模式（无需公网 IP）。
 
 三种运行方式：
@@ -38,6 +49,7 @@ from store import (
 import moyu
 import extensions as _ext
 import ignore as _ignore
+import settings as _settings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_MSG_FILE = os.path.join(HERE, "last_group_msg.json")
@@ -158,6 +170,8 @@ HELP_BASE = (
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
     "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
+    "设置 —— 看/改本机设置（网页「配置中心」改的是同一份）；\n"
+    "            「设置 <键> <值> / 设置 重置 <键>」\n"
     "帮助 —— 显示本菜单\n"
     "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰"
 )
@@ -279,7 +293,10 @@ def search_files(query, limit=SEARCH_LIMIT):
       1.5 相对路径是其**子序列**（如 工作日志10-08 → .../每日工作日志/2026-10-08.md）
       当前工作区内的文件额外 +0.1（同分时优先本地）
 
-    ⚠️ 1.5 这级只在查询长度 ≥3 时启用 —— 子序列太宽松，短查询会命中一大片。
+    返回顺序（🔴 见下面 sort）：
+      **匹配分降序 → 同分时修改时间倒序（最新在前）→ 再同分时路径短的在前**
+
+    ⚠️ 1.5 这级只在查询长度 >=3 时启用 —— 子序列太宽松，短查询会命中一大片。
     """
     q = (query or "").strip().lower()
     if not q:
@@ -308,9 +325,16 @@ def search_files(query, limit=SEARCH_LIMIT):
                 continue
             if local:
                 score += 0.1
-            out.append((score, rel, full))
-    out.sort(key=lambda x: (-x[0], len(x[1])))
-    return [(rel, full) for _, rel, full in out[:limit]]
+            # mtime 只对**命中的**文件取（命中数很少，开销可忽略；不是对全树 stat）
+            try:
+                mt = os.path.getmtime(full)
+            except OSError:
+                mt = 0.0
+            out.append((score, mt, rel, full))
+    # 🔴 匹配分降序 → **修改时间倒序（最新在前）** → 路径短的在前（同秒时保证结果稳定）。
+    #    以前同分是按路径长度升序排，那个顺序对用户没有意义（用户 2026-10-09 明确要求改成时间优先）。
+    out.sort(key=lambda x: (-x[0], -x[1], len(x[2])))
+    return [(rel, full) for _, _, rel, full in out[:limit]]
 
 
 def resolve_choice(text, matches):
@@ -505,13 +529,20 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
 
     # 0) 忽略表：先放行「忽略」指令本身（否则指令会被自己的规则吃掉），
     #    再对普通消息做闸门 —— 命中即整条跳过（不收灵感、不响应）。
-    #    抄海豹骰子 `.botlist`：两个 bot 同群时靠这个避免互相收集 / 循环响应。
+    #    同群有别的机器人时，靠这个避免互相收集 / 循环响应。
     if _ignore.is_command(text):
         await message.reply(content=_ignore.handle_command(text), msg_seq=1)
         return
     hit = _ignore.match(text, t["sender_id"])
     if hit:
         print(f"[忽略] scope={scope} hit={hit!r} text={text!r}", flush=True)
+        return
+
+    # 0.6) 设置：改的是 `memo-bot/settings.json` —— 和网页「⚙ 设置」同一份。
+    #      「设置」后面**必须有分隔符**，否则「设置好了」「配置一下」这种普通聊天
+    #      会被当成指令（同忽略表的处理）。
+    if _settings.is_command(text):
+        await message.reply(content=_settings.handle_command(text), msg_seq=1)
         return
 
     # 0.5) 有待选文件时，优先解析「选哪个」（序号 / 文件名片段）
@@ -533,7 +564,9 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     fm = (FILE_SEND_RE if mentioned else EXPLICIT_FILE_RE).match(text)
     if fm:
         q = fm.group(1).strip()
-        matches = search_files(q)
+        # 🔴 必须丢线程：搜索根可能是整个用户目录（百万级文件），同步跑会把事件循环
+        #    卡死几十秒 —— 期间收不到任何消息、心跳也停摆。
+        matches = await asyncio.to_thread(search_files, q)
         if not matches:
             await message.reply(
                 content=f"（没找到含「{q}」的文件，已搜配置的根目录）", msg_seq=1
@@ -655,7 +688,9 @@ def main():
             print(f"[botpy] 已上线：{self.robot.name}", flush=True)
             # 启动播报（主动推送，群内需开启「机器人主动发言」）
             gid = (os.getenv("QQ_GROUP_OPENID") or "").strip()
-            msg = (os.getenv("QQ_STARTUP_MSG") or "我上班了，开摸！").strip()
+            # 文案从 settings 读（网页「⚙ 设置」和机器人「设置」都能改）；
+            # 留空 = 不播报。settings 内部会自动回退到 .env 的 QQ_STARTUP_MSG。
+            msg = (_settings.get("startup_msg") or "").strip()
             if gid and msg:
                 try:
                     import send_file as sf

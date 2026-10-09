@@ -3,6 +3,8 @@
 #    所有注释都必须单独成行。
 .env
 .env.local
+# 配置中心写 .env 前的自动备份（同样是凭据）
+.env.bak
 # 含真实群 openid / msg_id
 last_group_msg.json
 # 个人数据（备忘 / 灵感库）
@@ -17,6 +19,8 @@ memos.db
 moyu-recent.json
 # 忽略表（含真实群内昵称 / 发送者 openid）
 ignore.json
+# 本机设置（网页「⚙ 设置」/ 机器人「设置」指令写的就是它）
+settings.json
 
 # ── 运行时产物 ───────────────────────────────────────────────
 __pycache__/
