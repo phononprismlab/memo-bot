@@ -253,12 +253,21 @@ def _pid_alive(pid):
         return False
     try:
         if os.name == "nt":
+            # 🔴 两处都要兜底，否则**整个启停流程会被打断**
+            #    （实测踩到：bot_stop 成功 → bot_start 在 _pid_alive 崩 → bot 被停掉却没起来）：
+            #    1) 显式 encoding + errors="replace" —— 中文 Windows 的 tasklist 输出是 GBK，
+            #       而设了 PYTHONUTF8=1 的环境会拿 UTF-8 去解码 → UnicodeDecodeError 直接冒泡。
+            #       表头乱码无所谓，PID 是 ASCII，不影响匹配。
+            #    2) stdout 兜底成 "" —— 受限环境里它可能是 None，`in None` 会抛 TypeError。
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True, timeout=10).stdout
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=10).stdout or ""
             return str(pid) in out
         os.kill(pid, 0)
         return True
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # ValueError 不是凑数：UnicodeDecodeError 继承自 ValueError，不继承 OSError。
+        # 上面的 encoding 兜底只是把「正常路径」护住了，真出现解码异常时仍会走到这里。
         return False
 
 
@@ -380,9 +389,12 @@ def bot_stop():
     if not pid:
         return True, "机器人本来就没在跑"
     try:
+        # 和 _pid_alive 同一个坑：中文 Windows 的 taskkill 输出是 GBK，
+        # 这里只取返回码不看文本，但解码仍会在 subprocess 内部发生 → 必须显式指定。
         subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.SubprocessError) as e:
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         return False, f"停不掉：{type(e).__name__}: {e}"
     for _ in range(24):
         if not _pid_alive(pid):

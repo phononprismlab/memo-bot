@@ -20,6 +20,7 @@
 
 🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json / .env**。
 """
+import ast
 import importlib.util
 import json
 import os
@@ -1389,6 +1390,36 @@ def _free_port():
         s.close()
 
 
+def _extract_pid_alive(relpath):
+    """用 AST 从源文件里单独抠出 `_pid_alive`，返回 **(函数对象, 函数源码段)**；找不到返回 `(None, "")`。
+
+    🔴 不能直接 `import bot` —— `bot.py` 是**模块级执行**，import 就会把机器人启动起来
+    （它会读 .env、连 QQ、抢 pid 锁）。测试要验的只是这一个纯函数，用 AST 精确抠出来最干净。
+
+    🔴 返回源码段是给源码护栏用的：断言必须**只匹配这个函数体**。曾踩到 —— 断言整个文件里
+    有没有 `ValueError`，而 `bot_stop()` 里恰好也有一处同名兜底 → `_pid_alive` 的兜底被删掉
+    后护栏依然全绿（假绿）。
+    """
+    path = os.path.join(ROOT, relpath)
+    if not os.path.isfile(path):
+        return None, ""
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    node = next((n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_pid_alive"), None)
+    if node is None:
+        return None, ""
+    seg = ast.get_source_segment(src, node)
+    ns = {"os": os, "subprocess": subprocess}
+    exec(seg, ns)
+    return ns["_pid_alive"], seg
+
+
+class _NoStdout:
+    """假的 subprocess 结果：stdout 是 None（受限环境里真会出现）。"""
+    stdout = None
+
+
 def test_console_encoding():
     """🔴 中文 Windows 上 stdout 重定向到文件时按系统默认编码（GBK）写 —— 编不出的
     字符会让 print 抛 UnicodeEncodeError，把**整个进程**带崩。
@@ -1462,6 +1493,44 @@ def test_console_encoding():
             proc.stdout.close()
         except (OSError, ValueError):
             pass
+
+    # 4) 🔴 行为护栏：`_pid_alive` 不许被「解码异常 / stdout 为 None」打断（2026-10-09 真凶）。
+    #    重启机器人时崩在这里 —— bot_stop 成功 → bot_start 崩 → **机器人被停掉却起不来**：
+    #      · tasklist 输出是 GBK，被 UTF-8 解码 → UnicodeDecodeError
+    #        （它继承 **ValueError**，不是 OSError → 只写 `except (OSError, ...)` 兜不住）
+    #      · 受限环境里 stdout 是 None → `str(pid) in None` 抛 TypeError
+    #    异常在 subprocess 内部产生，源码文本护栏**抓不到** → 必须真调一次。
+    #    bot.py 是模块级执行（import 就会启动机器人），所以用 AST 抠出函数单独跑。
+    for rel in ("bot.py", "config-web.py"):
+        fn, seg = _extract_pid_alive(rel)
+        check(f"{rel}::_pid_alive 源码带 encoding + ValueError 兜底",
+              'encoding="utf-8", errors="replace"' in seg
+              and "subprocess.SubprocessError, ValueError" in seg)
+        if fn is None or os.name != "nt":
+            why = "没抽出函数定义" if fn is None else "跳过：非 Windows"
+            check(f"{rel}::_pid_alive 遇 UnicodeDecodeError 不冒泡", True, why)
+            check(f"{rel}::_pid_alive 遇 stdout=None 不抛 TypeError", True, why)
+            continue
+        orig_run = subprocess.run
+        try:
+            def _raise_decode(*a, **k):
+                raise UnicodeDecodeError("utf-8", b"\xd0\xcf", 0, 1, "invalid continuation byte")
+
+            subprocess.run = _raise_decode
+            try:
+                check(f"{rel}::_pid_alive 遇 UnicodeDecodeError 不冒泡", fn(os.getpid()) is False)
+            except Exception as e:
+                check(f"{rel}::_pid_alive 遇 UnicodeDecodeError 不冒泡", False,
+                      f"冒泡 {type(e).__name__}")
+
+            subprocess.run = lambda *a, **k: _NoStdout()
+            try:
+                check(f"{rel}::_pid_alive 遇 stdout=None 不抛 TypeError", fn(os.getpid()) is False)
+            except Exception as e:
+                check(f"{rel}::_pid_alive 遇 stdout=None 不抛 TypeError", False,
+                      f"抛了 {type(e).__name__}")
+        finally:
+            subprocess.run = orig_run
 
 
 # ── [14] 回旋镖 + 导出 ──────────────────────────────────────────

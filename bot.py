@@ -77,12 +77,18 @@ def _pid_alive(pid):
         return False
     if os.name == "nt":
         try:
+            # 🔴 和 config-web.py::_pid_alive 同款兜底，缺一个都会崩：
+            #    1) 显式 encoding —— 中文 Windows 的 tasklist 输出是 GBK，
+            #       设了 PYTHONUTF8=1 的环境会拿 UTF-8 去解码 → UnicodeDecodeError。
+            #    2) stdout 兜底成 "" —— 受限环境里可能是 None，`in None` 抛 TypeError。
             out = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, text=True, timeout=10,
-            ).stdout
+                encoding="utf-8", errors="replace",
+            ).stdout or ""
             return str(pid) in out
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # ValueError 不是凑数：UnicodeDecodeError 继承自 ValueError，不是 OSError。
             return False
     try:
         os.kill(pid, 0)

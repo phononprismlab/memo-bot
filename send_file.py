@@ -43,7 +43,12 @@ for _stream in (sys.stdout, sys.stderr):
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 VIDEO_EXT = {".mp4"}
 VOICE_EXT = {".silk", ".mp3", ".wav", ".ogg"}
-HARD_LIMIT = 200 * 1024 * 1024  # QQ 富媒体 200MB 限制
+HARD_LIMIT = 200 * 1024 * 1024  # QQ 文档写的富媒体上限（实测远达不到，见下）
+# 🔴 实测（2026-10-09，逐档发送验证）：file_data 是 base64 塞进 JSON body 的，base64 会膨胀
+#    约 1/3；网关在 body 约 16~20MB 时**直接回 HTTP 413**（返回 HTML，不是 QQ 业务错误码）。
+#    ⇒ 按原文件算：5MB ✅ / 10MB ✅ / 15MB ❌ / 20MB ❌ / 30MB ❌。
+#    所以 HARD_LIMIT 只当「绝对不可能」的兜底，真正该看的是下面这个。
+GATEWAY_SAFE = 10 * 1024 * 1024
 
 # 纯文本类：手机端文件卡片常打不开，改为「把内容当文本消息直发」
 TEXT_EXT = {
@@ -93,7 +98,18 @@ def load_last_msg(max_age=PASSIVE_MAX_AGE):
 
 
 def load_env():
-    """读取同目录 .env（不依赖第三方库）。"""
+    """读取同目录 .env（不依赖第三方库）。
+
+    🔴 读完必须**同时灌进 os.environ**：渲染链路是 md2img.py → md2png.mjs（node 子进程），
+    而 node 那边是从 **os.environ** 读 MEMO_PLAYWRIGHT_CORE / MEMO_CHROME 的。
+    只把值放进返回的 dict，子进程拿不到 → 渲染失败 → **静默降级成文本直发**
+    （文本类文件本来的预期行为是「渲染成图片」，降级后手机上收到的是一大段文字）。
+
+    bot.py 走的是 python-dotenv 的 load_dotenv()，它本来就写 os.environ，
+    所以群指令那条路径不会踩到；**只有命令行直接跑 send_file.py 会**。
+
+    用 setdefault：真实环境变量优先，不覆盖调用方显式设的值。
+    """
     env = {}
     p = Path(__file__).with_name(".env")
     if p.exists():
@@ -103,6 +119,8 @@ def load_env():
                 continue
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
+    for k, v in env.items():
+        os.environ.setdefault(k, v)
     return env
 
 
@@ -405,7 +423,10 @@ def main():
 
     where = "单聊" if scope == SCOPE_C2C else "群"
     ft = args.type or detect_file_type(args.file)
-    if size > 30 * 1024 * 1024:
+    if size > GATEWAY_SAFE:
+        print(f"提示：文件 {size / 1024 / 1024:.1f}MB，已超过实测可用上限（约 10MB）——"
+              f"base64 后膨胀约 1/3，很可能被网关以 HTTP 413 拒绝。")
+    elif size > 5 * 1024 * 1024:
         print(f"提示：文件较大（{size // 1024 // 1024}MB），base64 上传会慢一些。")
     mode = "被动回复" if msg_id else "主动推送"
 
