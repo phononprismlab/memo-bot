@@ -1,0 +1,8 @@
+# PyPI 包名是 qq-botpy（导入名才是 botpy）；注意不是 "botpy"
+qq-botpy
+python-dotenv
+# Markdown → HTML（渲染成图片发送用）
+markdown
+# 长图分片拼接（md2img.py，Chrome 16384 像素回绕的规避方案）
+pillow
+# 注：私有扩展（extensions/local/）的额外依赖另见 extensions/local/requirements.txt

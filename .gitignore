@@ -1,0 +1,39 @@
+# ── 凭据 / 隐私（绝不进仓库）──────────────────────────────────
+# ⚠️ 注意：.gitignore 不支持「行内注释」——`#` 之后会被当成模式的一部分。
+#    所有注释都必须单独成行。
+.env
+.env.local
+# 含真实群 openid / msg_id
+last_group_msg.json
+# 个人数据（备忘 / 灵感库）
+memos.db
+*.db
+*.db-journal
+# 个人使用状态
+moyu-recent.json
+
+# ── 运行时产物 ───────────────────────────────────────────────
+__pycache__/
+*.pyc
+bot.pid
+bot.out.log
+bot.out.log.*
+botpy.log
+*.log
+# ideas-bubbles.py 的生成物（按需要手动保留）
+灵感泡泡.html
+
+# ── 私有扩展（本地自定义指令，绝不进公开仓库）────────────────
+extensions/local/
+
+# ── 依赖 / 虚拟环境 ─────────────────────────────────────────
+node_modules/
+venv/
+env/
+.venv/
+
+# ── 系统 / 编辑器 ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
