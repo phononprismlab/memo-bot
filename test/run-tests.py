@@ -2230,6 +2230,58 @@ def test_offwork_paths():
     check("compare 缺位补 0（0.2 == 0.2.0）", _ver.compare_version("0.2", "0.2.0") == 0)
     check("远端地址走 jsdelivr（raw 连不上）", "jsdelivr" in _ver.RAW_URL)
 
+    # 7.0) 🔴 更新检测必须查**两个源**。
+    #      起因（2026-10-10 真机）：`@main/VERSION` 是**分支引用**，jsdelivr 给它
+    #      `Cache-Control: public, max-age=604800, s-maxage=43200` —— 边缘缓存 **12 小时**。
+    #      发版 3 小时后去取，拿到的还是 `0.1.0`（`Age: 11640`），
+    #      于是 0.1.0 的客户端点「检查更新」被判成「已是最新」。
+    #      🔴 实测**加随机查询串也躲不掉**：`?nocache=<随机数>` 命中的是同一份缓存，
+    #         `Age` 一模一样 —— jsdelivr 的缓存键不含 query。别再想着用 cache-busting 绕。
+    #      换源：`data.jsdelivr.com` 的版本列表接口 `max-age=300`（5 分钟），且按 **tag** 列。
+    check("🔴 版本列表接口走 data.jsdelivr.com（缓存只有 5 分钟，不是 12 小时）",
+          "data.jsdelivr.com" in _ver.VERSIONS_API and _ver.VERSIONS_API != _ver.RAW_URL)
+
+    _stub = {}
+    _real_get = _ver._get
+
+    def _fake_get(url, timeout):
+        """按 URL 分派桩：data.jsdelivr → 版本列表 JSON；其余 → VERSION 文件正文。
+        值是 Exception 就抛，用来模拟网络故障。"""
+        if "data.jsdelivr.com" in url:
+            if isinstance(_stub.get("api"), Exception):
+                raise _stub["api"]
+            return json.dumps({"versions": _stub.get("api") or []})
+        if isinstance(_stub.get("raw"), Exception):
+            raise _stub["raw"]
+        return _stub.get("raw") or ""
+
+    try:
+        _ver._get = _fake_get
+
+        _stub.update(api=[{"version": "0.1.0"}, {"version": "0.1.1"}], raw="0.1.0\n")
+        check("🔴 两源都查、取较大者（tag 先到，文件还陈旧）", _ver.latest() == ("0.1.1", None))
+
+        _stub.update(api=[{"version": "0.1.0"}], raw="0.1.2\n")
+        check("只有 VERSION 文件先到时也认（仍取较大者）", _ver.latest() == ("0.1.2", None))
+
+        _stub.update(api=[{"version": "0.1.1"}, {"version": "0.0.9"}, {"version": "0.1.0"}], raw="")
+        check("🔴 不靠接口给的顺序（乱序也取最大）", _ver.latest() == ("0.1.1", None))
+
+        _stub.update(api=[], raw="")
+        _e = _ver.latest()
+        check("接口列不出 tag、文件也空 → 报错而不是假装「已是最新」",
+              _e[0] is None and "没解析出版本号" in _e[1])
+
+        _stub.update(api=OSError("模拟网络故障"), raw="0.1.1\n")
+        check("主源挂 → 回落到 VERSION 文件", _ver.latest() == ("0.1.1", None))
+
+        _stub.update(api=OSError("模拟网络故障"), raw=OSError("模拟网络故障"))
+        _e = _ver.latest()
+        check("两源全挂 → (None, 错误说明)，且两个源都在说明里",
+              _e[0] is None and "版本列表" in _e[1] and "VERSION 文件" in _e[1])
+    finally:
+        _ver._get = _real_get
+
     # 7.1) 下载：给用户一个能直接点的链接（GitHub Releases 直链 / 可换成自建源）
     check("安装包名带版本号", _ver.asset_name("0.2.0") == "memo-bot-setup-v0.2.0.exe")
     check("版本串带 v 前缀也能归一化",
