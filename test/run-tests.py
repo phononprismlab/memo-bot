@@ -53,6 +53,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
+# 🔴 测试不许碰真实数据目录。`groups.json` 是「群消息路由」写的 ——
+#    route 测试用的是假 openid，曾真的落进 memo-bot/groups.json。统一指到临时目录。
+import groups as _groups_mod            # noqa: E402
+
+_TMP_DATA = tempfile.mkdtemp(prefix="memo_test_data_")
+_groups_mod.FILE = os.path.join(_TMP_DATA, "groups.json")
+
 FAILS = []
 TOTAL = [0]
 
@@ -217,19 +224,19 @@ def test_bot():
 
     check("search_files 空查询返回 []", bot.search_files("") == [])
     # 搜索根默认是用户主目录（慢且不确定）→ 测试里临时指到仓库目录
-    _orig_root = bot.SEARCH_ROOT
-    bot.SEARCH_ROOT = ROOT
+    _orig_roots = bot.SEARCH_ROOTS
+    bot.SEARCH_ROOTS = [ROOT]
     try:
         hits = bot.search_files("moyu-data")
         check("search_files 命中 moyu-data.json",
               any("moyu-data.json" in rel for rel, _ in hits),
               f"got={[r for r, _ in hits[:3]]}")
     finally:
-        bot.SEARCH_ROOT = _orig_root
+        bot.SEARCH_ROOTS = _orig_roots
 
     # 🔴 排序：匹配分降序 → 同分时**修改时间倒序（最新在前）** → 再同分时路径短的在前
     _srt = tempfile.mkdtemp(prefix="sort_test_")
-    _orig_root = bot.SEARCH_ROOT
+    _orig_roots = bot.SEARCH_ROOTS
     try:
         now = time.time()
         # 三个同分（文件名都含 hit）但 mtime 不同的文件
@@ -244,7 +251,7 @@ def test_bot():
         with open(p, "w", encoding="utf-8") as f:
             f.write("x")
         os.utime(p, (now, now))
-        bot.SEARCH_ROOT = _srt
+        bot.SEARCH_ROOTS = [_srt]
         got = [rel for rel, _ in bot.search_files("hit")]
         check("同分时按 mtime 倒序（最新在前）",
               got[:3] == ["hit-new.txt", "hit-mid.txt", "hit-old.txt"], f"got={got}")
@@ -261,8 +268,36 @@ def test_bot():
         check("同分同时间时路径短的在前",
               got2.index("hit-a.txt") < got2.index("hit-bbbbbbbbbb.txt"), f"got={got2}")
     finally:
-        bot.SEARCH_ROOT = _orig_root
+        bot.SEARCH_ROOTS = _orig_roots
         shutil.rmtree(_srt, ignore_errors=True)
+
+    # 🔴 多搜索目录（MEMO_SEARCH_ROOT 支持分号分隔的多个根）
+    _r1 = tempfile.mkdtemp(prefix="multi_a_")
+    _r2 = tempfile.mkdtemp(prefix="multi_b_")
+    _orig_roots = bot.SEARCH_ROOTS
+    try:
+        with open(os.path.join(_r1, "alpha-needle.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        os.makedirs(os.path.join(_r2, "sub"))
+        with open(os.path.join(_r2, "sub", "beta-needle.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        bot.SEARCH_ROOTS = [_r1, _r2]
+        rels = [rel for rel, _ in bot.search_files("needle")]
+        check("多个搜索根都生效", len(rels) == 2, f"got={rels}")
+        # 根重叠（第二个是第一个的子目录）→ 不重复收
+        bot.SEARCH_ROOTS = [_r2, os.path.join(_r2, "sub")]
+        rels2 = [rel for rel, _ in bot.search_files("beta-needle")]
+        check("重叠的搜索根不重复收", len(rels2) == 1, f"got={rels2}")
+    finally:
+        bot.SEARCH_ROOTS = _orig_roots
+        shutil.rmtree(_r1, ignore_errors=True)
+        shutil.rmtree(_r2, ignore_errors=True)
+
+    check("parse_search_roots 分号分隔", bot.parse_search_roots("a;b") == ["a", "b"])
+    check("parse_search_roots 换行分隔", bot.parse_search_roots("a\nb\n") == ["a", "b"])
+    check("parse_search_roots 去重", bot.parse_search_roots("a;a") == ["a"])
+    check("parse_search_roots 空 → 用户主目录",
+          bot.parse_search_roots("") == [os.path.expanduser("~")])
 
     # 🔴 搜索可能跑几十秒（搜索根 = 整个用户目录）→ 必须丢线程，不能卡事件循环
     _src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
@@ -1315,6 +1350,27 @@ def test_config_web():
         k, e = cw.write_env({"QQ_BOT_SANDBOX": "yes"})
         check("bool 归一化成 true", cw.read_env_file()["QQ_BOT_SANDBOX"] == "true")
 
+        # 3b) 搜索根支持**多个目录**（分号 / 换行分隔）
+        _ra = tempfile.mkdtemp(prefix="cw_root_a_")
+        _rb = tempfile.mkdtemp(prefix="cw_root_b_")
+        try:
+            check("多目录字段拆成列表", cw.split_roots("a;b\nc") == ["a", "b", "c"])
+            check("多目录校验：都存在则通过", cw.check_roots(f"{_ra};{_rb}") is None)
+            check("多目录校验：有一个不存在就报错",
+                  bool(cw.check_roots(f"{_ra};{os.path.join(_rb, 'nope')}")))
+            check("多目录校验：空值报错", bool(cw.check_roots("")))
+            check("MEMO_SEARCH_ROOT 是多目录字段",
+                  cw.ENV_SPEC["MEMO_SEARCH_ROOT"].get("kind") == "paths")
+            k, e = cw.write_env({"MEMO_SEARCH_ROOT": f"{_ra}\n{_rb}"})
+            check("多目录写 .env 成功", k == ["MEMO_SEARCH_ROOT"] and e is None, e)
+            stored = cw.read_env_file()["MEMO_SEARCH_ROOT"]
+            check("多目录在 .env 里是分号串（换行已归一）", ";" in stored and "\n" not in stored, stored)
+            check("多目录写 .env 反斜杠转正斜杠", "\\" not in stored, stored)
+        finally:
+            shutil.rmtree(_ra, ignore_errors=True)
+            shutil.rmtree(_rb, ignore_errors=True)
+            cw.write_env({"MEMO_SEARCH_ROOT": tmpdir})     # 还原，别影响后面的用例
+
         # 4) 密钥留空 = 不改（页面不回显它，留空不能理解成清空）
         cw.write_env({"QQ_BOT_SECRET": "SECRET-VALUE-123456"})
         before_secret = cw.read_env_file()["QQ_BOT_SECRET"]
@@ -1354,6 +1410,17 @@ def test_config_web():
         check("页面有「保存并重启机器人」", "保存并重启机器人" in cw.PAGE)
         check("页面有目录浏览器", "浏览…" in cw.PAGE)
         check("页面有搜索目录实测按钮", "check-root" in cw.PAGE)
+        check("页面支持多目录字段（每行一个）", "f.kind === 'paths'" in cw.PAGE)
+
+        # 8) 数据文件位置：字段齐全 + 页面展示 + 打开文件夹走白名单
+        _st = cw.full_state()
+        for _k in ("data_dir", "memos_db", "env", "settings"):
+            check(f"paths 暴露 {_k}", bool(_st["paths"].get(_k)), str(_st["paths"].get(_k)))
+        check("页面有数据文件位置区块", "数据文件位置" in cw.PAGE)
+        check("页面有打开文件夹按钮", "data-open" in cw.PAGE)
+        _csrc = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+        check("打开文件夹是白名单（不吃任意路径）",
+              'targets = {"data": data_dir()' in _csrc and 'payload.get("what")' in _csrc)
         check("页面有开机自启开关", "autostart" in cw.PAGE)
         check("页面有依赖自检", "依赖自检" in cw.PAGE)
 
@@ -1671,6 +1738,137 @@ def test_boomerang_export():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── [15] 关机播报（触发可靠性）+ 数据目录解耦 ────────────────────
+def test_offwork_paths():
+    """🔴 两条硬约束：
+
+    1. **关机播报不能再依赖计划任务**。实测事件 1074 触发的那次：任务启动了
+       （LastRunTime 有值）但返回码 0xC000026B、脚本一行日志都没写 —— 关机流程
+       没给 Python 启动的机会。主力改成常驻进程监听 `WM_QUERYENDSESSION`。
+    2. **启动器不许改源码版的数据目录**。早先无条件设 `MEMO_DATA_DIR`，
+       源码直跑也被挪到 `%LOCALAPPDATA%/memo-bot`，读不到旧库（实测生成了空 memos.db）。
+    """
+    print("\n[15] 关机播报（触发可靠性）+ 数据目录解耦")
+
+    workspace = os.path.dirname(ROOT)
+
+    # 1) 模块在位
+    for name in ("offwork.py", "shutdown_hook.py", "memo-launcher.py", "paths.py"):
+        check(f"{name} 在位", os.path.isfile(os.path.join(ROOT, name)))
+
+    # 2) offwork：dry-run 不联网、返回码合法
+    import offwork
+
+    cfg = offwork.read_config()
+    check("read_config 返回 5 元组", isinstance(cfg, tuple) and len(cfg) == 5)
+    code, text = offwork.send_offwork(dry_run=True)
+    check("dry-run 返回 0/2 且不抛", code in (0, 2), text)
+    check("dry-run 不取 access_token（不打网络）", "access_token" not in text)
+
+    # 3) shutdown_hook：真建顶层窗口，PostMessage 能触发且去重
+    import shutdown_hook
+
+    check("shutdown_hook.available 与平台一致",
+          shutdown_hook.available() == (os.name == "nt"))
+    if shutdown_hook.available():
+        import ctypes
+
+        called = []
+        shutdown_hook.install(lambda: called.append(1))
+        hwnd = None
+        for _ in range(100):
+            hwnd = shutdown_hook._HWND
+            if hwnd:
+                break
+            time.sleep(0.05)
+        check("关机监听建出顶层窗口", bool(hwnd))
+        if hwnd:
+            u = ctypes.windll.user32
+            u.PostMessageW(hwnd, shutdown_hook.WM_QUERYENDSESSION, 0, 0)
+            time.sleep(0.4)
+            u.PostMessageW(hwnd, shutdown_hook.WM_QUERYENDSESSION, 0, 0)
+            time.sleep(0.2)
+            check("收到关机通知只回调一次（去重）", called == [1], str(called))
+
+    # 4) 计划任务入口改为转调 offwork（不再自带一份发送逻辑）
+    notify = os.path.join(workspace, "offwork_notify.py")
+    nsrc = open(notify, encoding="utf-8").read() if os.path.isfile(notify) else ""
+    check("offwork_notify.py 转调 offwork 模块", "offwork.send_offwork" in nsrc)
+    check("offwork_notify.py 不再自己取 token", "get_access_token" not in nsrc)
+
+    # 5) 启动器：源码直跑不许改数据目录
+    lsrc = open(os.path.join(ROOT, "memo-launcher.py"), encoding="utf-8").read()
+    check("launcher 用 node/ 判定安装版",
+          '_NODE_IN_PACKAGE = os.path.join(os.path.dirname(HERE), "node", "node.exe")' in lsrc)
+    check("launcher 只在安装版设 MEMO_DATA_DIR",
+          'if PACKAGED and not os.environ.get("MEMO_DATA_DIR")' in lsrc)
+
+    # 6) paths：没设 MEMO_DATA_DIR 时回退代码目录（源码直跑行为不变）
+    probe = ("import os,sys;"
+             f"sys.path.insert(0, r'{ROOT}');"
+             "import paths;"
+             "print(paths.data_dir())")
+    env = dict(os.environ)
+    env["MEMO_DATA_DIR"] = ""
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", env=env)
+    check("未设 MEMO_DATA_DIR 时回退代码目录",
+          out.stdout.strip() == ROOT,
+          out.stdout.strip() or out.stderr.strip()[:120])
+
+    # 7) 版本号 + 更新检测（纯函数，不联网）
+    import version as _ver
+
+    check("version.py 有 VERSION", bool(_ver.VERSION))
+    check("VERSION 文件与常量一致",
+          open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip() == _ver.VERSION)
+    check("parse_version 认 v 前缀", _ver.parse_version("v1.2.3") == (1, 2, 3))
+    check("parse_version 认不出返回空", _ver.parse_version("abc") == ())
+    check("compare 新版在前 → 1", _ver.compare_version("0.2.0", "0.1.0") == 1)
+    check("compare 同版 → 0", _ver.compare_version("0.1.0", "0.1.0") == 0)
+    check("compare 旧版 → -1", _ver.compare_version("0.1.0", "0.2.0") == -1)
+    check("compare 按数字比（0.10.0 > 0.9.0）", _ver.compare_version("0.10.0", "0.9.0") == 1)
+    check("compare 缺位补 0（0.2 == 0.2.0）", _ver.compare_version("0.2", "0.2.0") == 0)
+    check("远端地址走 jsdelivr（raw 连不上）", "jsdelivr" in _ver.RAW_URL)
+
+    _csrc2 = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+    check("页面有「检查更新」按钮", "btn-update" in _csrc2)
+    check("配置中心暴露 version", '"version": _version.VERSION' in _csrc2)
+
+    # 8) 群发现：不用再手动拉群 + 翻日志找 openid
+    import groups as _g
+
+    check("groups.parse_ids 分号分隔", _g.parse_ids("a;b") == ["a", "b"])
+    check("groups.parse_ids 逗号分隔", _g.parse_ids("a,b") == ["a", "b"])
+    check("groups.parse_ids 去重", _g.parse_ids("a;a") == ["a"])
+    check("groups.parse_ids 空 → []", _g.parse_ids("") == [])
+
+    _gtmp = tempfile.mkdtemp(prefix="groups_")
+    _orig_gfile = _g.FILE
+    _g.FILE = os.path.join(_gtmp, "groups.json")
+    _g._RECENT.clear()
+    try:
+        _g.note("oid-A")
+        _g.note("oid-B")
+        got = [x["openid"] for x in _g.all_groups()]
+        check("groups.note 记下两个群", set(got) == {"oid-A", "oid-B"}, str(got))
+        _g.note("oid-A")                       # 节流窗口内重复 → 不重复记
+        check("groups 重复记录不重复", len(_g.all_groups()) == 2)
+    finally:
+        _g.FILE = _orig_gfile
+        _g._RECENT.clear()
+        shutil.rmtree(_gtmp, ignore_errors=True)
+
+    _csrc3 = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+    check("页面有「已发现的群」区块", "已发现的群" in _csrc3)
+    check("页面有「加入推送」按钮", "data-addgroup" in _csrc3)
+    _bsrc = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("bot 收到群消息会记录群", "_groups.note(" in _bsrc)
+    check("启动播报遍历多个群", "for gid in _groups.targets()" in _bsrc)
+    _osrc = open(os.path.join(ROOT, "offwork.py"), encoding="utf-8").read()
+    check("关机播报遍历多个群", "for gid in gids" in _osrc)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -1689,6 +1887,7 @@ def main():
     test_config_web()
     test_console_encoding()
     test_boomerang_export()
+    test_offwork_paths()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

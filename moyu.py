@@ -23,9 +23,11 @@ import random
 import re
 import sys
 
+from paths import data_path
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "moyu-data.json")
-RECENT = os.path.join(HERE, "moyu-recent.json")
+DATA = os.path.join(HERE, "moyu-data.json")   # 只读：库内容随代码走
+RECENT = data_path("moyu-recent.json")        # 可写：安装版落用户目录（见 paths.py）
 
 RECENT_KEEP = 20  # 记住最近抽过的多少条（不重复窗口）
 MAX_DRAW = 5      # 一次最多抽几条

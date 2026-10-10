@@ -31,6 +31,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from paths import data_path
+
 # 🔴 标准输出 / 错误强制 UTF-8。中文 Windows 默认 GBK，print 到编不出的字符
 #    （emoji / ⏻ / ⚙ 等）会抛 UnicodeEncodeError。本文件既作 CLI 用、又被 bot.py
 #    导入，一旦崩会连带影响调用方。errors="replace" 兜底，不让进程挂掉。
@@ -65,7 +67,8 @@ TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 API_PROD = "https://api.sgroup.qq.com"
 API_SANDBOX = "https://sandbox.api.sgroup.qq.com"
 
-LAST_MSG_FILE = Path(__file__).with_name("last_group_msg.json")
+# 🔴 可写数据 —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
+LAST_MSG_FILE = Path(data_path("last_group_msg.json"))
 PASSIVE_MAX_AGE = 240  # 被动回复有效期（秒）；超时需重新在群里 @ 一次 bot
 
 SCOPE_GROUP = "group"
@@ -111,7 +114,7 @@ def load_env():
     用 setdefault：真实环境变量优先，不覆盖调用方显式设的值。
     """
     env = {}
-    p = Path(__file__).with_name(".env")
+    p = Path(data_path(".env"))
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
             line = line.strip()

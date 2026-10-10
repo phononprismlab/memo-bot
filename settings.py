@@ -19,8 +19,11 @@ import os
 import re
 import threading
 
+from paths import data_path
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILE = os.path.join(HERE, "settings.json")
+# 🔴 settings.json 是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
+FILE = data_path("settings.json")
 
 _LOCK = threading.Lock()
 
@@ -84,7 +87,7 @@ def _dotenv():
     """读同目录 `.env`（不依赖第三方库）—— 只用于「env 回退」。"""
     out = {}
     try:
-        with open(os.path.join(HERE, ".env"), encoding="utf-8") as f:
+        with open(data_path(".env"), encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

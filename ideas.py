@@ -44,8 +44,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import store  # noqa: E402
+from paths import data_dir  # noqa: E402  （数据目录：导出产物落哪）
 
-DEFAULT_EXPORT = os.path.join(os.path.dirname(HERE), "灵感池.md")
+# 🔴 导出产物是「用户可见文件」→ 落数据目录（安装版 = 用户目录，见 paths.py）
+DEFAULT_EXPORT = os.path.join(data_dir(), "灵感池.md")
 # 群里 @机器人 的占位符（<C9> 之类）落库时会带进来，导出时清掉
 _NOISE = re.compile(r"<[^\s<>]{1,40}>")
 

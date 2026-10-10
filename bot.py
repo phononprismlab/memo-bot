@@ -65,10 +65,14 @@ import extensions as _ext
 import ignore as _ignore
 import settings as _settings
 import export as _export
+import groups as _groups
+
+from paths import data_path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LAST_MSG_FILE = os.path.join(HERE, "last_group_msg.json")
-PID_FILE = os.path.join(HERE, "bot.pid")
+# 🔴 这两个是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
+LAST_MSG_FILE = data_path("last_group_msg.json")
+PID_FILE = data_path("bot.pid")
 
 
 def _pid_alive(pid):
@@ -154,7 +158,7 @@ def save_last_msg(openid, msg_id, scope="group"):
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    load_dotenv(data_path(".env"))
 except Exception:
     pass
 
@@ -356,7 +360,38 @@ def memo_list_text(limit=10, kind=KIND_MEMO):
 #    不要指向含凭据 / 私密文件的目录。
 # 🔴 同目录文件在搜索里加权（同分时优先）；用 MEMO_WORKSPACE_ROOT 覆盖。
 WORKSPACE_ROOT = os.getenv("MEMO_WORKSPACE_ROOT") or HERE
-SEARCH_ROOT = os.getenv("MEMO_SEARCH_ROOT") or os.path.expanduser("~")
+
+
+def parse_search_roots(raw=None):
+    """把 `MEMO_SEARCH_ROOT` 解析成目录列表（分号或换行分隔；去重、展开 `~`）。
+
+    空 → 回退到用户主目录（跟以前一样）。**配置中心里是每行一个目录。**
+    """
+    text = os.getenv("MEMO_SEARCH_ROOT") if raw is None else raw
+    out = []
+    for part in re.split(r"[;\n]+", text or ""):
+        p = part.strip().strip('"').strip("'")
+        if not p:
+            continue
+        p = os.path.expanduser(p)
+        if p not in out:
+            out.append(p)
+    return out or [os.path.expanduser("~")]
+
+
+def _prune_roots(roots):
+    """去掉被别的根包含的子目录 —— 否则同一棵树会被 `os.walk` 走两遍。"""
+    norm = sorted({os.path.normcase(os.path.abspath(r)) for r in roots}, key=len)
+    out = []
+    for r in norm:
+        if any(r == o or r.startswith(o + os.sep) for o in out):
+            continue
+        out.append(r)
+    return out
+
+
+SEARCH_ROOTS = parse_search_roots()
+SEARCH_ROOT = SEARCH_ROOTS[0]      # 兼容：扩展 API / 老代码只认单个根
 EXCLUDE_DIRS = {
     "node_modules", ".git", "__pycache__", "envs", ".venv",
     "binaries", ".cache", "dist", "build", ".next",
@@ -383,7 +418,8 @@ def _is_subsequence(q, s):
 
 
 def search_files(query, limit=SEARCH_LIMIT):
-    """按文件名/路径模糊搜**配置的根目录**（默认你的用户主目录，可用 MEMO_SEARCH_ROOT 改）。
+    """按文件名/路径模糊搜**配置的根目录**（默认你的用户主目录，可用 MEMO_SEARCH_ROOT 改，
+    **支持多个目录** —— 分号分隔，配置中心里是每行一个）。
 
     打分（全部**忽略大小写**）：
       3.0 文件名含该子串（最准，如 readme → README.md）
@@ -401,35 +437,43 @@ def search_files(query, limit=SEARCH_LIMIT):
     if not q:
         return []
     out = []
-    for dirpath, dirnames, filenames in os.walk(SEARCH_ROOT):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        for fn in filenames:
-            low = fn.lower()
-            full = os.path.join(dirpath, fn)
-            if full.startswith(WORKSPACE_ROOT + os.sep):
-                rel = os.path.relpath(full, WORKSPACE_ROOT).replace("\\", "/")
-                local = True
-            else:
-                rel = os.path.relpath(full, SEARCH_ROOT).replace("\\", "/")
-                local = False
-            if q in low:
-                score = 3.0
-            elif q in rel.lower():
-                score = 2.5
-            elif _is_subsequence(q, low):
-                score = 2.0
-            elif len(q) >= 3 and _is_subsequence(q, rel.lower()):
-                score = 1.5
-            else:
-                continue
-            if local:
-                score += 0.1
-            # mtime 只对**命中的**文件取（命中数很少，开销可忽略；不是对全树 stat）
-            try:
-                mt = os.path.getmtime(full)
-            except OSError:
-                mt = 0.0
-            out.append((score, mt, rel, full))
+    seen = set()
+    for root in _prune_roots(SEARCH_ROOTS):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+            for fn in filenames:
+                low = fn.lower()
+                full = os.path.join(dirpath, fn)
+                key = os.path.normcase(full)
+                if key in seen:              # 多个根有重叠时别重复收
+                    continue
+                seen.add(key)
+                if full.startswith(WORKSPACE_ROOT + os.sep):
+                    rel = os.path.relpath(full, WORKSPACE_ROOT).replace("\\", "/")
+                    local = True
+                else:
+                    rel = os.path.relpath(full, root).replace("\\", "/")
+                    local = False
+                if q in low:
+                    score = 3.0
+                elif q in rel.lower():
+                    score = 2.5
+                elif _is_subsequence(q, low):
+                    score = 2.0
+                elif len(q) >= 3 and _is_subsequence(q, rel.lower()):
+                    score = 1.5
+                else:
+                    continue
+                if local:
+                    score += 0.1
+                # mtime 只对**命中的**文件取（命中数很少，开销可忽略；不是对全树 stat）
+                try:
+                    mt = os.path.getmtime(full)
+                except OSError:
+                    mt = 0.0
+                out.append((score, mt, rel, full))
     # 🔴 匹配分降序 → **修改时间倒序（最新在前）** → 路径短的在前（同秒时保证结果稳定）。
     #    以前同分是按路径长度升序排，那个顺序对用户没有意义（用户 2026-10-09 明确要求改成时间优先）。
     out.sort(key=lambda x: (-x[0], -x[1], len(x[2])))
@@ -617,6 +661,14 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     """
     t = chat_target(message, scope)
     gid, mid = t["key"], (getattr(message, "id", "") or "")
+    if scope == SCOPE_GROUP:
+        # 记下这个群 —— 配置中心页面据此列出「机器人被拉进过哪些群」，
+        # 用户不用再手动拉群 + 翻日志找 openid（见 groups.py）。
+        try:
+            _groups.note(getattr(message, "group_openid", "") or t["openid"],
+                         getattr(message, "group_name", "") or "")
+        except Exception:
+            pass
     save_last_msg(t["openid"], mid, scope)
     raw = getattr(message, "content", "") or ""
     text = strip_at(raw)
@@ -809,15 +861,30 @@ def main():
 
     install_group_message_parser()
 
+    # 关机播报：常驻进程监听 Windows 关机通知。
+    # 计划任务那条路（事件 1074）实测会被关机流程掐掉 —— 任务启动了但脚本没跑起来
+    # （返回码 0xC000026B、无日志）。这里常驻监听 WM_QUERYENDSESSION 兜住。
+    try:
+        import offwork as _offwork
+        import shutdown_hook as _shutdown
+
+        _shutdown.install(
+            lambda: _offwork.send_offwork(log=_offwork.file_log, attempts=1),
+            on_error=lambda t: print("[关机监听] " + t, flush=True),
+        )
+        print("[关机播报] 已挂上关机监听（WM_QUERYENDSESSION）", flush=True)
+    except Exception as _e:                            # noqa: BLE001
+        print(f"[关机播报·监听未装上] {type(_e).__name__}: {_e}", flush=True)
+
     class MemoClient(Client):
         async def on_ready(self):
             print(f"[botpy] 已上线：{self.robot.name}", flush=True)
             # 启动播报（主动推送，群内需开启「机器人主动发言」）
-            gid = (os.getenv("QQ_GROUP_OPENID") or "").strip()
-            # 文案从 settings 读（网页「⚙ 设置」和机器人「设置」都能改）；
-            # 留空 = 不播报。settings 内部会自动回退到 .env 的 QQ_STARTUP_MSG。
+            # 🔴 目标可以**多个群**（`.env` 的 QQ_GROUP_OPENID 分号分隔，见 groups.py）
             msg = (_settings.get("startup_msg") or "").strip()
-            if gid and msg:
+            for gid in _groups.targets():
+                if not msg:
+                    break
                 try:
                     import send_file as sf
 
@@ -826,7 +893,7 @@ def main():
                     )
                     print(f"[启动播报] {gid}: {msg}", flush=True)
                 except Exception as e:
-                    print(f"[启动播报失败] {type(e).__name__}: {e}", flush=True)
+                    print(f"[启动播报失败] {gid}: {type(e).__name__}: {e}", flush=True)
 
         async def send_file_to_chat(self, message, scope, openid, full, rel, mid,
                                     caption=None, as_file=False):

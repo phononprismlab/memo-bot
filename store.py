@@ -11,7 +11,10 @@ import sqlite3
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-DB = os.path.join(os.path.dirname(__file__), "memos.db")
+from paths import data_path
+
+# 🔴 memos.db 是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
+DB = data_path("memos.db")
 
 KIND_MEMO = "memo"
 KIND_IDEA = "idea"

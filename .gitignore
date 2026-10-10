@@ -19,6 +19,8 @@ memos.db
 moyu-recent.json
 # 忽略表（含真实群内昵称 / 发送者 openid）
 ignore.json
+# 已发现的群（含真实群 openid）
+groups.json
 # 本机设置（网页「⚙ 设置」/ 机器人「设置」指令写的就是它）
 settings.json
 

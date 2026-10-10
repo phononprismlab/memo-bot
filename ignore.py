@@ -21,6 +21,8 @@ import json
 import os
 import re
 
+from paths import data_path
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 CMD_PREFIX = "忽略"
@@ -39,7 +41,7 @@ def file_path():
     惰性求值：`MEMO_IGNORE_FILE` 来自 .env，而 .env 是在 bot.py 导入之后才加载的，
     若在模块顶层读死会拿到空值。
     """
-    return os.getenv("MEMO_IGNORE_FILE") or os.path.join(HERE, "ignore.json")
+    return os.getenv("MEMO_IGNORE_FILE") or data_path("ignore.json")
 
 
 def env_rules():

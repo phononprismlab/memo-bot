@@ -49,12 +49,17 @@ sys.path.insert(0, HERE)
 
 import ignore as _ignore      # noqa: E402  （忽略表：规则读写）
 import settings as _settings  # noqa: E402  （本机设置：settings.json）
+import groups as _groups      # noqa: E402  （已发现的群 / 主动推送目标）
+import version as _version    # noqa: E402  （版本号 + 「有没有新版本」检测）
+from paths import data_path, data_dir   # noqa: E402  （数据目录：可写文件落哪）
 
-ENV_PATH = os.path.join(HERE, ".env")
-ENV_BAK = os.path.join(HERE, ".env.bak")
-BOT_PY = os.path.join(HERE, "bot.py")
-BOT_LOG = os.path.join(HERE, "bot.out.log")
-PID_FILE = os.path.join(HERE, "bot.pid")
+# 🔴 .env / 日志 / pid 都是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
+ENV_PATH = data_path(".env")
+ENV_BAK = data_path(".env.bak")
+BOT_PY = os.path.join(HERE, "bot.py")              # 代码：随安装目录走
+LAUNCHER = os.path.join(HERE, "memo-launcher.py")  # 统一启动器（补 sys.path + 定数据目录）
+BOT_LOG = data_path("bot.out.log")
+PID_FILE = data_path("bot.pid")
 TASK_NAME = "MoyuBot"
 DEFAULT_PORT = 8770
 PORT_TRIES = 12
@@ -133,6 +138,10 @@ def write_env(updates):
         v = str(v if v is not None else "").strip()
         if spec.get("kind") == "bool":
             v = "true" if v.lower() in ("1", "true", "yes", "on") else "false"
+        if spec.get("kind") == "paths":
+            # 多目录：归一成「分号串 + 正斜杠」——
+            # 两个 .env 解析器（python-dotenv 与 settings._dotenv）对反斜杠转义处理不一致。
+            v = ";".join(p.replace("\\", "/") for p in split_roots(v))
         # 🔴 密钥留空 = 「不修改」。因为页面上本来就不回显它，留空不能理解成「清空」。
         if spec.get("secret") and not v:
             continue
@@ -193,13 +202,24 @@ def write_env(updates):
 
 
 # ── 目录校验 / 统计 ───────────────────────────────────────────────
-def check_dir(v):
-    """搜索根目录的校验：必须存在且是目录。"""
-    if not v:
-        return "不能为空（留空的话「发文件」会去搜你的整个用户目录，很慢）"
-    p = os.path.expanduser(str(v))
-    if not os.path.isdir(p):
-        return f"这个目录不存在：{v}"
+def split_roots(v):
+    """把多目录字段拆成目录列表（分号或换行分隔，去掉引号与空项）。"""
+    out = []
+    for part in re.split(r"[;\n]+", str(v or "")):
+        p = part.strip().strip('"').strip("'")
+        if p:
+            out.append(p)
+    return out
+
+
+def check_roots(v):
+    """搜索根目录的校验：每个都要存在且是目录（**支持多个**，分号或换行分隔）。"""
+    parts = split_roots(v)
+    if not parts:
+        return "至少填一个目录（留空的话「发文件」会去搜你的整个用户目录，很慢）"
+    for p in parts:
+        if not os.path.isdir(os.path.expanduser(p)):
+            return f"这个目录不存在：{p}"
     return None
 
 
@@ -356,8 +376,8 @@ def autostart_set(on):
     if on:
         script = (
             f"$act=New-ScheduledTaskAction -Execute '{_q(_pythonw())}' "
-            f"-WorkingDirectory '{_q(HERE)}' "
-            f"-Argument '-u \"{_q(BOT_PY)}\" --log \"{_q(BOT_LOG)}\"';"
+            f"-WorkingDirectory '{_q(data_dir())}' "
+            f"-Argument '\"{_q(LAUNCHER)}\" --bot --log \"{_q(BOT_LOG)}\"';"
             "$trg=New-ScheduledTaskTrigger -AtLogOn;"
             "$set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
             "-DontStopIfGoingOnBatteries -StartWhenAvailable "
@@ -419,8 +439,8 @@ def bot_start():
         try:
             fh = open(BOT_LOG, "ab")
             try:
-                subprocess.Popen([_pythonw(), "-u", BOT_PY, "--log", BOT_LOG],
-                                 cwd=HERE, stdin=subprocess.DEVNULL,
+                subprocess.Popen([_pythonw(), "-u", LAUNCHER, "--bot", "--log", BOT_LOG],
+                                 cwd=data_dir(), stdin=subprocess.DEVNULL,
                                  stdout=fh, stderr=subprocess.STDOUT,
                                  creationflags=flags, close_fds=True)
             finally:
@@ -521,13 +541,18 @@ ENV_SPEC = {
     },
     "QQ_GROUP_OPENID": {
         "label": "目标群 openid", "group": "bot",
-        "help": "发文件 / 启动播报默认发到这个群。机器人跑起来后，群里发一条备忘，"
-                "日志里会打印 group_openid，把它填进来",
+        "help": "启动播报 / 关机播报发到哪些群。可以填多个，用分号隔开。"
+                "不用自己去翻日志找 —— 把机器人拉进群、在群里随便说句话，"
+                "下面「已发现的群」里就会出现，点「加入推送」自动填进来。",
         "check": lambda v: None,
     },
     "QQ_BOT_SANDBOX": {
         "label": "沙箱环境", "group": "bot", "kind": "bool",
-        "help": "本地联调时打开；正式给大家用请关掉",
+        "help": "QQ 开放平台的调试开关，默认关着，别动它。"
+                "① 什么时候开：只有你在自己调试、机器人还没提交审核时，才需要打开。"
+                "② 开了会怎样：机器人进入「沙箱环境」，只对你在 QQ 后台「沙箱配置」里"
+                "加过白名单的测试群 / 测试用户可见 —— 别人把机器人拉进正式群，收不到任何回复。"
+                "③ 给朋友用：必须关掉。关掉才是正式环境，所有群正常收发。",
         "check": lambda v: None,
     },
     "MEMO_TRIGGER": {
@@ -536,11 +561,12 @@ ENV_SPEC = {
         "check": lambda v: None if (v and " " not in v) else "不能为空、不能含空格",
     },
     "MEMO_SEARCH_ROOT": {
-        "label": "「发文件」搜索根目录", "group": "files", "path": True,
+        "label": "「发文件」搜索根目录", "group": "files", "kind": "paths",
         "default": os.path.expanduser("~"),
-        "help": "「发文件」只在这个目录下面找文件。目录越大搜得越慢 —— "
-                "别指向主目录（里面常有上百万个文件），指向你真正放文档的地方",
-        "check": check_dir,
+        "help": "「发文件」只在这些目录下面找文件。可以填多个，一行一个（换行分隔）。"
+                "目录越大搜得越慢 —— 别指向主目录（里面常有上百万个文件），"
+                "指向你真正放文档的地方",
+        "check": check_roots,
     },
     "MEMO_IGNORE": {
         "label": "忽略关键词（逗号分隔）", "group": "ignore", "default": "",
@@ -577,7 +603,14 @@ def state_fields():
             raw = os.getenv(key)
         if raw is None:
             raw = spec.get("default", "")
-        kind = "bool" if spec.get("kind") == "bool" else ("path" if spec.get("path") else "text")
+        if spec.get("kind") == "bool":
+            kind = "bool"
+        elif spec.get("kind") == "paths":
+            kind = "paths"
+        elif spec.get("path"):
+            kind = "path"
+        else:
+            kind = "text"
         if spec.get("secret"):
             kind = "secret"
         out.append({
@@ -608,8 +641,9 @@ def full_state():
     appid = (envfile.get("QQ_BOT_APPID") or os.getenv("QQ_BOT_APPID") or "").strip()
     secret = (envfile.get("QQ_BOT_SECRET") or os.getenv("QQ_BOT_SECRET")
               or os.getenv("QQ_BOT_TOKEN") or "").strip()
-    root = (envfile.get("MEMO_SEARCH_ROOT") or os.getenv("MEMO_SEARCH_ROOT")
-            or os.path.expanduser("~")).strip()
+    raw_root = (envfile.get("MEMO_SEARCH_ROOT") or os.getenv("MEMO_SEARCH_ROOT")
+                or os.path.expanduser("~")).strip()
+    roots = split_roots(raw_root)
     return {
         "ok": True,
         "fields": state_fields(),
@@ -618,8 +652,15 @@ def full_state():
         "deps": dep_report(),
         "ignore": {"env": _ignore.env_rules(), "file": _ignore.file_rules()},
         "paths": {"env": ENV_PATH, "settings": _settings.file_path(),
-                  "search_root": root, "here": HERE},
+                  "search_root": roots[0] if roots else "",
+                  "search_roots": roots, "here": HERE,
+                  "data_dir": data_dir(), "memos_db": data_path("memos.db"),
+                  "bot_log": BOT_LOG},
         "ready": bool(appid and secret),
+        "version": _version.VERSION,
+        "repo": _version.REPO,
+        "groups_found": _groups.all_groups(),
+        "group_targets": _groups.targets(),
     }
 
 
@@ -730,14 +771,74 @@ def make_handler(doc):
                                       {"ok": ok, "message": msg, "state": full_state()})
 
                 if path == "/api/check-root":
-                    root = str(payload.get("path") or "").strip()
-                    err = check_dir(root)
+                    roots = split_roots(payload.get("path"))
+                    if not roots:
+                        return self._send(400, {"ok": False, "error": "还没填目录"})
+                    total, secs, stopped = 0, 0.0, False
+                    for r in roots:
+                        rp = os.path.expanduser(r)
+                        if not os.path.isdir(rp):
+                            return self._send(400, {"ok": False, "error": f"这个目录不存在：{r}"})
+                        n, sec, st = count_files(rp)
+                        total += n
+                        secs += sec
+                        stopped = stopped or st
+                    print(f"  [配置] 统计 {len(roots)} 个目录：{total} 个文件 / {round(secs, 3)}s",
+                          flush=True)
+                    return self._send(200, {"ok": True, "count": total,
+                                            "seconds": round(secs, 3), "truncated": stopped})
+
+                if path == "/api/update-check":
+                    cur = _version.VERSION
+                    far, err = _version.latest()
+                    if not far:
+                        return self._send(200, {"ok": False, "current": cur, "error": err})
+                    return self._send(200, {
+                        "ok": True, "current": cur, "latest": far,
+                        "has_update": _version.compare_version(far, cur) > 0,
+                        "url": _version.HOMEPAGE.format(repo=_version.REPO),
+                    })
+
+                if path == "/api/groups":
+                    # 把「已发现的群」里的一个 openid 追加到推送列表（写 .env 的 QQ_GROUP_OPENID）
+                    oid = str(payload.get("add") or "").strip()
+                    if not oid:
+                        return self._send(400, {"ok": False, "error": "缺少 openid"})
+                    cur = _groups.parse_ids()
+                    if oid not in cur:
+                        cur.append(oid)
+                    _keys, err = write_env({"QQ_GROUP_OPENID": ";".join(cur)})
                     if err:
                         return self._send(400, {"ok": False, "error": err})
-                    n, sec, stopped = count_files(os.path.expanduser(root))
-                    print(f"  [配置] 统计 {root}：{n} 个文件 / {sec}s", flush=True)
-                    return self._send(200, {"ok": True, "count": n, "seconds": sec,
-                                            "truncated": stopped})
+                    return self._send(200, {"ok": True,
+                                            "message": "已加入推送列表（重启机器人后生效）",
+                                            "state": full_state()})
+
+                if path == "/api/open-folder":
+                    # 🔴 只允许打开白名单里的这几个路径 —— 别让页面变成「打开任意目录」的口子
+                    what = str(payload.get("what") or "")
+                    targets = {"data": data_dir(), "db": data_path("memos.db"),
+                               "env": ENV_PATH, "settings": _settings.file_path(),
+                               "log": BOT_LOG}
+                    t = targets.get(what)
+                    if not t:
+                        return self._send(400, {"ok": False, "error": "不认识的路径"})
+                    try:
+                        t = os.path.abspath(t)
+                        if os.path.isfile(t):
+                            # 选中文件本身（资源管理器 /select 不接受长路径时退回打开父目录）
+                            subprocess.Popen(["explorer", "/select," + os.path.normpath(t)])
+                        else:
+                            d = t if os.path.isdir(t) else os.path.dirname(t)
+                            if not os.path.isdir(d):
+                                return self._send(404, {"ok": False, "error": "路径不存在：" + d})
+                            opener = getattr(os, "startfile", None)
+                            if opener is None:
+                                return self._send(500, {"ok": False, "error": "这个系统不支持"})
+                            opener(d)
+                        return self._send(200, {"ok": True, "path": t})
+                    except OSError as e:
+                        return self._send(500, {"ok": False, "error": str(e)})
 
                 if path == "/api/ignore":
                     if payload.get("clear"):
@@ -830,6 +931,14 @@ PAGE = r"""<!DOCTYPE html>
     background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1.4 inherit;
   }
+  textarea{
+    width:100%; box-sizing:border-box; padding:9px 11px; border-radius:10px;
+    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
+    font:12.5px/1.7 ui-monospace,Consolas,"Courier New",monospace;
+    resize:vertical; min-height:56px;
+  }
+  textarea:focus{outline:none; border-color:rgba(79,209,197,.55)}
+  textarea::placeholder{color:#5b6675}
   input:focus{outline:none; border-color:rgba(79,209,197,.55)}
   input::placeholder{color:#5b6675}
   button{
@@ -852,6 +961,10 @@ PAGE = r"""<!DOCTYPE html>
   .note.ok{color:#8fe6dc}
   .note.bad{color:#fc8181}
   .deps{display:flex; flex-direction:column; gap:5px; margin-top:4px}
+  .deps .dep{align-items:flex-start}
+  .pth{font:11.5px/1.55 ui-monospace,Consolas,"Courier New",monospace; color:var(--dim);
+       word-break:break-all; flex:1 1 auto; min-width:0}
+  .deps .dep button{flex:0 0 auto}
   .dep{display:flex; align-items:baseline; gap:8px; font-size:12.5px}
   .dep b{font-weight:600; min-width:130px}
   .dep .m{color:var(--dim); font-size:11.5px; word-break:break-all}
@@ -1011,6 +1124,14 @@ function fieldHTML(f){
       + '<button data-browse="' + f.key + '">浏览…</button>'
       + '<button data-test="' + f.key + '">测试</button></div>'
       + '<div class="note" data-note="' + f.key + '"></div>';
+  } else if(f.kind === 'paths'){
+    const lines = String(v || '').split(';').map(s => s.trim()).filter(Boolean);
+    ctl = '<textarea data-k="' + f.key + '" rows="' + Math.max(2, lines.length) + '" '
+      + 'spellcheck="false" placeholder="每行一个目录，例如 D:/文档">'
+      + esc(lines.join('\n')) + '</textarea>'
+      + '<div class="row"><button data-browse="' + f.key + '">＋ 加一个目录</button>'
+      + '<button data-test="' + f.key + '">测试</button></div>'
+      + '<div class="note" data-note="' + f.key + '"></div>';
   } else {
     ctl = '<input type="text" data-k="' + f.key + '" value="' + esc(v) + '">';
   }
@@ -1031,6 +1152,7 @@ function renderSections(){
   for(const g of S.groups){
     if(g.key === 'runtime'){ html += runtimeSection(g); continue; }
     if(g.key === 'ignore'){ html += ignoreSection(g); continue; }
+    if(g.key === 'bot'){ html += botSection(g); continue; }
     const fs = S.fields.filter(f => f.group === g.key);
     if(!fs.length) continue;
     html += '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
@@ -1038,6 +1160,46 @@ function renderSections(){
   }
   $('sections').innerHTML = html;
   bindFields();
+}
+
+function botSection(g){
+  const fs = S.fields.filter(f => f.group === g.key);
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">' + fs.map(fieldHTML).join('')
+    + discoveredGroupsHTML() + '</div></section>';
+}
+
+function discoveredGroupsHTML(){
+  const gs = S.groups_found || [];
+  const tg = S.group_targets || [];
+  const rows = gs.length ? gs.map(g => {
+    const on = tg.includes(g.openid);
+    return '<div class="dep"><b>' + esc(g.name || '（还没拿到群名）') + '</b>'
+      + '<span class="m pth" title="' + esc(g.openid) + '">' + esc(g.openid) + '</span>'
+      + (on ? '<span class="note ok">已在推送列表</span>'
+            : '<button data-addgroup="' + esc(g.openid) + '">＋ 加入推送</button>')
+      + '</div>';
+  }).join('') : '<div class="note">还没发现群 —— 把机器人拉进一个群，'
+    + '在群里随便说句话（@ 它，或者发一条备忘），这里就会出现。</div>';
+  return '<div class="f"><div class="lb">已发现的群</div>'
+    + '<div class="hp">机器人每收到一条群消息就会记下这个群。'
+    + '点「加入推送」＝把它的 openid 追加到上面的「目标群 openid」，'
+    + '启动播报 / 关机播报就会发过去。不用自己去翻日志找 openid。</div>'
+    + '<div class="deps">' + rows + '</div></div>';
+}
+
+function pathRows(){
+  const P = S.paths || {};
+  const rows = [
+    ['数据目录', P.data_dir, 'data'],
+    ['备忘 / 灵感库（memos.db）', P.memos_db, 'db'],
+    ['机器人凭据（.env）', P.env, 'env'],
+    ['本机设置（settings.json）', P.settings, 'settings'],
+  ];
+  return rows.filter(r => r[1]).map(r =>
+    '<div class="dep"><b>' + esc(r[0]) + '</b>'
+    + '<span class="m pth" title="' + esc(r[1]) + '">' + esc(r[1]) + '</span>'
+    + '<button data-open="' + r[2] + '">打开</button></div>').join('');
 }
 
 function runtimeSection(g){
@@ -1056,7 +1218,34 @@ function runtimeSection(g){
     + '<div class="f"><div class="lb">依赖自检</div>'
     + '<div class="hp">缺「必需」的装不上就启动不了；带「渲染成图片用」的缺了只是发文件时降级成文件卡片。</div>'
     + '<div class="deps">' + deps + '</div></div>'
+    + '<div class="f"><div class="lb">数据文件位置</div>'
+    + '<div class="hp">备忘和灵感都在本地数据库里，配置在下面这几个文件里。'
+    + '点「打开」会在资源管理器里定位过去 —— 想拿数据自己处理（或者丢给 AI 分析）时从这里取。</div>'
+    + '<div class="deps">' + pathRows() + '</div></div>'
+    + '<div class="f"><div class="lb">版本</div>'
+    + '<div class="hp">更新方式：拿新版的文件覆盖过去就行，数据不受影响'
+    + '（数据在「数据文件位置」那几个地方）。</div>'
+    + '<div class="row"><span class="note" id="ver-note">v' + esc(S.version || '?') + '</span>'
+    + '<button id="btn-update">检查更新</button></div></div>'
     + '</div></section>';
+}
+
+async function checkUpdate(auto){
+  const note = $('ver-note');
+  const cur = (S && S.version) || '?';
+  if(note) note.textContent = 'v' + cur + '（检查中…）';
+  let j;
+  try{ j = await api('/api/update-check', {}); }
+  catch(e){
+    if(note) note.textContent = 'v' + cur + '（检查失败：连不上网）';
+    return;
+  }
+  if(note){
+    if(!j.ok) note.textContent = 'v' + (j.current || cur) + '（检查失败：' + (j.error || '') + '）';
+    else if(j.has_update) note.textContent = '有新版 v' + j.latest + '（当前 v' + j.current + '）';
+    else note.textContent = 'v' + j.current + '（已是最新）';
+  }
+  if(j.ok && j.has_update) toast('有新版本 v' + j.latest + ' —— ' + (j.url || ''));
 }
 
 function ignoreSection(g){
@@ -1111,6 +1300,22 @@ function bindFields(){
     b.addEventListener('click', () => openPick(b.dataset.browse)));
   document.querySelectorAll('[data-test]').forEach(b =>
     b.addEventListener('click', () => testRoot(b.dataset.test)));
+  document.querySelectorAll('[data-open]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const j = await api('/api/open-folder', {what: b.dataset.open});
+      if(!j.ok) toast('打不开：' + (j.error || ''));
+    }));
+
+  const ub = $('btn-update');
+  if(ub) ub.addEventListener('click', () => checkUpdate(false));
+
+  document.querySelectorAll('[data-addgroup]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const j = await api('/api/groups', {add: b.dataset.addgroup});
+      if(j.state) S = j.state;
+      toast(j.ok ? j.message : ('失败：' + (j.error || '')));
+      render();
+    }));
 
   const as = $('autostart');
   if(as) as.addEventListener('change', async () => {
@@ -1155,7 +1360,11 @@ function splitDirty(){
     if(!f) continue;
     if(f.target === 'env'){
       if(f.kind === 'secret' && !String(DIRTY[k]).trim()) continue;  // 留空 = 不改
-      env[k] = DIRTY[k];
+      let val = DIRTY[k];
+      if(f.kind === 'paths'){          // 多行 → 分号串（.env 里就存 `a;b`）
+        val = String(val).split(/[\n;]+/).map(s => s.trim()).filter(Boolean).join(';');
+      }
+      env[k] = val;
     } else {
       st[k] = DIRTY[k];
     }
@@ -1200,7 +1409,8 @@ async function botAct(action){
 /* ── 目录浏览器 ───────────────────────────────────────────── */
 async function openPick(key){
   PICK_TARGET = key;
-  const cur = fieldValue(key) || '';
+  const raw = String(fieldValue(key) || '');
+  const cur = raw.split(/[\n;]+/).map(s => s.trim()).filter(Boolean)[0] || '';
   await loadDir(cur);
   $('pick').classList.add('on');
 }
@@ -1252,8 +1462,16 @@ $('pick-up').onclick = () => loadDir($('pick')._parent || '');
 $('pick-use').onclick = () => {
   const p = $('pick')._path;
   if(PICK_TARGET && p){
-    const el = document.querySelector('input[data-k="' + PICK_TARGET + '"]');
-    if(el){ el.value = p; setDirty(PICK_TARGET, p); }
+    const el = document.querySelector('[data-k="' + PICK_TARGET + '"]');
+    if(el && el.tagName === 'TEXTAREA'){      // 多目录：追加一行，不覆盖已有的
+      const cur = el.value.split(/[\n;]+/).map(s => s.trim()).filter(Boolean);
+      const np = p.replace(/\\/g, '/');
+      if(!cur.includes(np)) cur.push(np);
+      el.value = cur.join('\n');
+      setDirty(PICK_TARGET, el.value);
+    } else if(el){
+      el.value = p; setDirty(PICK_TARGET, p);
+    }
   }
   $('pick').classList.remove('on');
 };
@@ -1263,6 +1481,8 @@ $('pick').addEventListener('click', e => { if(e.target === $('pick')) $('pick').
   try{
     S = await api('/api/state');
     render();
+    // 顺手查一次有没有新版（不阻塞页面，失败静默）
+    setTimeout(() => { checkUpdate(true).catch(() => {}); }, 800);
   }catch(e){
     document.body.innerHTML = '<div style="padding:60px;text-align:center;color:#fc8181;'
       + 'font:15px sans-serif">连不上配置中心服务：' + esc(e) + '</div>';

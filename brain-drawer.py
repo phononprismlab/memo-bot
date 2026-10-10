@@ -71,8 +71,10 @@ sys.path.insert(0, HERE)
 import export  # noqa: E402  （导出：和机器人「导出」指令共用同一套排版）
 import settings  # noqa: E402  （设置：网页「⚙ 设置」与机器人「设置」指令共用）
 import store  # noqa: E402
+from paths import data_dir  # noqa: E402  （数据目录：输出产物落哪）
 
-WORKSPACE = os.path.dirname(HERE)
+# 🔴 输出的是「用户可见产物」→ 落数据目录（安装版 = 用户目录，见 paths.py）
+WORKSPACE = data_dir()
 DEFAULT_OUT = os.path.join(WORKSPACE, "脑内抽屉.html")
 
 # ── 桶（bucket）= 页面上的一类卡片 ─────────────────────────────
