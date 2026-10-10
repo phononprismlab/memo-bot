@@ -15,8 +15,16 @@
   [9] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
  [10] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
  [11] settings       本机设置：默认值/env 回退/校验归一化/批量回滚/中文标签/指令识别
- [12] config-web     配置中心：.env 按行写入（注释与顺序保留/备份）、白名单校验、
-                     secret 不回显、字段表分组、页面护栏、文档同步
+[12] config-web     配置中心：.env 按行写入（注释与顺序保留/备份）、白名单校验、
+                    secret 不回显、字段表分组、页签与未配置门禁、摸鱼库页签、
+                    页面护栏、文档同步
+ [13] console        GBK 环境下不许把进程带崩（stdout 重定向 / 日志编码）
+ [14] boomerang      回旋镖取数范围 + 导出打包
+ [15] offwork        关机播报触发可靠性 + 数据目录解耦
+  [16] onboarding     新手引导：「你好」自我介绍（写明无语言生成能力）、首次上线发介绍、
+                     之后只发启动播报、备忘 / 灵感回执可配
+  [17] moyu.library   摸鱼库可配置：内置只读种子 + 数据目录用户库、保存 / 校验 / 恢复默认、
+                     读坏回退内置、改库清空「抽过哪些」
 
 🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json / .env**。
 """
@@ -59,6 +67,11 @@ import groups as _groups_mod            # noqa: E402
 
 _TMP_DATA = tempfile.mkdtemp(prefix="memo_test_data_")
 _groups_mod.FILE = os.path.join(_TMP_DATA, "groups.json")
+
+# 🔴 关掉「首次建库塞示例」（store._seed）。测试的临时库每个都是全新的，
+#    不关的话每段用例都会多出 4 条示例，把一堆「共 N 条」的断言搅乱。
+#    播种行为本身由 [3] store 段单独开一个库测（那里会临时摘掉这个变量）。
+os.environ["MEMO_NO_SEED"] = "1"
 
 FAILS = []
 TOTAL = [0]
@@ -207,6 +220,47 @@ def test_store():
         check("迁移补齐 4 个新列",
               all(c in cols for c in ("kind", "status", "note", "processed_at")),
               f"got={cols}")
+        check("🔴 老库不播种（表已存在 → fresh=False，一个字节都不动）", len(rows) == 1)
+
+        # ── 首次建库播种示例（2026-10-10）──────────────────────────
+        # 测试环境默认关着（见文件顶部的 MEMO_NO_SEED）—— 这里临时摘掉，单开一个库测
+        _no_seed = os.environ.pop("MEMO_NO_SEED", None)
+        try:
+            store.DB = os.path.join(tmpdir, "fresh.db")
+            store.init()
+            seeded = store.list_memos(50)
+            check("🔴 全新库会塞示例（3 条灵感 + 1 条备忘）",
+                  len(seeded) == 4
+                  and len([r for r in seeded if r["kind"] == "idea"]) == 3
+                  and len([r for r in seeded if r["kind"] == "memo"]) == 1,
+                  f"got={[(r['kind'], r['content']) for r in seeded]}")
+            check("示例都是待处理（打开抽屉就能看到）",
+                  all(r["status"] == "open" for r in seeded))
+            _all_txt = "".join(r["content"] for r in seeded)
+            check("示例覆盖了「灵感怎么来 / 怎么处理 / 回旋镖 / 摸鱼」四件事",
+                  "不用 @ 我" in _all_txt and "回旋镖" in _all_txt
+                  and "点一下" in _all_txt and "摸鱼" in _all_txt)
+            check("示例时间各错开一秒（同一秒排序不稳定）",
+                  len({r["created_at"] for r in seeded}) == 4)
+            check("示例标了来源（sender_name=摸鱼bot）",
+                  all(r["sender_name"] == "摸鱼bot" for r in seeded))
+
+            store.init()
+            check("🔴 二次 init 不重复播种", len(store.list_memos(50)) == 4)
+
+            store.delete_items([r["id"] for r in seeded])
+            store.init()
+            check("🔴 示例被删光后也不重新塞（只看「表是不是新建的」）",
+                  len(store.list_memos(50)) == 0)
+
+            os.environ["MEMO_NO_SEED"] = "1"
+            store.DB = os.path.join(tmpdir, "noseed.db")
+            store.init()
+            check("MEMO_NO_SEED=1 关掉播种（测试 / 想要空库的人）",
+                  len(store.list_memos(50)) == 0)
+        finally:
+            if _no_seed is not None:
+                os.environ["MEMO_NO_SEED"] = _no_seed
     finally:
         store.DB = orig_db
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -512,6 +566,7 @@ def test_ideas_bubbles():
         # ── 布局防重叠的源码级护栏（这些是真机踩过的坑，回归必查）
         T = ib.TEMPLATE
         py_src = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
+        _store_src = open(os.path.join(ROOT, "store.py"), encoding="utf-8").read()
         check("所有气泡同一下降速度（BASE_DUR，避免追尾）",
               "const BASE_DUR" in T and "const dur = BASE_DUR" in T)
         check("有最小间隔门 minGapMs（保证竖直等距）", "function minGapMs" in T)
@@ -630,7 +685,7 @@ def test_ideas_bubbles():
         check("内容流不再硬编码只取 open",
               "x.s === 'open'" not in T2)
         check("轮播队列只装待处理", "shuffle(streamItems().slice())" in T2)
-        check("归档四个桶（含已勾掉的备忘）",
+        check("归档四个桶（含已完成的备忘）",
               "const ARCHIVE = ['memo_done', 'done', 'decided', 'dropped'];" in T2)
         check("垃圾桶文案", "🗑 垃圾桶" in T2)
         check("已处理 / 已决议 各有列表入口",
@@ -733,13 +788,13 @@ def test_ideas_bubbles():
               and "wrappedLines(note, widthPx / NOTE_FONT)" in T2)
 
         # ── 备忘也上这一页（2026-10-09）───────────────────────────
-        # 🔴 备忘 = 我要做，只有「勾掉 / 没勾掉」；灵感 = 我的想法，有四态。
-        #    两条流混排在同一条内容流里，靠「桶」分流。
+        # 🔴 备忘 = 我要做，有「没完成 / 已完成 / 已丢弃」三态；灵感 = 我的想法，有四态。
+        #    两条流混排在同一条内容流里，靠「桶」分流；dropped 是两类共用的桶。
         m1 = store.add_memo("g", "", "s", "", "买猫粮", kind=store.KIND_MEMO)
         store.add_memo("g", "", "s", "", "换水", kind=store.KIND_MEMO)
         memo_items = [x for x in ib.collect() if x["k"] == "memo"]
         check("备忘进了同一条流", len(memo_items) == 2, f"got={len(memo_items)}")
-        check("没勾掉的备忘桶 = memo",
+        check("没完成的备忘桶 = memo",
               all(x["s"] == "memo" for x in memo_items), f"got={memo_items}")
         check("备忘也会被 --open-only 带上",
               any(x["k"] == "memo" for x in ib.collect(open_only=True)))
@@ -750,64 +805,210 @@ def test_ideas_bubbles():
               and ib.bucket_of({"kind": "memo", "status": "done"}) == "memo_done"
               and ib.bucket_of({"kind": "idea", "status": "decided"}) == "decided"
               and ib.bucket_of({"kind": "idea", "status": "乱写"}) == "open")
+        check("🔴 已丢弃的备忘进 dropped 桶（与灵感共用）",
+              ib.bucket_of({"kind": "memo", "status": "dropped"}) == "dropped"
+              and ib.bucket_of({"kind": "idea", "status": "dropped"}) == "dropped"
+              and ib.memo_bucket("dropped") == "dropped")
         check("BUCKET_ORDER / BUCKET_LABEL 覆盖六个桶",
               set(ib.BUCKET_ORDER)
               == {"memo", "memo_done", "open", "done", "decided", "dropped"}
               and set(ib.BUCKET_LABEL) == set(ib.BUCKET_ORDER))
+        check("备忘「已完成」标签（不再叫「已勾掉」）",
+              ib.BUCKET_LABEL["memo_done"] == "备忘 · 已完成"
+              and "勾掉" not in "".join(ib.BUCKET_LABEL.values()))
+        check("备忘没有 decided 态（store.MEMO_STATUSES）",
+              store.MEMO_STATUSES == ("open", "done", "dropped"))
 
-        check("勾掉备忘 → 改动 1 条", store.set_memo_done([m1["id"]], True) == 1)
-        check("勾掉后桶变 memo_done",
+        check("完成备忘 → 改动 1 条", store.set_memo_status([m1["id"]], "done") == 1)
+        check("完成后桶变 memo_done",
               any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
-        check("取消勾掉 → 回到 memo 桶",
-              store.set_memo_done([m1["id"]], False) == 1
+        check("取消完成 → 回到 memo 桶",
+              store.set_memo_status([m1["id"]], "open") == 1
               and any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
-        check("勾不存在的 id 返回 0 不炸", store.set_memo_done(["nope"], True) == 0)
-        check("勾掉接口碰不到灵感（kind 过滤）",
-              store.set_memo_done([b["id"]], True) == 0)
+        check("丢弃备忘 → 进 dropped 桶",
+              store.set_memo_status([m1["id"]], "dropped") == 1
+              and any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
+        check("已丢弃的备忘默认不进内容流",
+              not any(x["id"] == m1["id"] for x in ib.collect(open_only=True)))
+        check("非法 status 返回 0 不炸", store.set_memo_status([m1["id"]], "decided") == 0)
+        check("改不存在的 id 返回 0 不炸", store.set_memo_status(["nope"], "done") == 0)
+        check("备忘改状态碰不到灵感（kind 过滤）",
+              store.set_memo_status([b["id"]], "done") == 0
+              and store.set_memo_status([b["id"]], "dropped") == 0)
+        check("老的 set_memo_done 仍然可用（薄包装）",
+              store.set_memo_done([m1["id"]], True) == 1
+              and store.find_idea(b["id"]) is not None
+              and store.set_memo_done([m1["id"]], False) == 1)
 
-        # 离线导出的操作文件：备忘条目走 kind='memo'
+        # 离线导出的操作文件：备忘条目走 kind='memo'（新写法 status，老写法 done 也认）
         ops2 = os.path.join(tmpdir, "ops2.json")
         with open(ops2, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "done": True},
+            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "status": "dropped"},
                                {"id": b["id"], "status": "open", "note": "回到待处理"}]}, f,
                       ensure_ascii=False)
-        check("apply_ops 支持备忘勾掉", ib.apply_ops(ops2) == 0)
-        check("apply_ops 勾掉了备忘",
-              any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
+        check("apply_ops 支持备忘新写法（status）", ib.apply_ops(ops2) == 0)
+        check("apply_ops 把备忘丢进了 dropped",
+              any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
         check("apply_ops 同时处理灵感状态", store.find_idea(b["id"])["status"] == "open")
+        ops2b = os.path.join(tmpdir, "ops2b.json")
+        with open(ops2b, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "done": True}]}, f,
+                      ensure_ascii=False)
+        check("apply_ops 仍认老写法（done）", ib.apply_ops(ops2b) == 0
+              and any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
+        ops2c = os.path.join(tmpdir, "ops2c.json")
+        with open(ops2c, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "status": "乱写"},
+                               {"id": m1["id"], "kind": "memo", "status": "decided"}]}, f,
+                      ensure_ascii=False)
+        check("apply_ops 拒绝备忘的非法 status", ib.apply_ops(ops2c) == 0)
 
-        # /api/memo —— 页面上的勾选框走这条
+        # ✏️ 离线链路也能改正文（可逆，所以不像删除那样被排除在 --apply 之外）
+        _m3 = store.add_memo("g", "", "s", "", "离线编辑前", kind=store.KIND_MEMO)
+        ops3 = os.path.join(tmpdir, "ops3.json")
+        with open(ops3, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": _m3["id"], "content": "离线编辑后"}]}, f,
+                      ensure_ascii=False)
+        check("apply_ops 支持只改正文（不带动状态）", ib.apply_ops(ops3) == 0)
+        _r3 = next(x for x in ib.collect() if x["id"] == _m3["id"])
+        check("离线改正文生效、桶没变（还是没完成的备忘）",
+              _r3["t"] == "离线编辑后" and _r3["s"] == "memo")
+        # 🔴 纯编辑（只有 content、没有 done/status）**不能**顺手把已完成的备忘改回 open
+        _m4 = store.add_memo("g", "", "s", "", "已完成的备忘", kind=store.KIND_MEMO)
+        store.set_memo_status([_m4["id"]], "done")
+        ops3b = os.path.join(tmpdir, "ops3b.json")
+        with open(ops3b, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": _m4["id"], "kind": "memo", "content": "只改正文"}]}, f,
+                      ensure_ascii=False)
+        ib.apply_ops(ops3b)
+        check("🔴 纯编辑不会把已完成的备忘改回 open",
+              any(x["id"] == _m4["id"] and x["s"] == "memo_done" and x["t"] == "只改正文"
+                  for x in ib.collect()))
+        # 编辑 + 状态叠在一条 op 上：两个都要生效
+        ops3c = os.path.join(tmpdir, "ops3c.json")
+        with open(ops3c, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": _m3["id"], "kind": "memo", "content": "叠着改",
+                                "status": "dropped"}]}, f, ensure_ascii=False)
+        ib.apply_ops(ops3c)
+        check("编辑 + 改状态能叠在一条 op 上",
+              any(x["id"] == _m3["id"] and x["t"] == "叠着改" and x["s"] == "dropped"
+                  for x in ib.collect()))
+        ops3d = os.path.join(tmpdir, "ops3d.json")
+        with open(ops3d, "w", encoding="utf-8") as f:
+            json.dump({"ops": [{"id": _m3["id"], "content": "   "}]}, f, ensure_ascii=False)
+        check("apply_ops 空正文不炸（跳过）", ib.apply_ops(ops3d) == 0)
+
+        # /api/memo —— 页面上的勾选框 / 浮层走这条
         httpd2 = ThreadingHTTPServer(("127.0.0.1", 0), ib._make_handler(doc))
         port2 = httpd2.server_address[1]
         threading.Thread(target=httpd2.serve_forever, daemon=True).start()
         base2 = f"http://127.0.0.1:{port2}"
+
+        def _post(path, payload, want=200):
+            """打一发 POST，返回 (状态码, json)。"""
+            try:
+                with urllib.request.urlopen(urllib.request.Request(
+                        base2 + path, data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json"})) as r:
+                    return r.status, json.load(r)
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read() or b"{}")
+
         try:
             with urllib.request.urlopen(base2 + "/api/items") as r:
                 check("GET /api/items 与旧 /api/ideas 同源",
                       len(json.load(r)["items"]) == len(ib.collect()))
-            req2 = urllib.request.Request(
-                base2 + "/api/memo",
-                data=json.dumps({"id": m1["id"], "done": False}).encode(),
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req2) as r:
-                check("POST /api/memo 取消勾掉", json.load(r).get("changed") == 1)
-            check("取消勾掉已落库",
+
+            code, j = _post("/api/memo", {"id": m1["id"], "status": "open"})
+            check("POST /api/memo 取消完成（status）", code == 200 and j.get("changed") == 1)
+            check("取消完成已落库",
                   any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
+
+            code, j = _post("/api/memo", {"id": m1["id"], "done": True})
+            check("POST /api/memo 仍认老的 done 写法",
+                  code == 200 and j.get("changed") == 1
+                  and any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
+
+            code, j = _post("/api/memo", {"id": m1["id"], "status": "dropped"})
+            check("POST /api/memo 丢弃 → dropped 桶",
+                  code == 200 and j.get("changed") == 1
+                  and any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
+
+            code, _ = _post("/api/memo", {"id": b["id"], "status": "dropped"})
+            check("/api/memo 碰不到灵感（kind 过滤）", code == 404)
+
             for label, payload, want in [
                 ("不存在的 id", {"id": "deadbeef", "done": True}, 404),
                 ("空 id", {"id": "", "done": True}, 400),
+                ("非法 status", {"id": m1["id"], "status": "decided"}, 400),
             ]:
-                try:
-                    urllib.request.urlopen(urllib.request.Request(
-                        base2 + "/api/memo",
-                        data=json.dumps(payload).encode(),
-                        headers={"Content-Type": "application/json"}))
-                    check(f"/api/memo {label} 应被拒绝", False)
-                except urllib.error.HTTPError as e:
-                    check(f"/api/memo {label} → HTTP {want}", e.code == want, f"got={e.code}")
+                code, _ = _post("/api/memo", payload)
+                check(f"/api/memo {label} → HTTP {want}", code == want, f"got={code}")
+
+            # ── ✏️ 再次编辑（走 /api/edit）─────────────────────────
+            medit2 = store.add_memo("g", "", "s", "", "HTTP 编辑前", kind=store.KIND_MEMO)
+            d_before = next(x["d"] for x in ib.collect() if x["id"] == medit2["id"])
+            code, j = _post("/api/edit", {"id": medit2["id"], "content": "HTTP 编辑后"})
+            check("POST /api/edit 改正文", code == 200 and j.get("changed") == 1)
+            _row = next(x for x in ib.collect() if x["id"] == medit2["id"])
+            check("🔴 改完正文变了、创建时间（显示的时间）没变",
+                  _row["t"] == "HTTP 编辑后" and _row["d"] == d_before)
+            for label, payload, want in [
+                ("空 id", {"id": "", "content": "x"}, 400),
+                ("空正文", {"id": medit2["id"], "content": "   "}, 400),
+                ("不存在的 id", {"id": "deadbeef", "content": "x"}, 404),
+            ]:
+                code, _ = _post("/api/edit", payload)
+                check(f"/api/edit {label} → HTTP {want}", code == want, f"got={code}")
+
+            # ── 永久删除（2026-10-10）──────────────────────────────
+            mdel = store.add_memo("g", "", "s", "", "这条要被永久删掉",
+                                  kind=store.KIND_MEMO)
+            store.set_memo_status([mdel["id"]], "dropped")
+            code, _ = _post("/api/delete", {"id": "deadbeef"})
+            check("/api/delete 不存在的 id → 404", code == 404, f"got={code}")
+            code, _ = _post("/api/delete", {"id": ""})
+            check("/api/delete 空 id → 400", code == 400, f"got={code}")
+            code, j = _post("/api/delete", {"id": mdel["id"]})
+            check("/api/delete 真删成功", code == 200 and j.get("deleted") == 1)
+            check("🔴 删完真的从库里没了",
+                  not any(x["id"] == mdel["id"] for x in ib.collect()))
+            code, _ = _post("/api/delete", {"id": mdel["id"]})
+            check("再删同一条 → 404（幂等不炸）", code == 404, f"got={code}")
+            check("delete_items 不吃空列表", store.delete_items([]) == 0
+                  and store.delete_items(None) == 0)
         finally:
             httpd2.shutdown()
             httpd2.server_close()
+
+        # store.delete_items 直接测一遍（两种 kind 都能删、返回条数）
+        _dm = store.add_memo("g", "", "s", "", "备忘删我", kind=store.KIND_MEMO)
+        _di = store.add_memo("g", "", "s", "", "灵感删我", kind=store.KIND_IDEA)
+        check("delete_items 一次删多条（含灵感）",
+              store.delete_items([_dm["id"], _di["id"]]) == 2
+              and not any(x["id"] in (_dm["id"], _di["id"]) for x in ib.collect()))
+        check("delete_items 不存在的 id 不计数", store.delete_items(["nope"]) == 0)
+
+        # ── ✏️ 再次编辑正文（2026-10-10）────────────────────────────
+        # 🔴 这条需求的核心是「**不改变创建时间戳**」—— 只动 content，created_at 一个字节不碰
+        medit = store.add_memo("g", "", "s", "", "写错了的正文", kind=store.KIND_MEMO)
+        _created = next(x["created_at"] for x in store.list_memos(500, store.KIND_MEMO)
+                        if x["id"] == medit["id"])
+        check("update_content 改正文 → 改动 1 条",
+              store.update_content(medit["id"], "改好的正文") == 1)
+        _after = next(x for x in store.list_memos(500, store.KIND_MEMO) if x["id"] == medit["id"])
+        check("正文真的改了", _after["content"] == "改好的正文")
+        check("🔴 创建时间不变（这条需求的核心）", _after["created_at"] == _created)
+        check("update_content 不存在的 id → 0", store.update_content("nope", "x") == 0)
+        check("update_content 空 id / None → 0",
+              store.update_content("", "x") == 0 and store.update_content(medit["id"], None) == 0)
+        check("update_content 不按 kind 过滤（灵感也能改）",
+              store.update_content(b["id"], "灵感也改过了") == 1
+              and store.find_idea(b["id"])["content"] == "灵感也改过了")
+        _uc = _store_src.split("def update_content")[1].split("\n# ──")[0]
+        _uc_body = _uc.split('"""')[-1]      # 掐掉 docstring，只看真代码
+        check("🔴 update_content 的 SQL 里没有 created_at",
+              "SET content=?" in _uc_body and "created_at" not in _uc_body)
 
         # 源码护栏：备忘在页面上是「一张带勾选框的卡片」
         check("标题已换成「脑内抽屉」",
@@ -818,19 +1019,62 @@ def test_ideas_bubbles():
               and "if(it.k === 'memo') hd.append(makeChk(it))" in T2)
         check("勾选框用 CSS 画（方框 + ::after 对勾），不依赖字符字形",
               ".bubble .chk{" in T2 and ".bubble .chk.on::after{" in T2)
-        check("勾掉走 /api/memo", "fetch('/api/memo'" in T2)
-        check("已勾掉的备忘有列表入口",
-              "✓ 已勾掉" in T2 and 'id="btn-memo_done"' in T2)
-        check("列表行也显示勾掉状态", "row.append(makeChk(it, renderList))" in T2)
-        check("浮层对备忘换一套动作（勾掉 / 取消勾掉）",
+        check("完成走 /api/memo", "fetch('/api/memo'" in T2)
+        check("已完成的备忘有列表入口",
+              "✓ 已完成" in T2 and 'id="btn-memo_done"' in T2)
+        check("列表行也显示完成状态", "row.append(makeChk(it, renderList))" in T2)
+        check("浮层对备忘换一套动作（完成 / 丢弃 / 恢复）",
               "modal.querySelectorAll('.ideaact button')" in T2
-              and "modal.querySelector('.memoact button')" in T2)
+              and "modal.querySelectorAll('.memoact button')" in T2
+              and 'data-memo="done"' in T2 and 'data-memo="drop"' in T2
+              and 'data-memo="open"' in T2 and "function syncMemoActions" in T2)
         check("离线暂存区分备忘与灵感",
-              "v.k === 'memo'" in T2 and "kind: 'memo'" in T2)
+              "v.k === 'memo'" in T2 and "op.kind = 'memo'" in T2)
         check("旧导出文件名已改（抽屉操作.json）",
               "抽屉操作.json" in T2 and "灵感操作.json" not in T2)
         check("导出文件名/入口脚本名同步",
               'os.path.join(WORKSPACE, "脑内抽屉.html")' in py_src)
+        check("🔴 页面上不该再出现「勾掉」",
+              "勾掉" not in T2 and "勾掉" not in py_src)
+
+        # ── 永久删除：确认弹窗 + 「以后不再提示」（2026-10-10）─────
+        check("永久删除走 /api/delete",
+              "fetch('/api/delete'" in T2 and 'path.startswith("/api/delete")' in py_src)
+        check("确认弹窗是自定义浮层（要放勾选框，window.confirm 做不到）",
+              'id="confirm"' in T2 and "function askDelete" in T2)
+        check("弹窗里写明找不回来",
+              "找不回来" in T2 and 'id="cquote"' in T2)
+        check("弹窗带「以后不再提示」勾选框",
+              'id="cnoask"' in T2 and "noAskDelete" in T2)
+        check("「不再提示」存浏览器本地（不进 settings.json）",
+              "bubble_del_noask_v1" in T2 and "lsSet(NOASK_KEY" in T2)
+        check("弹窗默认不勾（每次都从「没勾」开始）",
+              "cnoaskEl.checked = false;" in T2)
+        check("设置浮层能把它勾回来",
+              "function deleteConfirmItem" in T2 and "永久删除前再确认" in T2)
+        check("🔴 离线模式禁用永久删除",
+              "离线模式删不了" in T2 and "del.disabled = true" in T2)
+        check("🔴 --apply 不接受删除操作（不可恢复的不进那条链路）",
+              "不含永久删除" in py_src and '"/api/delete"' not in py_src.split("def apply_ops")[1]
+              .split("def _make_handler")[0])
+        check("永久删除按钮有独立的危险样式",
+              "button.danger" in T2 and "永久删除" in T2)
+
+        # ── ✏️ 再次编辑：页面入口 + 创建时间不变（2026-10-10）──────
+        check("编辑走 /api/edit",
+              "fetch('/api/edit'" in T2 and 'path.startswith("/api/edit")' in py_src)
+        check("浮层里有「✏️ 编辑」入口", 'id="btn-edit"' in T2 and "✏️ 编辑" in T2)
+        check("编辑态是独立 textarea + 保存 / 取消",
+              'id="editbox"' in T2 and 'id="esave"' in T2 and 'id="ecancel"' in T2)
+        check("🔴 页面写明了「创建时间不变」", "创建时间不变" in T2)
+        check("归档列表行也有编辑入口", "ed.textContent = '✏️ 编辑'" in T2)
+        check("🔴 编辑时空格是打字、不是暂停轮播",
+              "document.activeElement !== editboxEl" in T2)
+        check("Escape 先退出编辑态（再关浮层）",
+              "else if(editing) setEditMode(false)" in T2)
+        check("离线编辑也进 --apply（可逆，不受删除那条限制）",
+              "store.update_content" in py_src.split("def apply_ops")[1]
+              .split("def _make_handler")[0])
     finally:
         store.DB = orig_db
         if _orig_set is None:
@@ -1075,8 +1319,9 @@ def test_route():
         memos = store.list_memos(10, store.KIND_MEMO)
         check("「备忘」落库 kind=memo",
               bool(memos) and memos[0]["kind"] == "memo", f"got={memos[:1]}")
-        check("「备忘」有回执", bool(m.replies) and "已记" in m.replies[0],
-              f"got={m.replies}")
+        check("「备忘」有回执（文案来自设置项 memo_ack）",
+              bool(m.replies) and m.replies[0] == bot._settings.get("memo_ack")
+              and m.replies[0] == "已经放进脑内抽屉了", f"got={m.replies}")
 
         # 6) @ 场景未识别 → 明确提示
         m = Msg("这是一句没头没脑的话")
@@ -1197,7 +1442,27 @@ def test_settings():
         check("展示范围排在两个文案之后",
               _order.index("bubbles_show") > _order.index("offwork_msg"),
               f"got={_order}")
+        # 🔴 三键新增：功能介绍 / 备忘回执 / 灵感回执（都是「回复文案可配」的一部分）
+        check("新增三键都在",
+              {"intro_msg", "memo_ack", "idea_ack"} <= set(settings.KEYS))
+        check("功能介绍是多行文本（kind=area）",
+              settings.KEYS["intro_msg"]["kind"] == "area")
+        check("功能介绍默认值写明「没有语言生成能力」",
+              "没有语言生成能力" in settings.get("intro_msg"))
+        check("备忘回执默认「已经放进脑内抽屉了」",
+              settings.get("memo_ack") == "已经放进脑内抽屉了")
+        check("灵感回执默认留空（= 静默收下，保持原有行为）",
+              settings.get("idea_ack") == "", f"got={settings.get('idea_ack')!r}")
+        check("新增三键都还没显式写过",
+              all(settings.is_set(k) is False
+                  for k in ("intro_msg", "memo_ack", "idea_ack")))
+        check("三键排在关机通知文案之后、展示范围之前",
+              _order.index("offwork_msg") < _order.index("intro_msg")
+              < _order.index("memo_ack") < _order.index("idea_ack")
+              < _order.index("bubbles_show"), f"got={_order}")
         check("默认展示范围是「备忘 + 待处理」", settings.get("bubbles_show") == ["memo", "open"])
+        check("展示范围标签：memo_done 叫「已完成」（不再叫「已勾掉」）",
+              settings.KEYS["bubbles_show"]["choice_labels"]["memo_done"] == "已完成")
         check("没写过文件时 is_set 为假", settings.is_set("startup_msg") is False)
         check("文件还不存在", not os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
 
@@ -1205,6 +1470,15 @@ def test_settings():
         check("set text 会去空白", ok and info == "起来干活", f"got={info!r}")
         check("写入后 is_set 为真", settings.is_set("startup_msg") is True)
         check("文件已落盘", os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
+
+        # area（多行）与可清空的回执
+        ok, info = settings.set_value("intro_msg", "第一行\n第二行\n")
+        check("area 保留内部换行、只去首尾空白",
+              ok and info == "第一行\n第二行", f"got={info!r}")
+        ok, info = settings.set_value("memo_ack", "  收好了  ")
+        check("备忘回执可改（去空白）", ok and info == "收好了", f"got={info!r}")
+        ok, info = settings.set_value("memo_ack", "")
+        check("备忘回执可以清空（= 静默记下）", ok and info == "", f"got={info!r}")
 
         ok, info = settings.set_value("bubbles_show", "待处理, done")
         check("multi 认中文标签 + code", ok and info == ["open", "done"], f"got={info}")
@@ -1384,16 +1658,23 @@ def test_config_web():
         check("AppSecret 不回显（value 为空）", sec["value"] == "" and sec["set"] is True)
         check("字段带 target（env / settings 分流）",
               {f["target"] for f in fields} == {"env", "settings"})
-        check("settings 的五个键都在字段表里",
+        check("settings 的八个键都在字段表里",
               {f["key"] for f in fields if f["target"] == "settings"}
-              == {"startup_msg", "offwork_msg", "bubbles_show",
-                  "boomerang_days", "boomerang_scope"})
-        check("分组覆盖 7 个分区",
+              == {"startup_msg", "offwork_msg", "intro_msg", "memo_ack", "idea_ack",
+                  "bubbles_show", "boomerang_days", "boomerang_scope"})
+        # 🔴 「运行方式」「摸鱼库」两块不走字段表（前者是自绘面板、后者是整块 textarea），
+        #    所以字段表只覆盖 7 个分区，别把这两个算进去。
+        check("字段表覆盖 7 个「有字段」的分区",
               {f["group"] for f in fields}
-              >= {"bot", "behavior", "files", "bubbles", "boomerang", "ignore"})
-        check("页面渲染顺序 = GROUPS 顺序",
+              == {"bot", "behavior", "msg", "files", "bubbles", "boomerang", "ignore"},
+              str(sorted({f["group"] for f in fields})))
+        check("GROUPS 共 9 个分区，第 9 个是摸鱼库",
+              len(cw.GROUPS) == 9 and cw.GROUPS[-1][0] == "moyu",
+              str([k for k, _, _ in cw.GROUPS]))
+        check("页签顺序 = GROUPS 顺序",
               [g["key"] for g in [{"key": k} for k, _, _ in cw.GROUPS]]
-              == ["bot", "behavior", "files", "bubbles", "boomerang", "runtime", "ignore"])
+              == ["bot", "behavior", "msg", "files", "bubbles", "boomerang",
+                  "runtime", "ignore", "moyu"])
 
         # 6) 目录浏览：不存在 / 不是目录都给错误，别抛
         bad = cw.browse_dirs(os.path.join(tmpdir, "nope"))
@@ -1423,6 +1704,35 @@ def test_config_web():
               'targets = {"data": data_dir()' in _csrc and 'payload.get("what")' in _csrc)
         check("页面有开机自启开关", "autostart" in cw.PAGE)
         check("页面有依赖自检", "依赖自检" in cw.PAGE)
+
+        # 9) 页签 + 未配置门禁（一屏一块，不用上下拉）
+        check("页面有页签条容器", 'id="tabs"' in cw.PAGE)
+        check("页签按后端分组渲染（页面不硬编码分组名）",
+              "function renderTabs" in cw.PAGE and "function visibleGroups" in cw.PAGE
+              and "const gs = visibleGroups()" in cw.PAGE)
+        check("一次只渲染当前页签那一块", "gs.find(x => x.key === ACTIVE_TAB)" in cw.PAGE)
+        check("未配凭据时只留「① 连接 QQ」",
+              "S.groups.filter(g => g.key === 'bot')" in cw.PAGE)
+        check("未配凭据时页签条隐藏",
+              "classList.add('hide')" in cw.PAGE and ".tabs.hide{display:none}" in cw.PAGE)
+        check("页面骨架是一屏一块（只有内容区滚动）",
+              "overflow:hidden" in cw.PAGE and "overflow-y:auto" in cw.PAGE)
+        check("多行文案用 textarea 渲染（kind=area）", "f.kind === 'area'" in cw.PAGE)
+
+        # 9b) 摸鱼库页签：页面护栏 + 端点 + 打开库文件走白名单
+        _csrc = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+        check("页面有摸鱼库页签的渲染函数", "function moyuSection" in cw.PAGE)
+        check("摸鱼库是整库提交（改一类不丢另外两类）",
+              "function moyuPayload" in cw.PAGE and "function moyuValue" in cw.PAGE)
+        check("摸鱼库有分类切换按钮", "data-moyucat" in cw.PAGE)
+        check("摸鱼库有恢复内置按钮", 'id="moyu-reset"' in cw.PAGE)
+        check("摸鱼库有「打开库文件位置」", 'id="moyu-open"' in cw.PAGE)
+        check("摸鱼库保存走 /api/moyu", "api('/api/moyu', {groups: moyu})" in cw.PAGE)
+        check("摸鱼库恢复走 /api/moyu {reset:true}", "api('/api/moyu', {reset: true})" in cw.PAGE)
+        check("后端有 /api/moyu 端点", 'path == "/api/moyu"' in _csrc)
+        check("打开库文件在白名单里（不吃任意路径）", '"moyu": _moyu.user_path()' in _csrc)
+        check("页签尺寸锁在「九个能排一行」的档位（改标题要重算宽度）",
+              "font:12px/1.2 inherit" in cw.PAGE and "max-width:880px" in cw.PAGE)
 
         # 8) sync_env：写完 .env 立刻让本进程看到新值
         cw.sync_env()
@@ -1635,6 +1945,11 @@ def test_boomerang_export():
         # 1) 指令解析：只认完整写法，别把「回旋镖xx」当指令
         check("parse_boomerang 裸指令", _bot.parse_boomerang("回旋镖") == (True, None))
         check("parse_boomerang 带天数", _bot.parse_boomerang("回旋镖 7") == (True, 7))
+        check("🔴 parse_boomerang 认 0 天（今天记的也翻）",
+              _bot.parse_boomerang("回旋镖 0") == (True, 0)
+              and _bot.parse_boomerang("回旋镖0") == (True, 0))
+        check("parse_boomerang 负数当非指令（落回普通流程，不误判）",
+              _bot.parse_boomerang("回旋镖 -1") == (False, None))
         check("parse_boomerang 别名", _bot.parse_boomerang("回旋标") == (True, None))
         check("parse_boomerang 非指令不误判", _bot.parse_boomerang("回旋镖xx") == (False, None))
         check("parse_boomerang 普通聊天不误判", _bot.parse_boomerang("今天摸鱼了") == (False, None))
@@ -1674,15 +1989,46 @@ def test_boomerang_export():
         _settings.set_value("boomerang_scope", saved)
         check("范围恢复后两条都回来", store.count_boomerang(3, saved) == 2)
 
+        # 4.5) 🔴 回溯天数 = 0：今天刚记的也能被翻出来（新用户第一发就有反应）
+        con = sqlite3.connect(store.DB)
+        con.execute("UPDATE memos SET boomerang_at = NULL")
+        con.commit()
+        con.close()
+        _settings.set_value("boomerang_days", 0)
+        check("🔴 天数 0 → 三条全进池子（含今天那条）", store.count_boomerang(0, saved) == 3)
+        _settings.set_value("boomerang_scope", ["open"])   # 只留「今天刚记的」那条灵感
+        got0 = _bot.boomerang_text()
+        check("🔴 天数 0 真能翻到今天的记录", "今天刚记的" in got0, got0[:60])
+        check("文案说「你今天」而不是「0 天前」",
+              "你今天" in got0 and "0 天前" not in got0)
+        # 再重置一次：验「显式传 0」不会被 falsy 判断（`if not days`）吃掉
+        con = sqlite3.connect(store.DB)
+        con.execute("UPDATE memos SET boomerang_at = NULL")
+        con.commit()
+        con.close()
+        check("🔴 显式传 days=0 不会被当成「没传」（falsy 陷阱）",
+              "今天刚记的" in _bot.boomerang_text(0))
+        _settings.set_value("boomerang_scope", saved)
+        _settings.set_value("boomerang_days", 3)
+
         # 5) settings：新加的 int 类型要能校验
         val, err = _settings.normalize("boomerang_days", "abc")
         check("回溯天数拒绝非整数", val is None and "整数" in err)
-        val, _ = _settings.normalize("boomerang_days", "0")
-        check("回溯天数下限是 1", val is None)
+        val, err = _settings.normalize("boomerang_days", "0")
+        check("🔴 回溯天数下限是 0（今天记的也翻得到，不把新用户挡在门外）",
+              val == 0 and err is None)
+        val, _ = _settings.normalize("boomerang_days", "-1")
+        check("回溯天数拒绝负数", val is None)
         val, _ = _settings.normalize("boomerang_days", "9999")
         check("回溯天数上限是 365", val is None)
         val, err = _settings.normalize("boomerang_days", "7")
         check("回溯天数接受 7", val == 7 and err is None)
+        check("🔴 设置项声明里 min 就是 0（别被人改回 1）",
+              _settings.KEYS["boomerang_days"]["min"] == 0)
+        check("help 文案说明「填 0 就能翻今天记的」",
+              "0" in _settings.KEYS["boomerang_days"]["help"])
+        check("help 文案里没有裸的 markdown 星号（页面按纯文本渲染）",
+              "**" not in _settings.KEYS["boomerang_days"]["help"])
         val, err = _settings.normalize("boomerang_scope", "备忘、待处理灵感")
         check("推送范围认中文标签", val == ["memo", "open"] and err is None)
         check("推送范围默认含备忘", "memo" in _settings.get("boomerang_scope"))
@@ -1721,7 +2067,8 @@ def test_boomerang_export():
         check("服务端有 /api/export 路由", '"/api/export"' in T2)
         check("导出响应带 filename*（中文名不乱码）", "filename*=UTF-8''" in T2)
         CW = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
-        check("配置中心有回旋镖分区", '("boomerang", "⑤ 回旋镖"' in CW)
+        # 🔴 不写死圈号（①~⑧ 会随分组增删变）—— 只认 group key
+        check("配置中心有回旋镖分区", '("boomerang", "' in CW and "回旋镖" in CW)
         check("回旋镖两个键都归到该分区",
               '"boomerang_days": "boomerang"' in CW
               and '"boomerang_scope": "boomerang"' in CW)
@@ -1831,9 +2178,52 @@ def test_offwork_paths():
     check("compare 缺位补 0（0.2 == 0.2.0）", _ver.compare_version("0.2", "0.2.0") == 0)
     check("远端地址走 jsdelivr（raw 连不上）", "jsdelivr" in _ver.RAW_URL)
 
+    # 7.1) 下载：给用户一个能直接点的链接（GitHub Releases 直链 / 可换成自建源）
+    check("安装包名带版本号", _ver.asset_name("0.2.0") == "memo-bot-setup-v0.2.0.exe")
+    check("版本串带 v 前缀也能归一化",
+          _ver.asset_name("v0.2.0") == "memo-bot-setup-v0.2.0.exe"
+          and _ver.asset_name(" 0.2.0 ") == "memo-bot-setup-v0.2.0.exe")
+    _dl = _ver.download_url("0.2.0")
+    check("默认下载直链 = GitHub Releases 且带版本号",
+          _dl == "https://github.com/phononprismlab/memo-bot/releases/download/v0.2.0/"
+                 "memo-bot-setup-v0.2.0.exe", _dl)
+    check("Release 页兜底链接", _ver.release_url("0.2.0").endswith("/releases/tag/v0.2.0"))
+    check("全部 Releases 列表链接", _ver.releases_url().endswith("/releases"))
+    _orig_base = os.environ.get("MEMO_DOWNLOAD_BASE")
+    try:
+        os.environ["MEMO_DOWNLOAD_BASE"] = "https://example.com/dl/"
+        check("🔴 MEMO_DOWNLOAD_BASE 能换成自建源（去尾斜杠）",
+              _ver.download_url("0.2.0") == "https://example.com/dl/memo-bot-setup-v0.2.0.exe")
+        check("显式传 base 优先于环境变量",
+              _ver.download_url("0.2.0", "https://cdn.example.com")
+              == "https://cdn.example.com/memo-bot-setup-v0.2.0.exe")
+    finally:
+        if _orig_base is None:
+            os.environ.pop("MEMO_DOWNLOAD_BASE", None)
+        else:
+            os.environ["MEMO_DOWNLOAD_BASE"] = _orig_base
+    check("没设基址时回到 GitHub", "github.com" in _ver.download_url("0.2.0"))
+
     _csrc2 = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
     check("页面有「检查更新」按钮", "btn-update" in _csrc2)
     check("配置中心暴露 version", '"version": _version.VERSION' in _csrc2)
+    check("更新接口回「直接下载」的链接（不只是仓库主页）",
+          '"download": _version.download_url(far)' in _csrc2)
+    check("页面有可见的「⬇ 下载新版」入口",
+          'id="ver-dl"' in _csrc2 and "a.dlbtn" in _csrc2)
+    check("直链打不开时给 Releases 兜底入口", "Releases 页面" in _csrc2)
+
+    # 🔴 安装包文件名两边必须一致：.iss 的 OutputBaseFilename ↔ version.py 的 ASSET_TMPL。
+    #    不一致 = 用户点「⬇ 下载新版」直接 404。_exe_poc 只在开发机上，没有就跳过。
+    _iss_path = os.path.join(os.path.dirname(ROOT), "_exe_poc", "memo-bot.iss")
+    if os.path.exists(_iss_path):
+        _iss = open(_iss_path, encoding="utf-8-sig").read()
+        check("🔴 .iss 产物名带版本号，且与 version.py 的模板对得上",
+              "OutputBaseFilename=memo-bot-setup-v{#MyAppVersion}" in _iss
+              and _ver.ASSET_TMPL == "memo-bot-setup-v{ver}.exe")
+        check("🔴 .iss 的版本号从 VERSION 文件读（不再手写一份）",
+              'Trim(FileRead(FileOpen(RepoDir + "\\VERSION")))' in _iss
+              and '#define MyAppVersion "' not in _iss)
 
     # 8) 群发现：不用再手动拉群 + 翻日志找 openid
     import groups as _g
@@ -1869,6 +2259,246 @@ def test_offwork_paths():
     check("关机播报遍历多个群", "for gid in gids" in _osrc)
 
 
+# ── [16] 新手引导：「你好」/ 首次功能介绍 / 可配回执 ──────────────
+def test_onboarding():
+    print("\n[16] 新手引导（首次功能介绍 /「你好」/ 可配回执）")
+    import asyncio
+    import bot
+    import settings
+    import store
+
+    class Msg:
+        """假消息：字段名与 botpy 的 GroupMessage / C2CMessage 对齐。"""
+
+        def __init__(self, content, gid="G1", mid="MSG1", sid="M1", uid=None):
+            self.content = content
+            self.id = mid
+            self.group_openid = gid
+            self.author = SimpleNamespace(member_openid=sid, user_openid=uid)
+            self.replies = []
+
+        async def reply(self, content=None, msg_seq=1):
+            self.replies.append(content)
+
+    class Client:
+        async def send_file_to_chat(self, *a, **k):
+            raise AssertionError("本用例不应走到发文件分支")
+
+    tmp = tempfile.mkdtemp(prefix="onboard_test_")
+    _env = {k: os.environ.get(k) for k in
+            ("MEMO_SETTINGS_FILE", "MEMO_DATA_DIR", "MEMO_IGNORE",
+             "MEMO_IGNORE_FILE", "MEMO_TRIGGER")}
+    _orig_db, _orig_last, _orig_trigger = store.DB, bot.LAST_MSG_FILE, bot.TRIGGER
+    os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
+    os.environ["MEMO_DATA_DIR"] = tmp          # onboarded.json 落到临时目录
+    os.environ["MEMO_IGNORE"] = ""
+    os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
+    os.environ["MEMO_TRIGGER"] = "备忘"
+    store.DB = os.path.join(tmp, "t.db")
+    bot.LAST_MSG_FILE = os.path.join(tmp, "last.json")
+    bot.TRIGGER = "备忘"
+    try:
+        store.init()
+        cli = Client()
+
+        def run(msg, mentioned=True, scope=bot.SCOPE_GROUP):
+            asyncio.run(bot.route_message(cli, msg, mentioned, scope))
+
+        # 1) 「你好」= 自我介绍，且明说没有语言生成能力
+        check("HELLO_CMDS 认「你好」", "你好" in bot.HELLO_CMDS)
+        check("内置兜底文案写明「没有语言生成能力」",
+              "没有语言生成能力" in bot.HELLO_FALLBACK)
+        check("intro_text 默认取设置里的「功能介绍」",
+              bot.intro_text() == settings.get("intro_msg")
+              and "没有语言生成能力" in bot.intro_text())
+        check("功能介绍默认是多行的", "\n" in bot.intro_text())
+
+        m = Msg("你好")
+        run(m)
+        check("「你好」回自我介绍", len(m.replies) == 1
+              and "没有语言生成能力" in m.replies[0], f"got={m.replies}")
+        check("「你好」不落库",
+              store.list_memos(10, store.KIND_IDEA) == []
+              and store.list_memos(10, store.KIND_MEMO) == [])
+
+        # 2) 设置里清空功能介绍 → 「你好」回退内置短文案（永远有话说）
+        settings.set_value("intro_msg", "")
+        m = Msg("你好")
+        run(m)
+        check("清空功能介绍后回退内置文案",
+              m.replies == [bot.HELLO_FALLBACK], f"got={m.replies}")
+        settings.reset("intro_msg")
+
+        # 3) 备忘回执可配
+        check("备忘回执默认值来自设置",
+              settings.get("memo_ack") == "已经放进脑内抽屉了")
+        m = Msg("备忘 买猫粮")
+        run(m)
+        check("默认备忘回执", m.replies == ["已经放进脑内抽屉了"], f"got={m.replies}")
+        settings.set_value("memo_ack", "收好了")
+        m = Msg("备忘 买狗粮")
+        run(m)
+        check("改设置后备忘回执跟着变", m.replies == ["收好了"], f"got={m.replies}")
+        settings.set_value("memo_ack", "")
+        m = Msg("备忘 买鱼粮")
+        run(m)
+        check("回执留空 = 静默记下（不回复）", m.replies == [], f"got={m.replies}")
+        check("静默时仍然落库", len(store.list_memos(10, store.KIND_MEMO)) == 3,
+              f"got={len(store.list_memos(10, store.KIND_MEMO))}")
+        settings.reset("memo_ack")
+
+        # 4) 灵感回执可配（私聊兜底分支）
+        check("灵感回执默认留空（保持原有静默行为）", settings.get("idea_ack") == "")
+        m = Msg("突然想到一个点子", uid="U1")
+        run(m, mentioned=True, scope=bot.SCOPE_C2C)
+        check("默认私聊静默收灵感", m.replies == [], f"got={m.replies}")
+        settings.set_value("idea_ack", "💡 已收作灵感")
+        m = Msg("又一个点子", uid="U1")
+        run(m, mentioned=True, scope=bot.SCOPE_C2C)
+        check("填了灵感回执就回那一句", m.replies == ["💡 已收作灵感"], f"got={m.replies}")
+        check("回执改了不影响落库",
+              len(store.list_ideas(store.STATUS_OPEN)) == 2,
+              f"got={len(store.list_ideas(store.STATUS_OPEN))}")
+        settings.reset("idea_ack")
+
+        # 5) 首次引导标记（写在数据目录：源码版 / 安装版各记各的，卸载不动数据）
+        _flag = os.path.join(tmp, "onboarded.json")
+        check("标记落在数据目录",
+              bot.data_path(bot._ONBOARD_FILE) == _flag,
+              f"got={bot.data_path(bot._ONBOARD_FILE)}")
+        check("初始：没发过功能介绍", bot.onboarded_done() is False)
+        bot.mark_onboarded()
+        check("打标记后：发过了", bot.onboarded_done() is True)
+        check("标记文件真的落盘", os.path.exists(_flag))
+        with open(_flag, "w", encoding="utf-8") as fh:
+            fh.write("{坏掉的 json")
+        check("标记读坏了当没发过（下次上线重试）", bot.onboarded_done() is False)
+
+        # 6) 上线播报：首次发介绍、之后只发启动播报（源码护栏）
+        _src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+        check("上线时按「有没有发过介绍」二选一",
+              "first = not onboarded_done()" in _src
+              and '"intro_msg" if first else "startup_msg"' in _src)
+        check("介绍被清空则退回普通播报", "first = False" in _src)
+        check("介绍发成功才打标记（一个群都没发成 → 下次重试）",
+              "if first and sent:" in _src and "mark_onboarded()" in _src)
+        check("写死的 C2C_ACK_IDEA 已换成设置项",
+              "C2C_ACK_IDEA" not in _src and '_settings.get("idea_ack")' in _src)
+    finally:
+        store.DB, bot.LAST_MSG_FILE, bot.TRIGGER = _orig_db, _orig_last, _orig_trigger
+        for k, v in _env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── [17] 摸鱼库可配置（内置种子 + 用户库）───────────────────────
+def test_moyu_library():
+    print("\n[17] 摸鱼库可配置（内置种子 / 用户库 / 校验 / 恢复默认）")
+    import moyu
+
+    tmp = tempfile.mkdtemp(prefix="moyu_lib_")
+    _orig_up, _orig_recent = moyu.user_path, moyu.RECENT
+    # 🔴 和 groups.json 一样：user_path() 默认落代码目录，测试必须指到临时目录，
+    #    否则「保存摸鱼库」的用例会真的往仓库里写 moyu-user.json。
+    moyu.user_path = lambda: os.path.join(tmp, "moyu-user.json")
+    moyu.RECENT = os.path.join(tmp, "moyu-recent.json")
+    up = moyu.user_path()
+    try:
+        base = moyu.builtin_items()
+
+        # 1) 还没用户库 → 用内置的
+        check("初始 source()=builtin", moyu.source() == "builtin")
+        check("初始 load_items() 就是内置库",
+              moyu.load_items() == base and len(base) > 0, f"got={len(moyu.load_items())}")
+        check("as_texts() 三类齐全",
+              set(moyu.as_texts()) == set(moyu.CATS)
+              and all(len(v) > 0 for v in moyu.as_texts().values()))
+        check("内置库 id 唯一", len({it["id"] for it in base}) == len(base))
+        check("内置库每条 cat 合法、text 是字符串",
+              all(it.get("cat") in moyu.CATS and isinstance(it.get("text"), str)
+                  for it in base))
+
+        # 2) 保存 → 落盘 + 立刻生效
+        ok, n = moyu.save_items({"relax": ["去阳台站两分钟", "   ", "去阳台站两分钟"],
+                                 "slack": ["泡杯茶"], "trivia": []})
+        check("保存成功", ok is True, n)
+        check("只算有效条数（丢空行 + 同类去重）", n == 2, f"got={n}")
+        check("保存后 source()=user", moyu.source() == "user")
+        check("保存后 load_items() = 用户库", len(moyu.load_items()) == 2)
+        check("落盘文件真的在", os.path.exists(up))
+        doc = json.load(open(up, encoding="utf-8"))
+        check("落盘结构 {version, items}",
+              doc.get("version") == 1 and isinstance(doc.get("items"), list))
+        check("id 是「分类-序号」",
+              [it["id"] for it in doc["items"]] == ["relax-01", "slack-01"])
+        check("原子写：不留 .tmp 残留", not os.path.exists(up + ".tmp"))
+
+        # 3) 也吃整段文本（配置中心传的是数组，但手改 / 别的调用方可能传字符串）
+        ok, n = moyu.save_items({"relax": "甲\n\n乙\n甲", "slack": [], "trivia": []})
+        check("传整段文本也能存（按行拆 / 丢空行 / 去重）", ok is True and n == 2, n)
+
+        # 4) 改了库 → 之前「抽过哪些」作废
+        moyu._save_recent(["relax-01"])
+        moyu.save_items({"relax": ["换个内容"], "slack": [], "trivia": []})
+        check("改库后 recent 清空", moyu._load_recent() == [])
+
+        # 5) 校验：全空 / 单条超长 / 单类超条数
+        ok, err = moyu.save_items({"relax": [], "slack": [], "trivia": []})
+        check("三类全空被拒", ok is False and "至少留一条" in (err or ""), err)
+        ok, err = moyu.save_items({"relax": ["x" * (moyu.MAX_TEXT_LEN + 1)]})
+        check("单条超长被拒", ok is False and "太长" in (err or ""), err)
+        ok, err = moyu.save_items(
+            {"relax": [f"第{i}条" for i in range(moyu.MAX_PER_CAT + 1)]})
+        check("单类超条数被拒", ok is False and "超过上限" in (err or ""), err)
+        check("被拒时不写文件（还是上一次的内容）",
+              [it["text"] for it in moyu.load_items()] == ["换个内容"])
+
+        # 6) 读坏 / 空库 → 悄悄退回内置，别让「摸鱼」整个哑掉
+        with open(up, "w", encoding="utf-8") as fh:
+            fh.write("{坏掉的 json")
+        check("用户库读坏 → 退回内置",
+              moyu.load_items() == base and moyu.source() == "builtin")
+        with open(up, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "items": []}, fh)
+        check("用户库是空的 → 退回内置", len(moyu.load_items()) == len(base))
+        with open(up, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1,
+                       "items": [{"id": "a", "cat": "relax", "text": "x"}]}, fh)
+        check("用户库正常 → 就用它", moyu.source() == "user")
+
+        # 7) 恢复内置默认
+        ok, msg = moyu.reset_items()
+        check("恢复默认成功", ok is True and "已恢复" in msg, msg)
+        check("恢复后用户库文件没了", not os.path.exists(up))
+        check("恢复后 source()=builtin", moyu.source() == "builtin")
+        ok, msg = moyu.reset_items()
+        check("本来就用内置时再点一次：说人话、不当成错误",
+              ok is False and msg == "本来用的就是内置库", msg)
+
+        # 8) 空库文案指路 + stats
+        check("空库文案指向配置中心页签", "配置中心" in moyu.format_moyu([]))
+        _st = moyu.stats()
+        check("stats() 带 source / path",
+              _st["source"] == "builtin" and _st["path"] == up, str(_st))
+
+        # 9) 源码护栏
+        _msrc = open(os.path.join(ROOT, "moyu.py"), encoding="utf-8").read()
+        check("内置库只当种子（程序没有往 DATA 写的地方）",
+              'open(DATA' in _msrc
+              and not re.search(r'open\(\s*DATA\s*,\s*["\']w', _msrc))
+        check("用户库落数据目录而不是代码目录",
+              'USER_FILE = "moyu-user.json"' in _msrc and "data_path(USER_FILE)" in _msrc)
+        check("用户库进了 .gitignore",
+              "moyu-user.json" in open(os.path.join(ROOT, ".gitignore"),
+                                       encoding="utf-8").read())
+    finally:
+        moyu.user_path, moyu.RECENT = _orig_up, _orig_recent
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -1888,6 +2518,8 @@ def main():
     test_console_encoding()
     test_boomerang_export()
     test_offwork_paths()
+    test_onboarding()
+    test_moyu_library()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

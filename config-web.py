@@ -9,6 +9,7 @@
   ⑤ 一键开关「开机自启」（注册 / 删除 Windows 计划任务 `MoyuBot`）
   ⑥ 启动 / 停止 / 重启机器人，并自检依赖是否装齐
   ⑦ 管理忽略表（别把同群其他机器人当内容收）
+  ⑧ 改「摸鱼」随机抽的内容库（一行一条；改完立刻生效，不用重启）
 
 🔴 只监听 127.0.0.1 —— 这个页面能读写 `.env`（含密钥），绝不对外暴露。
 🔴 AppSecret 读回来只显示「已设置」，**不回显明文**；要改必须重新输入一遍。
@@ -50,6 +51,7 @@ sys.path.insert(0, HERE)
 import ignore as _ignore      # noqa: E402  （忽略表：规则读写）
 import settings as _settings  # noqa: E402  （本机设置：settings.json）
 import groups as _groups      # noqa: E402  （已发现的群 / 主动推送目标）
+import moyu as _moyu          # noqa: E402  （摸鱼库：内置库 / 用户自己那份）
 import version as _version    # noqa: E402  （版本号 + 「有没有新版本」检测）
 from paths import data_path, data_dir   # noqa: E402  （数据目录：可写文件落哪）
 
@@ -541,18 +543,15 @@ ENV_SPEC = {
     },
     "QQ_GROUP_OPENID": {
         "label": "目标群 openid", "group": "bot",
-        "help": "启动播报 / 关机播报发到哪些群。可以填多个，用分号隔开。"
-                "不用自己去翻日志找 —— 把机器人拉进群、在群里随便说句话，"
-                "下面「已发现的群」里就会出现，点「加入推送」自动填进来。",
+        "help": "启动播报 / 关机播报发到哪些群，多个用分号隔开。"
+                "不用自己找 openid —— 机器人收到群消息就会记下，"
+                "下面「已发现的群」里点一下就加进来。",
         "check": lambda v: None,
     },
     "QQ_BOT_SANDBOX": {
         "label": "沙箱环境", "group": "bot", "kind": "bool",
         "help": "QQ 开放平台的调试开关，默认关着，别动它。"
-                "① 什么时候开：只有你在自己调试、机器人还没提交审核时，才需要打开。"
-                "② 开了会怎样：机器人进入「沙箱环境」，只对你在 QQ 后台「沙箱配置」里"
-                "加过白名单的测试群 / 测试用户可见 —— 别人把机器人拉进正式群，收不到任何回复。"
-                "③ 给朋友用：必须关掉。关掉才是正式环境，所有群正常收发。",
+                "开着 = 机器人只对你后台加过白名单的测试群可见；给别人用必须关掉。",
         "check": lambda v: None,
     },
     "MEMO_TRIGGER": {
@@ -576,15 +575,20 @@ ENV_SPEC = {
     },
 }
 
-# 分组顺序 = 页面从上到下的顺序
+# 分组顺序 = 页签顺序 = 页面一次只显示一块
+# 🔴 分块原则：一个页签的内容要能**一屏装下**（不上下拉）。
+#    所以「播报文案」与「回执文案」分开 —— 三段长文案塞一块必然超屏。
 GROUPS = [
     ("bot", "① 连接 QQ", "在 https://q.qq.com 创建机器人后，把凭据填进来。必填。"),
-    ("behavior", "② 群内行为", "备忘触发词与两句播报文案。"),
-    ("files", "③ 发文件", "「发文件」功能的检索范围。"),
-    ("bubbles", "④ 脑内抽屉", "轮播页里放哪几类（备忘 / 灵感）。"),
-    ("boomerang", "⑤ 回旋镖", "把 N 天前的旧记录翻出来推回给用户（发「回旋镖」触发）。"),
-    ("runtime", "⑥ 运行方式", "开机自启、机器人进程、依赖自检。"),
-    ("ignore", "⑦ 忽略表", "别把同群里其他机器人的话当内容收进来。"),
+    ("behavior", "② 群内行为", "备忘触发词，以及记下备忘 / 收到灵感后回的那句话。"),
+    ("msg", "③ 播报文案", "机器人上线时说什么、关机时说什么、第一次连上时怎么介绍自己。"),
+    ("files", "④ 发文件", "「发文件」功能的检索范围。"),
+    ("bubbles", "⑤ 脑内抽屉", "轮播页里放哪几类（备忘 / 灵感）。"),
+    ("boomerang", "⑥ 回旋镖", "把 N 天前的旧记录翻出来推回给用户（发「回旋镖」触发）。"
+                              "回溯天数填 0 就翻今天记的 —— 刚上手也能玩。"),
+    ("runtime", "⑦ 运行方式", "开机自启、机器人进程、依赖自检。"),
+    ("ignore", "⑧ 忽略表", "别把同群里其他机器人的话当内容收进来。"),
+    ("moyu", "⑨ 摸鱼库", "「摸鱼」随机抽的那些内容，一行一条。改完保存立刻生效，不用重启。"),
 ]
 
 
@@ -621,7 +625,9 @@ def state_fields():
             "default": spec.get("default", ""),
         })
 
-    group_of = {"startup_msg": "behavior", "offwork_msg": "behavior", "bubbles_show": "bubbles",
+    group_of = {"startup_msg": "msg", "offwork_msg": "msg", "intro_msg": "msg",
+                "memo_ack": "behavior", "idea_ack": "behavior",
+                "bubbles_show": "bubbles",
                 "boomerang_days": "boomerang", "boomerang_scope": "boomerang"}
     for s in _settings.describe():
         out.append({
@@ -651,6 +657,16 @@ def full_state():
         "bot": {"running": bool(pid), "pid": pid, "task": st, "task_name": TASK_NAME},
         "deps": dep_report(),
         "ignore": {"env": _ignore.env_rules(), "file": _ignore.file_rules()},
+        "moyu": {
+            "source": _moyu.source(),                 # 'builtin' / 'user'
+            "path": _moyu.user_path(),
+            "groups": _moyu.as_texts(),               # {cat: [文本, ...]}
+            "cats": [{"key": c, "name": _moyu.CAT_NAME[c], "icon": _moyu.CAT_ICON[c],
+                      "help": _moyu.CAT_HELP[c]} for c in _moyu.CATS],
+            "max_text_len": _moyu.MAX_TEXT_LEN,
+            "max_per_cat": _moyu.MAX_PER_CAT,
+            "builtin_total": len(_moyu.builtin_items()),
+        },
         "paths": {"env": ENV_PATH, "settings": _settings.file_path(),
                   "search_root": roots[0] if roots else "",
                   "search_roots": roots, "here": HERE,
@@ -796,6 +812,12 @@ def make_handler(doc):
                     return self._send(200, {
                         "ok": True, "current": cur, "latest": far,
                         "has_update": _version.compare_version(far, cur) > 0,
+                        # ⬇ 直接下载安装包（GitHub Releases 直链；设了 MEMO_DOWNLOAD_BASE 就走自建源）
+                        "download": _version.download_url(far),
+                        "asset": _version.asset_name(far),
+                        # 直链打不开时的兜底：这一版的 Release 页 / 全部 Releases
+                        "release": _version.release_url(far),
+                        "releases": _version.releases_url(),
                         "url": _version.HOMEPAGE.format(repo=_version.REPO),
                     })
 
@@ -814,12 +836,29 @@ def make_handler(doc):
                                             "message": "已加入推送列表（重启机器人后生效）",
                                             "state": full_state()})
 
+                if path == "/api/moyu":
+                    if payload.get("reset"):
+                        ok, msg = _moyu.reset_items()
+                        return self._send(200 if ok else 400,
+                                          {"ok": ok, "message": msg if ok else None,
+                                           "error": None if ok else msg,
+                                           "state": full_state()})
+                    groups = payload.get("groups")
+                    if not isinstance(groups, dict):
+                        return self._send(400, {"ok": False, "error": "要指定 groups 或 reset"})
+                    ok, info = _moyu.save_items(groups)
+                    if not ok:
+                        return self._send(400, {"ok": False, "error": info})
+                    return self._send(200, {"ok": True,
+                                            "message": f"摸鱼库已保存（{info} 条），下次发「摸鱼」立刻生效",
+                                            "state": full_state()})
+
                 if path == "/api/open-folder":
                     # 🔴 只允许打开白名单里的这几个路径 —— 别让页面变成「打开任意目录」的口子
                     what = str(payload.get("what") or "")
                     targets = {"data": data_dir(), "db": data_path("memos.db"),
                                "env": ENV_PATH, "settings": _settings.file_path(),
-                               "log": BOT_LOG}
+                               "log": BOT_LOG, "moyu": _moyu.user_path()}
                     t = targets.get(what)
                     if not t:
                         return self._send(400, {"ok": False, "error": "不认识的路径"})
@@ -888,49 +927,81 @@ PAGE = r"""<!DOCTYPE html>
     --ok:#4fd1c5; --warn:#f6ad55; --bad:#fc8181;
   }
   *{box-sizing:border-box}
+  html,body{height:100%}
   body{
-    margin:0; padding:0 0 120px; color:var(--ink);
+    margin:0; padding:0; color:var(--ink); overflow:hidden;
+    display:flex; flex-direction:column;
     font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
     background:radial-gradient(ellipse 120% 80% at 50% -10%, #17334f 0%, #0d1a2b 45%, #070a11 100%);
     background-attachment:fixed; -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:820px; margin:0 auto; padding:0 18px}
-  header{padding:26px 0 18px}
-  header h1{margin:0; font-size:19px; font-weight:700; letter-spacing:.3px}
+  /* 🔴 一屏一块的骨架：头 / 页签 / 底部按钮条都固定，只有中间内容区滚动。
+     这样切页签时页面不会跳，也不会出现「一路往下拉看不到头」的长页面。
+     🔴 宽度定 880 是为了让九个页签排得下一行（见下面 .tab 的说明）。 */
+  .wrap{flex:1 1 auto; min-height:0; display:flex; flex-direction:column;
+        width:100%; max-width:880px; margin:0 auto; padding:0 18px}
+  header{flex:0 0 auto; padding:14px 0 8px}
+  header h1{margin:0; font-size:18px; font-weight:700; letter-spacing:.3px}
   header h1 span{color:var(--dim); font-weight:400; font-size:12.5px; margin-left:8px}
-  .statusline{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px}
+  .statusline{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px}
   .dot{width:9px; height:9px; border-radius:50%; background:var(--dim); flex:0 0 auto}
   .dot.on{background:var(--ok); box-shadow:0 0 10px rgba(79,209,197,.75)}
   .dot.off{background:var(--bad)}
   .hint{
-    margin-top:14px; padding:11px 14px; border-radius:12px; font-size:13px;
+    margin-top:10px; padding:10px 14px; border-radius:12px; font-size:12.5px;
     background:rgba(246,173,85,.1); border:1px solid rgba(246,173,85,.4); color:#f6c98a;
   }
   .hint.good{background:rgba(79,209,197,.1); border-color:rgba(79,209,197,.38); color:#8fe6dc}
 
+  /* 页签条：一次只显示一块，避免长页面上下拉。
+     🔴 未配置 QQ 凭据时整条隐藏（只留「① 连接 QQ」）。 */
+  .tabs{
+    flex:0 0 auto; display:flex; gap:5px; flex-wrap:wrap; padding:2px 0 8px; margin:0;
+  }
+  .tabs.hide{display:none}
+  /* 分区内部的次级切换（摸鱼库的「放松 / 摸鱼 / 冷知识」） */
+  .tabs.mini{padding:0 0 8px}
+  /* 🔴 九个分区必须排成一行。排不下就会折成两行、白白吃掉 40px 高度，
+     把「① 连接 QQ」「⑦ 运行方式」挤到一屏之外。所以这里刻意压紧：
+     字号 12px、横向内边距 10px —— 改标题时留意总量别超过内容宽（约 784px）。 */
+  .tab{
+    padding:5px 10px; border-radius:9px; cursor:pointer; white-space:nowrap;
+    font:12px/1.2 inherit; color:var(--dim); transition:.15s;
+    background:rgba(255,255,255,.05); border:1px solid var(--line);
+  }
+  .tab:hover{background:rgba(255,255,255,.13); color:var(--ink)}
+  .tab.on{background:rgba(79,209,197,.16); border-color:rgba(79,209,197,.5);
+    color:var(--ok); font-weight:600}
+
+  /* 内容区：唯一会滚的地方（而且只在某个分区真的装不下时才滚） */
+  #sections{flex:1 1 auto; min-height:0; overflow-y:auto; padding-bottom:6px}
+
   section{
-    margin:14px 0; border-radius:16px; overflow:hidden;
+    margin:0 0 12px; border-radius:16px; overflow:hidden;
     background:rgba(20,28,42,.82); border:1px solid var(--line);
   }
   section > h2{
-    margin:0; padding:14px 18px 0; font-size:14.5px; font-weight:700;
+    margin:0; padding:12px 18px 0; font-size:14.5px; font-weight:700;
   }
   section > .desc{padding:3px 18px 0; font-size:12px; color:var(--dim)}
-  section > .body{padding:6px 18px 16px}
-  .f{padding:13px 0; border-bottom:1px solid rgba(255,255,255,.07)}
+  section > .body{padding:4px 18px 12px}
+  .f{padding:10px 0; border-bottom:1px solid rgba(255,255,255,.07)}
   .f:last-child{border-bottom:none}
-  .f .lb{font-size:13.5px; font-weight:600; display:flex; align-items:center; gap:7px}
+  .f .lb{font-size:13px; font-weight:600; display:flex; align-items:center; gap:7px}
   .f .lb .req{font-size:10.5px; color:var(--warn); border:1px solid rgba(246,173,85,.5);
     border-radius:5px; padding:0 5px; font-weight:400}
   .f .lb .tag{font-size:10.5px; color:var(--dim); border:1px solid var(--line);
     border-radius:5px; padding:0 5px; font-weight:400}
-  .f .hp{font-size:11.5px; color:var(--dim); margin:3px 0 8px; line-height:1.65}
+  .f .hp{font-size:11.5px; color:var(--dim); margin:2px 0 7px; line-height:1.55}
   .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
   input[type=text],input[type=password]{
     flex:1 1 260px; min-width:0; padding:9px 11px; border-radius:10px;
     background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1.4 inherit;
   }
+  /* 单行文本框直接挂在 .f 下面（不在 .row 里），flex 不生效 → 会缩成默认宽度。
+     这里补一条让它铺满，跟 textarea 对齐。 */
+  .f > input[type=text]{width:100%}
   textarea{
     width:100%; box-sizing:border-box; padding:9px 11px; border-radius:10px;
     background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
@@ -952,6 +1023,14 @@ PAGE = r"""<!DOCTYPE html>
   button.danger{border-color:rgba(252,129,129,.45); color:#fc8181}
   button.danger:hover{background:rgba(252,129,129,.14)}
   button:disabled{opacity:.45; cursor:default}
+  /* 「⬇ 下载新版」是个 <a>（要能右键复制链接 / 新窗口打开），外观跟主按钮一致 */
+  a.dlbtn{
+    display:inline-block; padding:8px 14px; border-radius:10px; text-decoration:none;
+    background:rgba(79,209,197,.16); border:1px solid rgba(79,209,197,.5); color:var(--ok);
+    font:13px/1 inherit; transition:.15s;
+  }
+  a.dlbtn:hover{background:rgba(79,209,197,.3)}
+  a.plain{color:var(--ok); text-decoration:none; border-bottom:1px dashed rgba(79,209,197,.5)}
   .chks{display:flex; gap:16px; flex-wrap:wrap}
   .chks label{display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer}
   .chks input{accent-color:#4fd1c5; width:15px; height:15px}
@@ -960,14 +1039,17 @@ PAGE = r"""<!DOCTYPE html>
   .note{font-size:12px; color:var(--dim); margin-top:7px}
   .note.ok{color:#8fe6dc}
   .note.bad{color:#fc8181}
-  .deps{display:flex; flex-direction:column; gap:5px; margin-top:4px}
-  .deps .dep{align-items:flex-start}
-  .pth{font:11.5px/1.55 ui-monospace,Consolas,"Courier New",monospace; color:var(--dim);
-       word-break:break-all; flex:1 1 auto; min-width:0}
+  /* 清单类（依赖自检 / 数据文件位置 / 已发现的群）：单行 + 省略号，
+     路径悬停看全文 —— 这样「⑦ 运行方式」才能一屏装下。 */
+  .deps{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+        gap:4px 18px; margin-top:4px}
+  .dep{display:flex; align-items:baseline; gap:8px; font-size:12.5px; min-width:0}
+  .dep b{font-weight:600; min-width:118px; flex:0 0 auto}
+  .dep .m{color:var(--dim); font-size:11.5px; flex:1 1 auto; min-width:0;
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .pth{font:11.5px/1.5 ui-monospace,Consolas,"Courier New",monospace; color:var(--dim)}
   .deps .dep button{flex:0 0 auto}
-  .dep{display:flex; align-items:baseline; gap:8px; font-size:12.5px}
-  .dep b{font-weight:600; min-width:130px}
-  .dep .m{color:var(--dim); font-size:11.5px; word-break:break-all}
+  .dep > .g, .dep > .b{flex:0 0 auto}
   .dep .g{color:var(--ok)} .dep .b{color:var(--bad)}
   .rules{display:flex; flex-direction:column; gap:6px; margin-top:8px}
   .rule{display:flex; align-items:center; gap:8px; font-size:12.5px;
@@ -976,8 +1058,8 @@ PAGE = r"""<!DOCTYPE html>
   .rule button{padding:4px 9px; font-size:11.5px}
 
   .savebar{
-    position:fixed; left:0; right:0; bottom:0; z-index:20;
-    display:flex; align-items:center; gap:10px; padding:13px 18px;
+    flex:0 0 auto; z-index:20;
+    display:flex; align-items:center; gap:10px; padding:11px 18px;
     background:rgba(10,16,26,.94); border-top:1px solid var(--line);
     -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
   }
@@ -1012,6 +1094,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="statusline" id="statusline"></div>
     <div id="banner"></div>
   </header>
+  <div id="tabs" class="tabs hide"></div>
   <div id="sections"></div>
 </div>
 
@@ -1039,6 +1122,9 @@ const FLAG = {"X-Memo-Config": "1"};
 let S = null;          // /api/state
 let DIRTY = {};        // key -> 新值（只放改动过的）
 let PICK_TARGET = null;
+let ACTIVE_TAB = null; // 当前显示的页签 key；未配置凭据时恒为 'bot'
+let MOYU_CAT = null;   // 摸鱼库页签里当前看的是哪一类（relax / slack / trivia）
+let MOYU_DIRTY = {};   // 摸鱼库：cat -> 输入框原文（只放改动过的）
 
 const $ = id => document.getElementById(id);
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -1057,8 +1143,29 @@ function toast(t){ const el = $('toast'); el.textContent = t; el.classList.add('
 /* ── 渲染 ─────────────────────────────────────────────────── */
 function render(){
   renderStatus();
+  renderTabs();
   renderSections();
   renderBanner();
+}
+
+/* 现在能看到的页签。🔴 没配好 QQ 凭据时只放「① 连接 QQ」——
+   后面那些设置没有凭据也用不上，先不给，免得一上来就是一片字。 */
+function visibleGroups(){
+  if(!S.ready) return S.groups.filter(g => g.key === 'bot');
+  return S.groups;
+}
+
+function renderTabs(){
+  const bar = $('tabs');
+  if(!S.ready){ bar.classList.add('hide'); bar.innerHTML = ''; ACTIVE_TAB = 'bot'; return; }
+  const gs = visibleGroups();
+  if(!ACTIVE_TAB || !gs.some(g => g.key === ACTIVE_TAB)) ACTIVE_TAB = gs[0].key;
+  bar.classList.remove('hide');
+  bar.innerHTML = gs.map(g =>
+    '<button class="tab' + (g.key === ACTIVE_TAB ? ' on' : '') + '" data-tab="' + esc(g.key) + '">'
+    + esc(g.title) + '</button>').join('');
+  bar.querySelectorAll('[data-tab]').forEach(b =>
+    b.addEventListener('click', () => { ACTIVE_TAB = b.dataset.tab; render(); }));
 }
 
 function renderStatus(){
@@ -1084,9 +1191,14 @@ function taskText(t){
 
 function renderBanner(){
   const el = $('banner');
-  if(S.ready){ el.innerHTML = '<div class="hint good">✅ QQ 凭据已就绪，机器人可以启动。</div>'; return; }
-  el.innerHTML = '<div class="hint">⚠️ 还没配好 QQ 凭据 —— 填好下面「① 连接 QQ」里的 '
-    + 'AppID 和 AppSecret 再保存，机器人才能启动。<br>'
+  // 凭据齐了就不占这一条 —— 状态行已经写着「机器人运行中」，重复提示只是白占一屏高度
+  if(S.ready){ el.innerHTML = ''; return; }
+  // 后面还有哪些页签，直接从后端给的 GROUPS 里取，不手写一份（免得改了分组这里忘了改）
+  const rest = S.groups.filter(g => g.key !== 'bot')
+    .map(g => g.title.replace(/^[①②③④⑤⑥⑦⑧⑨⑩]\s*/, '')).join(' / ') || '其它设置';
+  el.innerHTML = '<div class="hint">⚠️ 还没配好 QQ 凭据 —— 先把下面「① 连接 QQ」里的 '
+    + 'AppID 和 AppSecret 填上并保存。<br>'
+    + '保存之后，其余设置（' + esc(rest) + '）才会以页签的形式出现。<br>'
     + '凭据在 <a href="https://q.qq.com" target="_blank" rel="noopener" '
     + 'style="color:#f6c98a">q.qq.com</a> 创建机器人后拿。</div>';
 }
@@ -1132,6 +1244,9 @@ function fieldHTML(f){
       + '<div class="row"><button data-browse="' + f.key + '">＋ 加一个目录</button>'
       + '<button data-test="' + f.key + '">测试</button></div>'
       + '<div class="note" data-note="' + f.key + '"></div>';
+  } else if(f.kind === 'area'){
+    ctl = '<textarea data-k="' + f.key + '" rows="5" spellcheck="false">'
+      + esc(v) + '</textarea>';
   } else {
     ctl = '<input type="text" data-k="' + f.key + '" value="' + esc(v) + '">';
   }
@@ -1148,14 +1263,16 @@ function groupOf(key){
 }
 
 function renderSections(){
+  const gs = visibleGroups();
+  const g = gs.find(x => x.key === ACTIVE_TAB) || gs[0];
   let html = '';
-  for(const g of S.groups){
-    if(g.key === 'runtime'){ html += runtimeSection(g); continue; }
-    if(g.key === 'ignore'){ html += ignoreSection(g); continue; }
-    if(g.key === 'bot'){ html += botSection(g); continue; }
+  if(g.key === 'runtime') html = runtimeSection(g);
+  else if(g.key === 'ignore') html = ignoreSection(g);
+  else if(g.key === 'moyu') html = moyuSection(g);
+  else if(g.key === 'bot') html = botSection(g);
+  else {
     const fs = S.fields.filter(f => f.group === g.key);
-    if(!fs.length) continue;
-    html += '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    html = '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
       + '</div><div class="body">' + fs.map(fieldHTML).join('') + '</div></section>';
   }
   $('sections').innerHTML = html;
@@ -1164,27 +1281,33 @@ function renderSections(){
 
 function botSection(g){
   const fs = S.fields.filter(f => f.group === g.key);
+  // 凭据还没齐时不显示「已发现的群」—— 那时机器人根本没连上，列表必然是空的
   return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
     + '</div><div class="body">' + fs.map(fieldHTML).join('')
-    + discoveredGroupsHTML() + '</div></section>';
+    + (S.ready ? discoveredGroupsHTML() : '') + '</div></section>';
 }
 
 function discoveredGroupsHTML(){
   const gs = S.groups_found || [];
   const tg = S.group_targets || [];
-  const rows = gs.length ? gs.map(g => {
+  if(!gs.length){
+    // 一条都没发现时只给一行提示 —— 别为一张空列表占掉半屏
+    return '<div class="f"><div class="lb">已发现的群</div>'
+      + '<div class="note">还没发现群 —— 把机器人拉进群、在群里随便说句话'
+      + '（@ 它，或者发一条备忘），这里就会出现。</div></div>';
+  }
+  const rows = gs.map(g => {
     const on = tg.includes(g.openid);
     return '<div class="dep"><b>' + esc(g.name || '（还没拿到群名）') + '</b>'
       + '<span class="m pth" title="' + esc(g.openid) + '">' + esc(g.openid) + '</span>'
       + (on ? '<span class="note ok">已在推送列表</span>'
             : '<button data-addgroup="' + esc(g.openid) + '">＋ 加入推送</button>')
       + '</div>';
-  }).join('') : '<div class="note">还没发现群 —— 把机器人拉进一个群，'
-    + '在群里随便说句话（@ 它，或者发一条备忘），这里就会出现。</div>';
+  }).join('');
   return '<div class="f"><div class="lb">已发现的群</div>'
     + '<div class="hp">机器人每收到一条群消息就会记下这个群。'
     + '点「加入推送」＝把它的 openid 追加到上面的「目标群 openid」，'
-    + '启动播报 / 关机播报就会发过去。不用自己去翻日志找 openid。</div>'
+    + '启动播报 / 关机播报就会发过去。</div>'
     + '<div class="deps">' + rows + '</div></div>';
 }
 
@@ -1206,7 +1329,7 @@ function runtimeSection(g){
   const deps = S.deps.map(d =>
     '<div class="dep"><b>' + esc(d.name) + '</b><span class="'
     + (d.ok ? 'g' : 'b') + '">' + (d.ok ? '✓' : '✗') + '</span>'
-    + '<span class="m">' + esc(d.detail) + '</span></div>').join('');
+    + '<span class="m" title="' + esc(d.detail) + '">' + esc(d.detail) + '</span></div>').join('');
   return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
     + '</div><div class="body">'
     + '<div class="f"><div class="lb">开机自启</div>'
@@ -1216,24 +1339,29 @@ function runtimeSection(g){
     + '<span class="note">当前：' + esc(taskText(S.bot.task)) + '（计划任务 '
     + esc(S.bot.task_name) + '）</span></div></div>'
     + '<div class="f"><div class="lb">依赖自检</div>'
-    + '<div class="hp">缺「必需」的装不上就启动不了；带「渲染成图片用」的缺了只是发文件时降级成文件卡片。</div>'
+    + '<div class="hp">缺「必需」的启动不了；带「渲染成图片用」的缺了只是发文件时降级成文件卡片。</div>'
     + '<div class="deps">' + deps + '</div></div>'
     + '<div class="f"><div class="lb">数据文件位置</div>'
-    + '<div class="hp">备忘和灵感都在本地数据库里，配置在下面这几个文件里。'
-    + '点「打开」会在资源管理器里定位过去 —— 想拿数据自己处理（或者丢给 AI 分析）时从这里取。</div>'
+    + '<div class="hp">备忘和灵感在本地数据库里，配置在这几个文件里。'
+    + '点「打开」定位过去 —— 想自己处理数据（或丢给 AI 分析）时从这里取。</div>'
     + '<div class="deps">' + pathRows() + '</div></div>'
     + '<div class="f"><div class="lb">版本</div>'
-    + '<div class="hp">更新方式：拿新版的文件覆盖过去就行，数据不受影响'
-    + '（数据在「数据文件位置」那几个地方）。</div>'
+    + '<div class="hp">更新：点「⬇ 下载新版」拿安装包（文件名带版本号），双击装上就行 —— '
+    + '装到同一个目录，你的数据（备忘 / 灵感 / 配置）不受影响。</div>'
     + '<div class="row"><span class="note" id="ver-note">v' + esc(S.version || '?') + '</span>'
-    + '<button id="btn-update">检查更新</button></div></div>'
-    + '</div></section>';
+    + '<button id="btn-update">检查更新</button>'
+    + '<a id="ver-dl" class="dlbtn" style="display:none" target="_blank" rel="noopener">⬇ 下载新版</a></div>'
+    + '<div class="note" id="ver-file" style="display:none"></div></div></div>';
 }
 
 async function checkUpdate(auto){
   const note = $('ver-note');
+  const dl = $('ver-dl');
+  const fileNote = $('ver-file');
   const cur = (S && S.version) || '?';
   if(note) note.textContent = 'v' + cur + '（检查中…）';
+  if(dl) dl.style.display = 'none';
+  if(fileNote) fileNote.style.display = 'none';
   let j;
   try{ j = await api('/api/update-check', {}); }
   catch(e){
@@ -1245,7 +1373,21 @@ async function checkUpdate(auto){
     else if(j.has_update) note.textContent = '有新版 v' + j.latest + '（当前 v' + j.current + '）';
     else note.textContent = 'v' + j.current + '（已是最新）';
   }
-  if(j.ok && j.has_update) toast('有新版本 v' + j.latest + ' —— ' + (j.url || ''));
+  if(j.ok && j.has_update && dl){
+    // 🔴 优先给**直接下载**的链接；直链打不开时页面上还有 Releases 兜底入口
+    dl.href = j.download || j.release || j.releases || j.url || '#';
+    dl.textContent = '⬇ 下载 v' + j.latest;
+    dl.style.display = '';
+    if(fileNote && j.asset){
+      fileNote.innerHTML = '安装包：' + esc(j.asset)
+        + '　·　打不开直链？去 <a class="plain" href="' + esc(j.release || j.releases || '#')
+        + '" target="_blank" rel="noopener">Releases 页面</a> 手动下';
+      fileNote.style.display = '';
+    }
+    toast('有新版本 v' + j.latest + ' —— 点「⬇ 下载 v' + j.latest + '」');
+  } else if(j.ok && auto === false){
+    toast('已经是最新版 v' + (j.current || cur));
+  }
 }
 
 function ignoreSection(g){
@@ -1268,6 +1410,63 @@ function ignoreSection(g){
     + '<button class="danger" id="rule-clear">清空本地规则</button></div></div>'
     + '<div class="f"><div class="lb">当前生效 ' + (envs.length + files.length) + ' 条</div>'
     + '<div class="rules">' + rows + '</div></div>'
+    + '</div></section>';
+}
+
+/* ── 摸鱼库 ───────────────────────────────────────────────── */
+/* 三类各是一个大输入框，三个并排必然超一屏 → 上面一排小按钮切着看。
+   值的来源：改过的在 MOYU_DIRTY，没改过的取 S.moyu.groups。 */
+function moyuLines(v){
+  const out = [], seen = new Set();
+  String(v == null ? '' : v).split('\n').forEach(s => {
+    s = s.trim();
+    if(s && !seen.has(s)){ seen.add(s); out.push(s); }
+  });
+  return out;   // 去空行 + 去重 —— 跟后端保存时的处理一致，页面上显示的条数才对得上
+}
+
+function moyuValue(cat){
+  if(cat in MOYU_DIRTY) return MOYU_DIRTY[cat];
+  return (((S.moyu || {}).groups || {})[cat] || []).join('\n');
+}
+
+function moyuSection(g){
+  const M = S.moyu || {};
+  const cats = M.cats || [];
+  if(!cats.length){
+    return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+      + '</div><div class="body"><div class="note bad">'
+      + '摸鱼库读不出来 —— 发「摸鱼」会没反应。</div></div></section>';
+  }
+  if(!MOYU_CAT || !cats.some(c => c.key === MOYU_CAT)) MOYU_CAT = cats[0].key;
+  const cur = cats.find(c => c.key === MOYU_CAT);
+  const total = cats.reduce((n, c) => n + moyuLines(moyuValue(c.key)).length, 0);
+  const picker = cats.map(c =>
+    '<button class="tab' + (c.key === cur.key ? ' on' : '') + '" data-moyucat="' + esc(c.key) + '">'
+    + esc(c.icon + ' ' + c.name + ' ' + moyuLines(moyuValue(c.key)).length) + '</button>').join('');
+  const used = M.source === 'user'
+    ? ('现在用的是你自己这份库（三类共 ' + total + ' 条）')
+    : ('现在用的是内置库（三类共 ' + total + ' 条，还没改过）');
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">'
+    + '<div class="f"><div class="lb">分哪三类</div>'
+    + '<div class="hp">' + esc(used + '。一类一个框，上面切着看。'
+        + '改完点最下面「保存」—— 下次发「摸鱼」立刻生效，不用重启。') + '</div>'
+    + '<div class="tabs mini">' + picker + '</div>'
+    + '<div class="hp">' + esc(cur.help) + '</div>'
+    + '<textarea data-moyu="' + esc(cur.key) + '" rows="12" spellcheck="false" '
+    + 'placeholder="一行一条，例如：站起来走 30 秒">' + esc(moyuValue(cur.key)) + '</textarea>'
+    + '<div class="note">当前这一类 <b class="cnt">' + moyuLines(moyuValue(cur.key)).length
+    + '</b>' + esc(' 条 · 一行一条 · 空行忽略 · 同类重复的自动去掉 · 单条最长 '
+        + M.max_text_len + ' 字 · 每类最多 ' + M.max_per_cat + ' 条') + '</div>'
+    + '</div>'
+    + '<div class="f"><div class="lb">想改回来</div>'
+    + '<div class="hp">' + esc('丢掉你改过的这份，回到随程序走的内置库（'
+        + M.builtin_total + ' 条）。内置库一直都在，随时能回来。') + '</div>'
+    + '<div class="row"><button class="danger" id="moyu-reset">恢复内置默认</button>'
+    + '<button id="moyu-open">打开库文件位置</button>'
+    + '<span class="note pth" title="' + esc(M.path || '') + '">' + esc(M.path || '')
+    + '</span></div></div>'
     + '</div></section>';
 }
 
@@ -1350,6 +1549,39 @@ function bindFields(){
       toast(j.ok ? j.message : ('失败：' + j.error));
       render();
     }));
+
+  // 摸鱼库：输入即记进 MOYU_DIRTY（切页签 / 切分类都不丢），保存时才提交
+  document.querySelectorAll('[data-moyu]').forEach(t =>
+    t.addEventListener('input', () => {
+      MOYU_DIRTY[t.dataset.moyu] = t.value;
+      const c = t.parentNode.querySelector('.cnt');
+      if(c) c.textContent = moyuLines(t.value).length;
+    }));
+  document.querySelectorAll('[data-moyucat]').forEach(b =>
+    b.addEventListener('click', () => {
+      const t = document.querySelector('[data-moyu]');
+      if(t) MOYU_DIRTY[t.dataset.moyu] = t.value;   // 先把当前这类的改动存住再切
+      MOYU_CAT = b.dataset.moyucat;
+      renderSections();
+    }));
+  const mrs = $('moyu-reset');
+  if(mrs) mrs.addEventListener('click', async () => {
+    const n = (S.moyu || {}).builtin_total || '';
+    if(!confirm('丢掉你改过的这份摸鱼库，恢复内置的 ' + n + ' 条？')) return;
+    const j = await api('/api/moyu', {reset: true});
+    if(j.state) S = j.state;
+    MOYU_DIRTY = {};
+    // 后端两种情况都给了人话（「已恢复内置摸鱼库」/「本来用的就是内置库」），直接用
+    const msg = j.message || j.error || '已恢复内置摸鱼库';
+    $('savemsg').textContent = msg;
+    toast(msg);
+    render();
+  });
+  const mop = $('moyu-open');
+  if(mop) mop.addEventListener('click', async () => {
+    const j = await api('/api/open-folder', {what: 'moyu'});
+    if(!j.ok) toast('打不开：' + (j.error || ''));
+  });
 }
 
 /* ── 保存 ─────────────────────────────────────────────────── */
@@ -1372,9 +1604,18 @@ function splitDirty(){
   return {env: env, st: st};
 }
 
+/* 摸鱼库提交的是**整库**：改过的那几类用输入框里的，没改过的照原样带上。
+   这样只动一类也不会把另外两类弄丢。 */
+function moyuPayload(){
+  const out = {};
+  for(const c of ((S.moyu || {}).cats || [])) out[c.key] = moyuLines(moyuValue(c.key));
+  return out;
+}
+
 async function save(){
   const {env, st} = splitDirty();
-  if(!Object.keys(env).length && !Object.keys(st).length){
+  const moyu = Object.keys(MOYU_DIRTY).length ? moyuPayload() : null;
+  if(!Object.keys(env).length && !Object.keys(st).length && !moyu){
     $('savemsg').textContent = '没有改动';
     return true;
   }
@@ -1388,8 +1629,16 @@ async function save(){
     if(!j.ok){ $('savemsg').textContent = '保存失败：' + j.error; toast('保存失败：' + j.error); return false; }
     if(j.state) S = j.state;
   }
+  if(moyu){
+    const j = await api('/api/moyu', {groups: moyu});
+    if(!j.ok){ $('savemsg').textContent = '保存失败：' + j.error; toast('保存失败：' + j.error); return false; }
+    if(j.state) S = j.state;
+    MOYU_DIRTY = {};
+  }
   DIRTY = {};
-  $('savemsg').textContent = '已保存 ✓（改凭据 / 触发词 / 搜索根要重启机器人才生效）';
+  $('savemsg').textContent = moyu
+    ? '已保存 ✓（摸鱼库立刻生效；改凭据 / 触发词 / 搜索根要重启机器人才生效）'
+    : '已保存 ✓（改凭据 / 触发词 / 搜索根要重启机器人才生效）';
   toast('已保存 ✓');
   render();
   return true;

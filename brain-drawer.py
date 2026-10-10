@@ -1,11 +1,11 @@
 """把「我要做」和「我的想法」渲染成一个不停往上飘的卡片轮播页，并支持在页面上直接处理。
 
 这个文件是干嘛的：读 `memos.db` 里的**备忘 + 灵感** → 生成一个不停往上飘的气泡轮播页，
-点卡片就能处理（备忘勾掉 / 灵感改状态），**在页面上直接写库**，不用导出任何文件。
+点卡片就能处理（备忘完成 / 灵感改状态），**在页面上直接写库**，不用导出任何文件。
 
 🔴 两类内容的分工（这是这个页面存在的理由）：
-  - **备忘（`kind='memo'`）= 我要做**：只有「没勾掉 / 已勾掉」两种，卡片左上角一个勾选框，
-    点一下就勾掉；勾掉的进「✓ 已勾掉」列表，随时能取消。
+  - **备忘（`kind='memo'`）= 我要做**：没完成 / 已完成 / 已丢弃 三种，卡片左上角一个勾选框，
+    点一下就完成；完成的进「✓ 已完成」列表，随时能取消。也可以直接丢弃。
   - **灵感（`kind='idea'`）= 我的想法**：有 待处理 / 已处理 / 已决议 / 已丢弃 四个状态。
   备忘以前只有群指令、没有界面，处理链路是断的 —— 这个页面把它补上。
 
@@ -14,18 +14,22 @@
   python brain-drawer.py                       # 只生成静态 HTML → 工作区根 脑内抽屉.html
   python brain-drawer.py --apply 抽屉操作.json  # 应用离线模式导出的操作
   python brain-drawer.py -o out.html
-  python brain-drawer.py --open-only           # 不加载归档，只带「没勾掉的备忘 + 待处理灵感」
+  python brain-drawer.py --open-only           # 不加载归档，只带「没完成的备忘 + 待处理灵感」
   python brain-drawer.py --no-memo             # 不带备忘，只看灵感
 
 视图：
   - **内容流放哪几类由设置决定**（`bubbles_show`，默认「备忘 + 待处理」）。
     顶部「⚙ 设置」里勾选，改的是 `memo-bot/settings.json` ——
     和配置中心网页、机器人「设置」指令写的是同一份。
-  - 顶部四个按钮「✓ 已勾掉 / ✅ 已处理 / 📌 已决议 / 🗑 垃圾桶」，点开在列表里看，
+  - 顶部四个按钮「✓ 已完成 / ✅ 已处理 / 📌 已决议 / 🗑 垃圾桶」，点开在列表里看，
     列表里可以「← 恢复」把某条放回内容流。
   - **有结论的条目会把结论一起显示**（气泡里在正文下方、虚线隔开一段「结论：…」）。
     没有结论就不显示 —— 和以前一样。
-  - 勾掉 ≠ 删除、丢弃 ≠ 删除：记录还在库里，只是换个桶，随时可恢复。
+  - **每条都能改正文**：浮层里点「✏️ 编辑」、或归档列表行里的「✏️ 编辑」，
+    改完**创建时间不变**（回顾时发现写错字 / 有了新想法，随时改）。
+  - 完成 ≠ 删除、丢弃 ≠ 删除：记录还在库里，只是换个桶，随时可恢复。
+    🔴 唯一会真删的是「已丢弃」列表里的「永久删除」—— 点它会先弹确认框
+       （带「以后不再提示」勾选框），确认后**从库里抹掉，找不回来**。
 
 设计：
   - 气泡从底部升起、横向漂移、顶部淡出，循环不停。
@@ -88,14 +92,15 @@ STATUS_LABEL = {
 STATUS_ORDER = ("open", "done", "decided", "dropped")
 VALID_STATUS = set(STATUS_ORDER)
 
-# 🔴 备忘（kind='memo'）= 我要做，只有「没勾掉 / 已勾掉」两种；
+# 🔴 备忘（kind='memo'）= 我要做，有「没完成 / 已完成 / 已丢弃」三种；
 #    灵感 = 我的想法，有上面那四个状态。两条流共用一个页面，所以统一用「桶」来分流：
 #    桶名既是 `bubbles_show` 设置里的取值，也直接当卡片的 `data-s`（配色 / 文案都按它查）。
-BUCKET_MEMO = "memo"              # 备忘 · 没勾掉
-BUCKET_MEMO_DONE = "memo_done"    # 备忘 · 已勾掉
+# 🔴 「已丢弃」是两类**共用**的桶 —— 丢弃的备忘和丢弃的灵感都进 `dropped`。
+BUCKET_MEMO = "memo"              # 备忘 · 没完成
+BUCKET_MEMO_DONE = "memo_done"    # 备忘 · 已完成
 BUCKET_LABEL = {
     BUCKET_MEMO: "备忘",
-    BUCKET_MEMO_DONE: "备忘 · 已勾掉",
+    BUCKET_MEMO_DONE: "备忘 · 已完成",
     "open": "待处理",
     "done": "已处理",
     "decided": "已决议",
@@ -104,11 +109,17 @@ BUCKET_LABEL = {
 BUCKET_ORDER = (BUCKET_MEMO, BUCKET_MEMO_DONE, "open", "done", "decided", "dropped")
 
 
+def memo_bucket(status):
+    """备忘的状态 → 它的桶名。`dropped` 与灵感共用同一个桶。"""
+    if status == store.STATUS_DROPPED:
+        return store.STATUS_DROPPED
+    return BUCKET_MEMO_DONE if status == store.STATUS_DONE else BUCKET_MEMO
+
+
 def bucket_of(row):
     """一条库里的记录 → 它在页面上的桶名。"""
     if (row.get("kind") or store.KIND_MEMO) == store.KIND_MEMO:
-        done = (row.get("status") or "") == store.STATUS_DONE
-        return BUCKET_MEMO_DONE if done else BUCKET_MEMO
+        return memo_bucket(row.get("status") or store.STATUS_OPEN)
     st = row.get("status") or store.STATUS_OPEN
     return st if st in STATUS_LABEL else store.STATUS_OPEN
 
@@ -291,8 +302,42 @@ TEMPLATE = r"""<!doctype html>
     background:rgba(20,28,42,.94); border:1px solid var(--line);
     box-shadow:0 24px 70px rgba(0,0,0,.6);
   }
-  #modal .meta{font-size:11.5px; color:var(--dim); letter-spacing:.6px; margin-bottom:12px}
+  #modal .meta{
+    display:flex; align-items:center; gap:10px;
+    font-size:11.5px; color:var(--dim); letter-spacing:.6px; margin-bottom:12px;
+  }
+  #modal .meta .mtxt{flex:1 1 auto; min-width:0}
+  /* 「✏️ 编辑」入口 —— 改正文用；创建时间不变（这是用户明确要求） */
+  #modal .meta .editbtn{
+    flex:0 0 auto; padding:4px 10px; border-radius:8px; cursor:pointer;
+    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--dim);
+    font:11.5px/1 inherit; letter-spacing:0; transition:.15s;
+  }
+  #modal .meta .editbtn:hover{
+    color:var(--open); border-color:rgba(79,209,197,.5); background:rgba(79,209,197,.12);
+  }
   #modal .body{font-size:16px; line-height:1.8; white-space:pre-wrap; word-break:break-word}
+  /* 编辑态：正文换成这个 textarea（.body 同时隐藏） */
+  #modal .editbox{
+    width:100%; padding:12px 13px; border-radius:12px; min-height:130px; resize:vertical;
+    background:rgba(255,255,255,.06); border:1px solid rgba(79,209,197,.45);
+    color:var(--ink); font:15px/1.8 inherit; white-space:pre-wrap;
+  }
+  #modal .editbox:focus{outline:none; border-color:rgba(79,209,197,.72)}
+  #modal .editrow{display:flex; align-items:center; gap:9px; margin-top:11px}
+  #modal .editrow .ehint{margin-right:auto; font-size:11.5px; color:var(--dim)}
+  #modal .editrow .ehint b{color:#68d391; font-weight:600}
+  #modal .editrow button{
+    padding:9px 15px; border-radius:10px; cursor:pointer; transition:.16s;
+    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--ink);
+    font:13.5px/1 inherit;
+  }
+  #modal .editrow button:hover{background:rgba(255,255,255,.14)}
+  #modal .editrow button.primary{
+    background:rgba(79,209,197,.16); border-color:rgba(79,209,197,.5); color:#4fd1c5;
+  }
+  #modal .editrow button.primary:hover{background:rgba(79,209,197,.28)}
+  #modal .editrow button[disabled]{opacity:.5; cursor:default; transform:none}
   #modal .hint{margin-top:18px; font-size:11.5px; color:var(--dim); line-height:1.7}
 
   /* 处理操作区 */
@@ -314,6 +359,7 @@ TEMPLATE = r"""<!doctype html>
   #modal .actions button[data-act="decided"]:hover{border-color:var(--decided); color:var(--decided)}
   #modal .actions button[data-act="dropped"]:hover{border-color:var(--dropped); color:var(--dropped)}
   #modal .actions button[data-act="open"]:hover{border-color:var(--open); color:var(--open)}
+  #modal .actions button[data-memo="drop"]:hover{border-color:var(--dropped); color:var(--dropped)}
   #modal .actions button[disabled]{opacity:.45; cursor:default; transform:none}
 
   /* 顶部工具条：模式提示 + 待提交 */
@@ -395,7 +441,9 @@ TEMPLATE = r"""<!doctype html>
   #list .row .m{font-size:10.5px; color:var(--dim); letter-spacing:.5px; margin-bottom:4px}
   #list .row .x{font-size:13.5px; line-height:1.65; white-space:pre-wrap; word-break:break-word}
   #list .row .n{font-size:12px; color:#8fa3b8; margin-top:6px; white-space:pre-wrap}
-  #list .row .ops{flex:0 0 auto}
+  #list .row .ops{
+    flex:0 0 auto; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;
+  }
   #list .row .ops button{
     padding:6px 10px; border-radius:8px; cursor:pointer; white-space:nowrap;
     background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--dim);
@@ -403,7 +451,50 @@ TEMPLATE = r"""<!doctype html>
   }
   #list .row .ops button:hover{color:var(--open); border-color:rgba(79,209,197,.5); background:rgba(79,209,197,.12)}
   #list .row .ops button[disabled]{opacity:.5; cursor:default}
+  /* 「已丢弃」列表里的永久删除 —— 唯一会真删数据的按钮，红色单独标出来 */
+  #list .row .ops button.danger{color:#fc8181; border-color:rgba(252,129,129,.4)}
+  #list .row .ops button.danger:hover{color:#fc8181; border-color:rgba(252,129,129,.6); background:rgba(252,129,129,.14)}
+  #list .row .ops button.danger[disabled]{color:var(--dim); border-color:var(--line)}
   #list .empty{padding:36px 10px; text-align:center; color:var(--dim); font-size:13.5px}
+
+  /* 永久删除确认浮层 —— z-index 必须高过 #list(45) / #settings(46)，它是从列表里弹出来的 */
+  #confirm{
+    position:fixed; inset:0; z-index:48; display:none;
+    align-items:center; justify-content:center; padding:26px;
+    background:rgba(4,7,12,.76); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+  }
+  #confirm.on{display:flex}
+  #confirm .panel{
+    width:min(460px,94vw); border-radius:18px; overflow:hidden;
+    background:rgba(20,28,42,.97); border:1px solid var(--line);
+    box-shadow:0 24px 70px rgba(0,0,0,.6);
+  }
+  #confirm .chead{padding:16px 20px 0}
+  #confirm .chead h2{margin:0; font-size:15px; font-weight:700; color:#fc8181}
+  #confirm .cbody{padding:9px 20px 0; color:var(--dim); font-size:13px; line-height:1.7}
+  #confirm .cbody .q{
+    color:var(--ink); font-size:13px; line-height:1.65; margin-top:9px; padding:9px 11px;
+    max-height:170px; overflow:auto; border-radius:10px;
+    background:rgba(255,255,255,.05); border:1px solid var(--line);
+    white-space:pre-wrap; word-break:break-word;
+  }
+  #confirm .noask{
+    display:flex; align-items:center; gap:8px; margin:14px 20px 0;
+    font-size:12.5px; color:var(--dim); cursor:pointer; user-select:none;
+  }
+  #confirm .noask input{width:14px; height:14px; margin:0; cursor:pointer; accent-color:#fc8181}
+  #confirm .noask:hover{color:var(--ink)}
+  #confirm .cfoot{display:flex; gap:9px; justify-content:flex-end; padding:16px 20px 18px}
+  #confirm .cfoot button{
+    padding:9px 16px; border-radius:10px; cursor:pointer; transition:.16s;
+    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--ink);
+    font:13.5px/1 inherit;
+  }
+  #confirm .cfoot button:hover{background:rgba(255,255,255,.14)}
+  #confirm .cfoot button.danger{
+    background:rgba(252,129,129,.16); border-color:rgba(252,129,129,.5); color:#fc8181;
+  }
+  #confirm .cfoot button.danger:hover{background:rgba(252,129,129,.27)}
 
   /* 设置浮层 —— 改的是 memo-bot/settings.json，与机器人「设置」指令同一份 */
   #settings{
@@ -515,7 +606,7 @@ TEMPLATE = r"""<!doctype html>
   <div class="bar">
     <span class="pill" id="mode">检测中…</span>
     <span class="pill pending" id="pending" style="display:none"></span>
-    <span class="pill act" id="btn-memo_done" data-s="memo_done">✓ 已勾掉<b>0</b></span>
+    <span class="pill act" id="btn-memo_done" data-s="memo_done">✓ 已完成<b>0</b></span>
     <span class="pill act" id="btn-done" data-s="done">✅ 已处理<b>0</b></span>
     <span class="pill act" id="btn-decided" data-s="decided">📌 已决议<b>0</b></span>
     <span class="pill act" id="btn-dropped" data-s="dropped">🗑 垃圾桶<b>0</b></span>
@@ -531,8 +622,16 @@ TEMPLATE = r"""<!doctype html>
 <div id="empty"><div class="big">🎉</div><div>抽屉里没有要处理的了</div></div>
 
 <div id="modal"><div class="card">
-  <div class="meta"></div>
+  <div class="meta"><span class="mtxt"></span><button class="editbtn" id="btn-edit"
+    title="改正文；创建时间不变">✏️ 编辑</button></div>
   <div class="body"></div>
+  <textarea class="editbox" id="editbox" rows="6" style="display:none"
+    placeholder="改这一条的正文…"></textarea>
+  <div class="editrow" id="editrow" style="display:none">
+    <span class="ehint">只改正文 · <b>创建时间不变</b> · Esc 取消</span>
+    <button id="ecancel">取消</button>
+    <button id="esave" class="primary">保存</button>
+  </div>
   <textarea class="note" id="note" rows="2" placeholder="结论 / 备注（可选）"></textarea>
   <div class="actions ideaact">
     <button data-act="done">✅ 已处理</button>
@@ -541,7 +640,9 @@ TEMPLATE = r"""<!doctype html>
     <button data-act="open">← 恢复待处理</button>
   </div>
   <div class="actions memoact" style="display:none">
-    <button data-memo="1">✓ 勾掉这条备忘</button>
+    <button data-memo="done">✓ 完成这条备忘</button>
+    <button data-memo="drop">🗑 丢弃</button>
+    <button data-memo="open">← 恢复</button>
   </div>
   <div class="hint">处理后会从轮播移出 · 点卡片外关闭 · 空格暂停/继续</div>
 </div></div>
@@ -552,6 +653,19 @@ TEMPLATE = r"""<!doctype html>
     <button id="lclose">✕ 关闭</button>
   </div>
   <div class="lbody" id="lbody"></div>
+</div></div>
+
+<div id="confirm"><div class="panel">
+  <div class="chead"><h2 id="ctitle">永久删除？</h2></div>
+  <div class="cbody">
+    删掉之后<b>从库里抹掉，找不回来</b> —— 不弹提示、不建回收站，也没法恢复。
+    <div class="q" id="cquote"></div>
+  </div>
+  <label class="noask"><input type="checkbox" id="cnoask">以后不再提示（下次点「永久删除」直接删）</label>
+  <div class="cfoot">
+    <button id="ccancel">取消</button>
+    <button id="cok" class="danger">永久删除</button>
+  </div>
 </div></div>
 
 <div id="settings"><div class="panel">
@@ -589,6 +703,9 @@ const modeEl = document.getElementById('mode');
 const pendEl = document.getElementById('pending');
 const toastEl = document.getElementById('toast');
 const noteEl = document.getElementById('note');
+const editboxEl = document.getElementById('editbox');
+const editrowEl = document.getElementById('editrow');
+const btnEdit = document.getElementById('btn-edit');
 const emptyEl = document.getElementById('empty');
 const nEl = document.getElementById('n');
 const nArchEl = document.getElementById('n-arch');
@@ -596,18 +713,19 @@ const nArchEl = document.getElementById('n-arch');
 document.getElementById('gen').textContent = GEN;
 
 /* ── 分流 ────────────────────────────────────────────────────
-   🔴 两类内容：备忘（`k='memo'`，我要做，只有勾掉/没勾掉）和灵感（`k='idea'`，我的想法）。
+   🔴 两类内容：备忘（`k='memo'`，我要做，没完成/已完成/已丢弃）和灵感（`k='idea'`，我的想法）。
       每条带一个**桶名** `s`，桶名进 `bubbles_show` 设置、也当卡片的 `data-s`。
       内容流放哪几个桶由**设置**决定（默认「备忘 + 待处理」）；
       其余桶各有归档列表（点顶部按钮看）。
+      🔴 `dropped` 是两类**共用**的桶 —— 丢弃的备忘和丢弃的灵感都进这里。
       展示范围在页面上改：顶部「⚙ 设置」，和机器人「设置」指令是同一份。 */
 const ARCHIVE = ['memo_done', 'done', 'decided', 'dropped'];
 const ARCHIVE_TITLE = {
-  memo_done: '✓ 已勾掉的备忘', done: '✅ 已处理',
+  memo_done: '✓ 已完成的备忘', done: '✅ 已处理',
   decided: '📌 已决议', dropped: '🗑 垃圾桶',
 };
 const ARCHIVE_EMPTY = {
-  memo_done: '还没有勾掉过备忘', done: '还没有处理完的灵感',
+  memo_done: '还没有完成过备忘', done: '还没有处理完的灵感',
   decided: '还没有下过结论的灵感', dropped: '垃圾桶是空的',
 };
 
@@ -709,7 +827,8 @@ async function refreshFromServer(){
     const byId = new Map(incoming.map(x => [x.id, x]));
     for(const it of IDEAS){
       const s = byId.get(it.id);
-      if(s){ it.s = s.s; if(s.note) it.note = s.note; }
+      // `t` 也要跟 —— 别的窗口（或别的机器）编辑过正文，这里得看到新文本
+      if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; }
     }
     const known = new Set(IDEAS.map(x => x.id));
     for(const x of incoming){ if(!known.has(x.id)) IDEAS.push(x); }
@@ -739,7 +858,8 @@ async function applyStatus(it, status, note){
     const j = await r.json();
     if(!j.ok) throw new Error(j.error || '写入失败');
   } else {
-    pending[it.id] = {s: status, note: note || '', t: Date.now()};
+    // 🔴 用 Object.assign 保留已有字段 —— 同一条可能先编辑过正文（`e`），再改状态
+    pending[it.id] = Object.assign({}, pending[it.id], {s: status, note: note || '', t: Date.now()});
     lsSet(PENDING_KEY, pending);
     renderPending();
   }
@@ -749,26 +869,38 @@ async function applyStatus(it, status, note){
         + (MODE === 'serve' ? '' : ' · 暂存中，记得导出'));
 }
 
-/* ── 备忘：只有「勾掉 / 没勾掉」两态 ──────────────────────
-   备忘 = 我要做，不需要「已决议 / 已丢弃」那一套；勾掉就进「✓ 已勾掉」列表。
-   🔴 勾掉 ≠ 删除：记录还在库里（status='done'），随时能取消。 */
-async function applyMemoDone(it, done){
+/* ── 备忘：没完成 / 已完成 / 已丢弃 三态 ────────────────────
+   备忘 = 我要做，不需要「已决议」那一套；完成就进「✓ 已完成」列表，不做就丢进垃圾桶。
+   🔴 完成 ≠ 删除、丢弃 ≠ 删除：记录还在库里（status='done' / 'dropped'），随时能取消 / 恢复。
+   🔴 桶名映射走 memoBucket()：done → 'memo_done'，open → 'memo'，dropped → 'dropped'（与灵感共用）。 */
+function memoBucket(status){
+  if(status === 'dropped') return 'dropped';
+  return status === 'done' ? 'memo_done' : 'memo';
+}
+
+async function applyMemoStatus(it, status){
   if(MODE === 'serve'){
     const r = await fetch('/api/memo', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({id: it.id, done: !!done}),
+      body: JSON.stringify({id: it.id, status: status}),
     });
     const j = await r.json();
     if(!j.ok) throw new Error(j.error || '写入失败');
   } else {
-    pending[it.id] = {k:'memo', done: !!done, t: Date.now()};
+    // 🔴 同上：保留 `e`（编辑过的正文），别一改状态就把编辑丢了
+    pending[it.id] = Object.assign({}, pending[it.id], {k:'memo', status: status, t: Date.now()});
     lsSet(PENDING_KEY, pending);
     renderPending();
   }
-  moveItem(it.id, done ? 'memo_done' : 'memo');
-  toast((done ? '已勾掉 ✓' : '已取消勾掉')
-        + (MODE === 'serve' ? '' : ' · 暂存中，记得导出'));
+  moveItem(it.id, memoBucket(status));
+  const said = {done:'已完成 ✓', open:'已放回备忘', dropped:'已丢弃 🗑'}[status] || status;
+  toast(said + (MODE === 'serve' ? '' : ' · 暂存中，记得导出'));
+}
+
+// 勾选框那一条路走的就是「完成 / 取消完成」
+async function applyMemoDone(it, done){
+  return applyMemoStatus(it, done ? 'done' : 'open');
 }
 
 /* 卡片上的勾选框（CSS 画的方框，勾上用对勾伪元素）。
@@ -776,7 +908,7 @@ async function applyMemoDone(it, done){
 function makeChk(it, after){
   const cb = document.createElement('span');
   cb.className = 'chk' + (it.s === 'memo_done' ? ' on' : '');
-  cb.title = it.s === 'memo_done' ? '已勾掉 —— 点一下取消' : '点一下勾掉';
+  cb.title = it.s === 'memo_done' ? '已完成 —— 点一下取消' : '点一下标记完成';
   cb.addEventListener('click', async (e)=>{
     e.stopPropagation();                 // 别顺手把详情浮层也打开了
     cb.style.pointerEvents = 'none';
@@ -788,10 +920,15 @@ function makeChk(it, after){
 }
 
 pendEl.addEventListener('click', ()=>{
-  // 备忘的暂存记的是「勾掉没勾掉」，灵感的记的是「状态 + 结论」—— 导出时分开写
-  const ops = Object.entries(pending).map(([id, v]) => v.k === 'memo'
-      ? {id: id, kind: 'memo', done: !!v.done}
-      : {id: id, status: v.s, note: v.note || ''});
+  // 备忘的暂存记的是「状态（open/done/dropped）」，灵感的记的是「状态 + 结论」，
+  // ✏️ 编辑单独记在 `e` 上 —— 三者可以叠在同一条上，导出时合成一个 op。
+  const ops = Object.entries(pending).map(([id, v]) => {
+    const op = {id: id};
+    if(v.k === 'memo'){ op.kind = 'memo'; op.status = v.status; }
+    else if(v.s){ op.status = v.s; op.note = v.note || ''; }
+    if(v.e != null) op.content = v.e;      // 编辑过的正文
+    return op;
+  });
   if(!ops.length) return;
   const blob = new Blob([JSON.stringify({ops: ops}, null, 2)], {type:'application/json'});
   const a = document.createElement('a');
@@ -982,7 +1119,7 @@ function spawn(warm){
 
   const hd = document.createElement('div');
   hd.className = 'hd';
-  if(it.k === 'memo') hd.append(makeChk(it));   // 🔴 备忘卡片左上角一个勾选框（勾掉没勾掉一眼看到）
+  if(it.k === 'memo') hd.append(makeChk(it));   // 🔴 备忘卡片左上角一个勾选框（完成没完成一眼看到）
   const meta = document.createElement('span');
   meta.className = 'meta';
   meta.textContent = (LABEL[it.s]||'') + ' · ' + it.d;
@@ -1007,17 +1144,27 @@ function spawn(warm){
 /* ── 浮层 ───────────────────────────────────────────────── */
 function openModal(it){
   current = it;
-  modal.querySelector('.meta').textContent = (LABEL[it.s]||'') + ' · ' + it.d;
+  modal.querySelector('.meta .mtxt').textContent = (LABEL[it.s]||'') + ' · ' + it.d;
   modal.querySelector('.body').textContent = it.t;
   const isMemo = it.k === 'memo';
-  // 备忘只有「勾掉 / 取消勾掉」一个动作，也没有「结论」这个概念 —— 换一套操作区
+  // 备忘没有「结论」这个概念 —— 换一套操作区（完成 / 丢弃 / 恢复）
   noteEl.value = it.note || '';
-  noteEl.style.display = isMemo ? 'none' : '';
-  modal.querySelector('.ideaact').style.display = isMemo ? 'none' : '';
-  modal.querySelector('.memoact').style.display = isMemo ? '' : 'none';
-  modal.querySelector('.memoact button').textContent =
-      it.s === 'memo_done' ? '← 取消勾掉' : '✓ 勾掉这条备忘';
+  setEditMode(false);            // 复位编辑态（正文 / 结论框 / 两个操作区的显隐都在里面）
+  if(isMemo) syncMemoActions(it);
   modal.classList.add('on');
+}
+
+/* 备忘浮层的三个按钮按当前状态显隐：
+   没完成 → 「完成」+「丢弃」；已完成 → 「取消完成」+「丢弃」；已丢弃 → 「恢复」。 */
+function syncMemoActions(it){
+  const doneB = modal.querySelector('.memoact [data-memo="done"]');
+  const dropB = modal.querySelector('.memoact [data-memo="drop"]');
+  const openB = modal.querySelector('.memoact [data-memo="open"]');
+  const dropped = it.s === 'dropped';
+  doneB.style.display = dropped ? 'none' : '';
+  doneB.textContent = it.s === 'memo_done' ? '← 取消完成' : '✓ 完成这条备忘';
+  dropB.style.display = dropped ? 'none' : '';
+  openB.style.display = dropped ? '' : 'none';
 }
 
 // 只有点「卡片外」才关 —— 否则点输入框也会误关
@@ -1042,25 +1189,176 @@ modal.querySelectorAll('.ideaact button').forEach(btn=>{
   });
 });
 
-// 备忘：浮层里那一个按钮（勾掉 / 取消勾掉）
-modal.querySelector('.memoact button').addEventListener('click', async (e)=>{
-  e.stopPropagation();
+// 备忘：浮层里那三个按钮（完成 / 取消完成 / 丢弃 / 恢复）
+modal.querySelectorAll('.memoact button').forEach(btn=>{
+  btn.addEventListener('click', async (e)=>{
+    e.stopPropagation();
+    if(!current) return;
+    const act = btn.dataset.memo;                    // done / drop / open
+    // 「完成」按钮是切换语义：已完成时它显示「← 取消完成」，点它就是放回备忘
+    const status = act === 'done' ? (current.s === 'memo_done' ? 'open' : 'done')
+                 : act === 'drop' ? 'dropped'
+                 : 'open';
+    btn.disabled = true;
+    try {
+      await applyMemoStatus(current, status);
+      modal.classList.remove('on');
+      current = null;
+    } catch(err){
+      toast('写入失败：' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
+/* ── ✏️ 再次编辑正文 ───────────────────────────────────────
+   回顾的时候发现写错了字、或者对某件事有了新想法 —— 改正文就行。
+   🔴 **创建时间不变**（用户明确要求）：改的是 `content`，`created_at` 一个字节都不动，
+      所以时间轴不会乱、排序也不会跳。备忘和灵感都能改。
+   入口有两个：浮层里 .meta 右边那个「✏️ 编辑」，以及归档列表行里的「✏️ 编辑」。 */
+let editing = false;
+
+/* 进 / 出编辑态。编辑态下：正文换成 textarea，结论框和两个操作区都收起来
+   （一次只做一件事，免得「改到一半顺手点了完成」）。 */
+function setEditMode(on){
+  editing = on;
+  const it = current;
+  if(!it) return;
+  const isMemo = it.k === 'memo';
+  modal.querySelector('.body').style.display = on ? 'none' : '';
+  editboxEl.style.display = on ? '' : 'none';
+  editrowEl.style.display = on ? '' : 'none';
+  btnEdit.style.display = on ? 'none' : '';
+  noteEl.style.display = (on || isMemo) ? 'none' : '';
+  modal.querySelector('.ideaact').style.display = (on || isMemo) ? 'none' : '';
+  modal.querySelector('.memoact').style.display = (on || !isMemo) ? 'none' : '';
+  // 底部提示在编辑态下是错的（「空格暂停/继续」这时候是打字）—— 直接收起来
+  modal.querySelector('.hint').style.display = on ? 'none' : '';
+  if(on){
+    editboxEl.value = it.t;
+    editboxEl.focus();
+    editboxEl.setSelectionRange(editboxEl.value.length, editboxEl.value.length);
+  }
+}
+
+btnEdit.addEventListener('click', ()=> setEditMode(true));
+document.getElementById('ecancel').addEventListener('click', ()=> setEditMode(false));
+document.getElementById('esave').addEventListener('click', saveEdit);
+
+async function saveEdit(){
   if(!current) return;
-  const btn = e.currentTarget;
-  const want = current.s !== 'memo_done';
+  const text = editboxEl.value.trim();
+  if(!text){ toast('正文不能改成空的'); return; }
+  if(text === current.t){ toast('没有改动'); setEditMode(false); return; }
+  const btn = document.getElementById('esave');
   btn.disabled = true;
   try {
-    await applyMemoDone(current, want);
-    modal.classList.remove('on');
-    current = null;
+    await applyEdit(current, text);
+    setEditMode(false);
   } catch(err){
-    toast('写入失败：' + err.message);
+    toast('保存失败：' + err.message);
   } finally {
     btn.disabled = false;
   }
-});
+}
 
-/* ── 归档列表：已勾掉的备忘 / 已处理 / 已决议 / 垃圾桶 ────── */
+/* 写库 / 暂存。和改状态一样分在线、离线两条路 —— 但**编辑是可反复执行的**，
+   所以离线那条也进 `--apply`（改错了再改回来就行，不像永久删除那样不可逆）。 */
+async function applyEdit(it, text){
+  if(MODE === 'serve'){
+    const r = await fetch('/api/edit', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: it.id, content: text}),
+    });
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || '保存失败');
+  } else {
+    // 🔴 只在已有暂存上**加字段**，别整个覆盖 —— 同一条可能刚被标过完成还没导出
+    pending[it.id] = pending[it.id] || {t: Date.now()};
+    pending[it.id].e = text;
+    pending[it.id].t = Date.now();
+    lsSet(PENDING_KEY, pending);
+    renderPending();
+  }
+  it.t = text;
+  paintText(it.id, text);
+  if(listEl.classList.contains('on')) renderList();
+  modal.querySelector('.body').textContent = text;
+  toast('正文已更新 · 创建时间没变' + (MODE === 'serve' ? '' : '（暂存中，记得导出）'));
+}
+
+/* 舞台上那条气泡就地换正文（字号档位跟着重算）。
+   气泡是生成时就定死的 DOM 快照 —— 不就地改的话得等它飘走再重来，
+   用户会以为「改了没生效」。 */
+function paintText(id, text){
+  for(const el of stage.children){
+    if(el.dataset.id !== id) continue;
+    const txt = el.querySelector('.txt');
+    if(txt) txt.textContent = text;
+    el.className = 'bubble ' + sizeClass(text.length);
+  }
+}
+
+/* ── 永久删除：确认浮层 + 「以后不再提示」 ─────────────────
+   🔴 这是页面上**唯一会真删数据**的操作。默认每次都确认；勾了「以后不再提示」
+      之后就直接删。这个偏好存在**浏览器本地**（localStorage），不进 settings.json ——
+      它是「这台机器上这个浏览器」的习惯，不是机器人的配置。
+      想让它重新弹出来：顶部「⚙ 设置」里的「永久删除前再确认」勾回去。 */
+const NOASK_KEY = 'bubble_del_noask_v1';
+let noAskDelete = lsGet(NOASK_KEY, false);
+
+const confirmEl = document.getElementById('confirm');
+const cquoteEl = document.getElementById('cquote');
+const cnoaskEl = document.getElementById('cnoask');
+let confirmResolve = null;
+
+function closeConfirm(ok){
+  confirmEl.classList.remove('on');
+  const r = confirmResolve;
+  confirmResolve = null;
+  if(r) r(ok);
+}
+
+function askDelete(text){
+  if(noAskDelete) return Promise.resolve(true);
+  cquoteEl.textContent = text;
+  cnoaskEl.checked = false;             // 每次都从「没勾」开始，免得手滑一路删下去
+  confirmEl.classList.add('on');
+  return new Promise(resolve => { confirmResolve = resolve; });
+}
+
+document.getElementById('cok').addEventListener('click', ()=>{
+  if(cnoaskEl.checked){ noAskDelete = true; lsSet(NOASK_KEY, true); }
+  closeConfirm(true);
+});
+document.getElementById('ccancel').addEventListener('click', ()=> closeConfirm(false));
+confirmEl.addEventListener('click', (e)=>{ if(e.target === confirmEl) closeConfirm(false); });
+
+/* 永久删除一条 —— 只给「已丢弃」列表里的按钮用。
+   🔴 离线模式（file://）不给删：这一下**不可恢复**，不该跟着「导出操作文件 → --apply」
+      那条链路走（文件可以反复应用，误删没法挽回）。 */
+async function deleteItem(it){
+  if(MODE !== 'serve'){
+    toast('离线模式删不了 —— 用桌面「脑内抽屉」打开再删');
+    return;
+  }
+  if(!await askDelete(it.t)) return;
+  const r = await fetch('/api/delete', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: it.id}),
+  });
+  const j = await r.json();
+  if(!j.ok) throw new Error(j.error || '删除失败');
+  IDEAS = IDEAS.filter(x => x.id !== it.id);
+  updateCounts();
+  renderList();
+  toast('已永久删除');
+}
+
+/* ── 归档列表：已完成的备忘 / 已处理 / 已决议 / 垃圾桶 ────── */
 let listStatus = null;
 
 function makeRow(it){
@@ -1068,7 +1366,9 @@ function makeRow(it){
   row.className = 'row';
   row.dataset.s = it.s;
   const isMemo = it.k === 'memo';
-  if(isMemo) row.append(makeChk(it, renderList));   // 列表里也直接显示勾掉状态
+  const dropped = it.s === 'dropped';
+  // 列表里也直接显示完成状态。🔴 已丢弃的不给勾选框 —— 先「恢复」再决定
+  if(isMemo && !dropped) row.append(makeChk(it, renderList));
   const c = document.createElement('div');
   c.className = 'c';
   const m = document.createElement('div');
@@ -1086,18 +1386,49 @@ function makeRow(it){
   }
   const ops = document.createElement('div');
   ops.className = 'ops';
-  const b = document.createElement('button');
-  if(isMemo){
+  if(dropped){
+    // 已丢弃（备忘 / 灵感都在这个桶）→ 恢复 + 永久删除
+    const back = document.createElement('button');
+    back.textContent = '← 恢复';
+    back.title = '放回内容流（备忘变回没完成，灵感变回待处理）';
+    back.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      back.disabled = true;
+      try {
+        if(isMemo) await applyMemoStatus(it, 'open');
+        else await applyStatus(it, 'open', it.note || '');
+        renderList();
+      } catch(err){ toast('写入失败：' + err.message); back.disabled = false; }
+    });
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = '🗑 永久删除';
+    del.title = '从库里删掉，找不回来';
+    if(MODE !== 'serve'){
+      del.disabled = true;
+      del.title = '离线模式删不了 —— 用桌面「脑内抽屉」打开再删';
+    }
+    del.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      del.disabled = true;
+      try { await deleteItem(it); }
+      catch(err){ toast('删除失败：' + err.message); del.disabled = false; }
+    });
+    ops.append(back, del);
+  } else if(isMemo){
     const want = it.s !== 'memo_done';
-    b.textContent = want ? '✓ 勾掉' : '← 取消勾掉';
-    b.title = want ? '勾掉这条备忘' : '取消勾掉，放回内容流';
+    const b = document.createElement('button');
+    b.textContent = want ? '✓ 完成' : '← 取消完成';
+    b.title = want ? '标记这条备忘已完成' : '取消完成，放回内容流';
     b.addEventListener('click', async (e)=>{
       e.stopPropagation();
       b.disabled = true;
       try { await applyMemoDone(it, want); renderList(); }
       catch(err){ toast('写入失败：' + err.message); b.disabled = false; }
     });
+    ops.append(b);
   } else {
+    const b = document.createElement('button');
     b.textContent = '← 恢复';
     b.title = '放回内容流（变回待处理）';
     b.addEventListener('click', async (e)=>{
@@ -1106,8 +1437,21 @@ function makeRow(it){
       try { await applyStatus(it, 'open', it.note || ''); renderList(); }
       catch(err){ toast('写入失败：' + err.message); b.disabled = false; }
     });
+    ops.append(b);
   }
-  ops.append(b);
+  // ✏️ 编辑：每条都有，不分状态（已丢弃的也能改）。
+  // 🔴 列表浮层 z-index 45 盖在详情浮层 40 上面 —— 所以先关列表、再开详情并直接进编辑态。
+  const ed = document.createElement('button');
+  ed.className = 'edit';
+  ed.textContent = '✏️ 编辑';
+  ed.title = '改正文；创建时间不变';
+  ed.addEventListener('click', (e)=>{
+    e.stopPropagation();
+    listEl.classList.remove('on');
+    openModal(it);
+    setEditMode(true);
+  });
+  ops.append(ed);
   row.append(c, ops);
   row.addEventListener('click', ()=> openModal(it));
   return row;
@@ -1143,7 +1487,7 @@ async function openList(status){
         const byId = new Map(incoming.map(x=>[x.id, x]));
         for(const it of IDEAS){
           const s = byId.get(it.id);
-          if(s){ it.s = s.s; if(s.note) it.note = s.note; }
+          if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; }
         }
         const known = new Set(IDEAS.map(x=>x.id));
         for(const x of incoming){ if(!known.has(x.id)) IDEAS.push(x); }
@@ -1229,6 +1573,36 @@ function renderSettings(){
     item.append(rst);
     sbodyEl.append(item);
   }
+  sbodyEl.append(deleteConfirmItem());
+}
+
+/* 「永久删除前再确认」—— 本页自己的一个开关，**不进 settings.json**。
+   它只是这台浏览器上的习惯（localStorage），所以单独渲染、不走 collectSettings()。
+   关掉之后，「已丢弃」列表里点「永久删除」就直接删 —— 想让它回来，在这里勾回去。 */
+function deleteConfirmItem(){
+  const item = document.createElement('div');
+  item.className = 'item';
+  const lb = document.createElement('div');
+  lb.className = 'lb'; lb.textContent = '永久删除前再确认';
+  const hp = document.createElement('div');
+  hp.className = 'hp';
+  hp.textContent = '「已丢弃」列表里点「永久删除」时弹不弹确认框。'
+                 + '关掉就直接删，不再问 —— 删掉找不回来，建议留着。';
+  const box = document.createElement('div');
+  box.className = 'chks';
+  const l = document.createElement('label');
+  const i = document.createElement('input');
+  i.type = 'checkbox'; i.id = 'del-confirm';
+  i.checked = !noAskDelete;
+  i.addEventListener('change', ()=>{
+    noAskDelete = !i.checked;
+    lsSet(NOASK_KEY, noAskDelete);
+    toast(noAskDelete ? '以后不再弹确认框' : '删除前会再确认一次');
+  });
+  l.append(i, document.createTextNode('弹确认框（关掉 = 以后不再提示）'));
+  box.append(l);
+  item.append(lb, hp, box);
+  return item;
 }
 
 function collectSettings(){
@@ -1341,11 +1715,15 @@ function setRunning(v){
 }
 
 document.addEventListener('keydown', (e)=>{
-  if(e.code === 'Space' && document.activeElement !== noteEl){
+  // 🔴 编辑框里敲空格是**打字**，不是暂停轮播 —— 必须排掉，否则正文里的空格全被吃掉
+  if(e.code === 'Space' && document.activeElement !== noteEl && document.activeElement !== editboxEl){
     e.preventDefault(); setRunning(!running);
   }
   if(e.code === 'Escape'){
-    modal.classList.remove('on'); listEl.classList.remove('on'); settingsEl.classList.remove('on');
+    // 确认框在最上层 —— 先关它（关掉 = 取消删除）；编辑态则先退出编辑（丢弃改动）
+    if(confirmEl.classList.contains('on')) closeConfirm(false);
+    else if(editing) setEditMode(false);
+    else { modal.classList.remove('on'); listEl.classList.remove('on'); settingsEl.classList.remove('on'); }
   }
 });
 
@@ -1396,9 +1774,16 @@ def build_html(items):
 def apply_ops(path):
     """应用离线模式导出的 `抽屉操作.json`。
 
-    两种条目：
-      - 灵感：`{"id":…, "status":"done|decided|dropped|open", "note":…}`
-      - 备忘：`{"id":…, "kind":"memo", "done":true|false}`
+    条目可以叠着写（一条同时改正文 + 改状态也行）：
+      - 灵感改状态：`{"id":…, "status":"done|decided|dropped|open", "note":…}`
+      - 备忘改状态：`{"id":…, "kind":"memo", "status":"open|done|dropped"}`
+                    （老写法 `{"kind":"memo", "done":true|false}` 仍然认）
+      - ✏️ 改正文：`{"id":…, "content":"新的正文"}` —— 可单用，也可和上面叠。
+        🔴 只改 `content`，**创建时间不变**（`store.update_content` 里 SQL 就没带 created_at）。
+
+    🔴 **不含永久删除** —— 那是不可恢复的操作，只能在页面上确认着点，
+       不让它跟着「导出 → --apply」这条可以反复执行的链路走。
+       （编辑不受这条限制：改错了再改回来就行，可逆。）
     """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -1413,19 +1798,46 @@ def apply_ops(path):
         if not iid:
             print(f"  跳过非法条目：{op}")
             continue
-        if op.get("kind") == "memo" or "done" in op:
-            done = bool(op.get("done"))
-            c = store.set_memo_done([iid], done)
-            label = BUCKET_LABEL[BUCKET_MEMO_DONE] if done else BUCKET_LABEL[BUCKET_MEMO]
-        else:
-            status = (op.get("status") or "").strip()
+
+        # ① 先处理正文编辑（如果有）
+        content = op.get("content")
+        if content is not None:
+            text = clean(str(content))
+            if text:
+                c = store.update_content(iid, text)
+                n += c
+                print(f"  [编辑] {iid[:8]} {'OK' if c else '（未找到）'}")
+            else:
+                print(f"  跳过空正文：{iid[:8]}")
+
+        # ② 再处理状态变更（如果有）
+        status = (op.get("status") or "").strip()
+        is_memo = op.get("kind") == "memo" or "done" in op
+        if is_memo:
+            # 🔴 `done` 键存在才算「要改状态」—— 只有 `kind` 没 `done`/`status` 的条目
+            #    是「纯编辑备忘」，不能顺手把它改成 open（那会悄悄回退已完成的条目）
+            if "done" in op:
+                st = store.STATUS_DONE if op.get("done") else store.STATUS_OPEN
+            else:
+                st = status
+            if st:
+                if st not in store.MEMO_STATUSES:
+                    print(f"  跳过非法条目：{op}")
+                    continue
+                c = store.set_memo_status([iid], st)
+                n += c
+                print(f"  [{BUCKET_LABEL[memo_bucket(st)]}] {iid[:8]} {'OK' if c else '（未找到）'}")
+            elif content is None:
+                print(f"  跳过非法条目：{op}")
+        elif status:
             if status not in VALID_STATUS:
                 print(f"  跳过非法条目：{op}")
                 continue
             c = store.set_idea_status([iid], status, (op.get("note") or "").strip() or None)
-            label = STATUS_LABEL[status]
-        n += c
-        print(f"  [{label}] {iid[:8]} {'OK' if c else '（未找到）'}")
+            n += c
+            print(f"  [{STATUS_LABEL[status]}] {iid[:8]} {'OK' if c else '（未找到）'}")
+        elif content is None:
+            print(f"  跳过非法条目：{op}")
     print(f"已应用 {n} 条")
     return 0
 
@@ -1435,7 +1847,9 @@ def _make_handler(doc):
 
     静态页 + `GET /api/ping` / `GET /api/items`（备忘 + 灵感，`/api/ideas` 是旧别名）
     + `GET /api/export` / `GET|POST /api/settings`
-    + `POST /api/status`（灵感改状态）/ `POST /api/memo`（备忘勾掉）/ `POST /api/quit`。
+    + `POST /api/status`（灵感改状态）/ `POST /api/memo`（备忘改状态）
+    + `POST /api/edit`（**改正文，创建时间不变**）
+    + `POST /api/delete`（**永久删除**一条，不可恢复）/ `POST /api/quit`。
     """
     from http.server import BaseHTTPRequestHandler
 
@@ -1519,23 +1933,62 @@ def _make_handler(doc):
                 print(f"  [设置] 已更新 {n_ok} 项", flush=True)
                 return self._send(200, {"ok": True, "keys": settings.describe()})
             if self.path.startswith("/api/memo"):
-                # 备忘勾掉 / 取消勾掉 —— 备忘没有「已决议 / 已丢弃」那一套
+                # 备忘改状态：完成 / 取消完成 / 丢弃 —— 备忘没有「已决议」那一套
                 try:
                     payload = self._read_json()
                 except (ValueError, OSError) as e:
                     return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
                 iid = (payload.get("id") or "").strip()
-                done = bool(payload.get("done"))
-                if not iid:
-                    return self._send(400, {"ok": False, "error": "id 不合法"})
+                # 🔴 兼容老的 `{done: true/false}` 写法（离线操作文件里长这样）
+                status = (payload.get("status") or "").strip()
+                if not status:
+                    status = store.STATUS_DONE if payload.get("done") else store.STATUS_OPEN
+                if not iid or status not in store.MEMO_STATUSES:
+                    return self._send(400, {"ok": False, "error": "id 或 status 不合法"})
                 try:
-                    changed = store.set_memo_done([iid], done)
+                    changed = store.set_memo_status([iid], status)
                 except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
                     return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
                 if not changed:
                     return self._send(404, {"ok": False, "error": "没找到这条备忘（可能已被删）"})
-                print(f"  [备忘{'已勾掉' if done else '取消勾掉'}] {iid[:8]}", flush=True)
+                print(f"  [{BUCKET_LABEL[memo_bucket(status)]}] {iid[:8]}", flush=True)
                 return self._send(200, {"ok": True, "changed": changed})
+            if self.path.startswith("/api/delete"):
+                # 🔴 永久删除（真删行，不可恢复）。页面侧已经弹过确认框了，这里不再问。
+                try:
+                    payload = self._read_json()
+                except (ValueError, OSError) as e:
+                    return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
+                iid = (payload.get("id") or "").strip()
+                if not iid:
+                    return self._send(400, {"ok": False, "error": "id 不合法"})
+                try:
+                    deleted = store.delete_items([iid])
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                if not deleted:
+                    return self._send(404, {"ok": False, "error": "没找到这条（可能已经被删了）"})
+                print(f"  [永久删除] {iid[:8]}", flush=True)
+                return self._send(200, {"ok": True, "deleted": deleted})
+            if self.path.startswith("/api/edit"):
+                # ✏️ 再次编辑正文。🔴 **只动 content，创建时间一个字节都不碰**（用户明确要求）。
+                try:
+                    payload = self._read_json()
+                except (ValueError, OSError) as e:
+                    return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
+                iid = (payload.get("id") or "").strip()
+                # 走和收消息时同一个 clean() —— 两边口径一致（规整空白、保留换行）
+                text = clean(str(payload.get("content") or ""))
+                if not iid or not text:
+                    return self._send(400, {"ok": False, "error": "id 或正文不合法（正文不能是空的）"})
+                try:
+                    changed = store.update_content(iid, text)
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                if not changed:
+                    return self._send(404, {"ok": False, "error": "没找到这条（可能已被删）"})
+                print(f"  [编辑] {iid[:8]}  {text[:40]}", flush=True)
+                return self._send(200, {"ok": True, "changed": changed, "content": text})
             if not self.path.startswith("/api/status"):
                 return self._send(404, {"ok": False, "error": "not found"})
             try:
@@ -1607,7 +2060,7 @@ def main():
     ap.add_argument("--port", type=int, default=8765, help="--serve 的起始端口")
     ap.add_argument("--no-browser", action="store_true", help="--serve 时不自动打开浏览器")
     ap.add_argument("--apply", metavar="JSON", help="应用离线模式导出的操作文件")
-    ap.add_argument("--open-only", action="store_true", help="只放「没勾掉的备忘 + 待处理灵感」")
+    ap.add_argument("--open-only", action="store_true", help="只放「没完成的备忘 + 待处理灵感」")
     ap.add_argument("--no-memo", action="store_true", help="不带备忘，只看灵感")
     args = ap.parse_args()
 
@@ -1618,7 +2071,7 @@ def main():
     items = collect(args.open_only, not args.no_memo)
     if not items and not args.serve:
         # 静态快照模式：空库确实没东西可放。
-        # 🔴 但 --serve 不能退 —— 页面还得能打开去看归档（已勾掉/已处理/已决议/垃圾桶），
+        # 🔴 但 --serve 不能退 —— 页面还得能打开去看归档（已完成/已处理/已决议/垃圾桶），
         #    否则「库一空，服务就起不来」= 一个完全静默的失败（2026-10-09 修）。
         print("（库里是空的，没有可放的内容）")
         sys.exit(1)

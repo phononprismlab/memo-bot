@@ -1,9 +1,18 @@
 """摸鱼库：群指令「摸鱼」随机抽一条，帮人放松。
 
-- 数据在 `moyu-data.json`（手改即可增删，**不用动代码**）。
+**生效的库 = 数据目录里的 `moyu-user.json`**；这个文件不存在时用随代码走的内置库
+`moyu-data.json`（65 条）。改法有三个，改的都是同一个文件：
+
+  - 配置中心网页「⑨ 摸鱼库」页签（推荐：分类切着看、有计数、能一键恢复内置）
+  - 直接编辑数据目录里的 `moyu-user.json`（手改也行）
+  - 删掉 `moyu-user.json` = 恢复内置库
+
+🔴 **内置的 `moyu-data.json` 只当种子，程序永远不写它** —— 源码版的数据目录就是代码
+   目录，如果直接往那儿写，会把仓库里跟着版本走的库覆盖掉。
+
 - 三类内容：relax（放松动作）/ slack（摸鱼点子）/ trivia（冷知识）。
 - 防重复：把最近抽过的 id 记在 `moyu-recent.json`，抽的时候排除；
-  快抽完一轮（剩余不足 n 条）就重置，从头再来。
+  快抽完一轮（剩余不足 n 条）就重置，从头再来。改库时这份记录会一并清空。
 
 🔴 指令识别走「归一化 + 前缀匹配」而不是精确正则 —— 旧实现用
    `^(?:摸鱼|…)$` 锚定，导致 `摸鱼！`/`摸摸鱼`/`想摸鱼` 这类自然写法
@@ -15,7 +24,7 @@
   python moyu.py 3          抽 3 条
   python moyu.py --cat all  三类混抽
   python moyu.py --cat trivia
-  python moyu.py --stats    看库大小与最近抽过多少
+  python moyu.py --stats    看库大小、用的是内置库还是自己那份
 """
 import json
 import os
@@ -26,15 +35,26 @@ import sys
 from paths import data_path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "moyu-data.json")   # 只读：库内容随代码走
-RECENT = data_path("moyu-recent.json")        # 可写：安装版落用户目录（见 paths.py）
+DATA = os.path.join(HERE, "moyu-data.json")   # 只读：内置库（种子），随代码走
+USER_FILE = "moyu-user.json"                  # 可写：用户自己那份，落在数据目录
+RECENT = data_path("moyu-recent.json")        # 可写：最近抽过的（见 paths.py）
 
 RECENT_KEEP = 20  # 记住最近抽过的多少条（不重复窗口）
 MAX_DRAW = 5      # 一次最多抽几条
+MAX_PER_CAT = 200   # 每类最多多少条（防手滑粘进来一整本书）
+MAX_TEXT_LEN = 120  # 单条最长多少字（群消息一条太长也没人看）
+
+# 分类；顺序 = 配置中心页面上「分哪三类」的排列顺序
+CATS = ("relax", "slack", "trivia")
 
 # 分类 → 展示用图标 / 名称
 CAT_ICON = {"relax": "🧘", "slack": "🐟", "trivia": "💡"}
 CAT_NAME = {"relax": "放松", "slack": "摸鱼", "trivia": "冷知识"}
+CAT_HELP = {
+    "relax": "真能让人从椅子上站起来歇一下的动作。发「摸鱼」默认抽这类。",
+    "slack": "纯摸鱼点子、划水建议。发「摸鱼」默认也抽这类。",
+    "trivia": "冷知识。默认池不含它，要发「摸鱼 冷知识」才抽。",
+}
 
 # 默认池：只放「真的能让人歇一下」的两类；冷知识要单独点
 DEFAULT_CATS = ("relax", "slack")
@@ -121,9 +141,124 @@ def parse(text):
     return None
 
 
-def load_items():
+def user_path():
+    """用户自己那份摸鱼库的路径（文件不存在 = 用内置的）。"""
+    return data_path(USER_FILE)
+
+
+def builtin_items():
+    """随代码走的内置库（只读种子）。"""
     with open(DATA, encoding="utf-8") as f:
         return json.load(f)["items"]
+
+
+def _read_user():
+    """读用户库 → items；文件不在 / 读坏了 / 是空的 → None。"""
+    p = user_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            items = json.load(f).get("items")
+    except (OSError, ValueError):
+        return None
+    return items if isinstance(items, list) and items else None
+
+
+def load_items():
+    """**生效的**摸鱼库：数据目录里有用户库就用它，否则用内置库。
+
+    🔴 用户库读坏了 / 空了 → 悄悄退回内置库，别让「摸鱼」整个哑掉。
+    """
+    return _read_user() or builtin_items()
+
+
+def source():
+    """现在用的是哪份：'user' = 用户自己改过的；'builtin' = 内置库。"""
+    return "user" if _read_user() else "builtin"
+
+
+def as_texts():
+    """→ {cat: [文本, ...]}（配置中心页面拿去填输入框）。"""
+    out = {c: [] for c in CATS}
+    for it in load_items():
+        c = it.get("cat")
+        if c in out and isinstance(it.get("text"), str):
+            out[c].append(it["text"])
+    return out
+
+
+def _clean(groups):
+    """{cat: 文本或文本列表} → ({cat: [干净文本]}, 错误信息)。
+
+    规则：按行拆 → 去首尾空白 → 丢空行 → 同类去重；三类不能全空；
+    单条长度与每类条数有上限（防手滑粘进来一整本书）。
+    """
+    out = {}
+    for c in CATS:
+        raw = (groups or {}).get(c)
+        if raw is None:
+            raw = []
+        lines = raw if isinstance(raw, (list, tuple)) else str(raw).splitlines()
+        seen, keep = set(), []
+        for ln in lines:
+            t = str(ln).strip()
+            if not t:
+                continue
+            if len(t) > MAX_TEXT_LEN:
+                return None, (f"「{CAT_NAME[c]}」里有 {len(t)} 个字的一条，太长了"
+                              f"（上限 {MAX_TEXT_LEN} 字）：{t[:20]}…")
+            if t in seen:
+                continue
+            seen.add(t)
+            keep.append(t)
+        if len(keep) > MAX_PER_CAT:
+            return None, f"「{CAT_NAME[c]}」有 {len(keep)} 条，超过上限 {MAX_PER_CAT} 条"
+        out[c] = keep
+    if not any(out.values()):
+        return None, "三类都是空的，「摸鱼」就没东西可抽了 —— 至少留一条"
+    return out, None
+
+
+def save_items(groups):
+    """把 {cat: 文本 / [文本]} 落成用户库 → (ok, 条数 或 错误信息)。"""
+    clean, err = _clean(groups)
+    if err:
+        return False, err
+    items = []
+    for c in CATS:
+        for i, t in enumerate(clean[c], 1):
+            items.append({"id": f"{c}-{i:02d}", "cat": c, "text": t})
+    doc = {
+        "version": 1,
+        "note": ("摸鱼库（你自己这份）。也可以在配置中心「⑨ 摸鱼库」页签里改。"
+                 "cat: relax=放松 / slack=摸鱼 / trivia=冷知识"),
+        "items": items,
+    }
+    p = user_path()
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except OSError as e:
+        return False, f"写不进去：{type(e).__name__}: {e}"
+    # 🔴 库换了 → 之前记的「抽过哪些」全部作废（id 是位置编号，换内容后含义就变了）
+    _save_recent([])
+    return True, len(items)
+
+
+def reset_items():
+    """删掉用户库 → 回到内置库 → (ok, 消息)。"""
+    p = user_path()
+    if not os.path.exists(p):
+        return False, "本来用的就是内置库"
+    try:
+        os.remove(p)
+    except OSError as e:
+        return False, f"删不掉：{type(e).__name__}: {e}"
+    _save_recent([])
+    return True, "已恢复内置摸鱼库"
 
 
 def _load_recent():
@@ -175,7 +310,7 @@ def parse_cats(word):
 def format_moyu(items):
     """抽到的条目 → 群消息文本。"""
     if not items:
-        return "（摸鱼库是空的）"
+        return "（摸鱼库是空的 —— 到配置中心「摸鱼库」页签里加几条）"
     if len(items) == 1:
         it = items[0]
         return f"🐟 摸鱼一下：\n{CAT_ICON.get(it.get('cat'), '·')} {it['text']}"
@@ -190,7 +325,8 @@ def stats():
     by_cat = {}
     for it in items:
         by_cat[it.get("cat", "?")] = by_cat.get(it.get("cat", "?"), 0) + 1
-    return {"total": len(items), "by_cat": by_cat, "recent": len(_load_recent())}
+    return {"total": len(items), "by_cat": by_cat, "recent": len(_load_recent()),
+            "source": source(), "path": user_path()}
 
 
 def main():

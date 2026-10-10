@@ -3,10 +3,12 @@
 这个文件是干嘛的：
   - 常驻跑着（由计划任务 `MoyuBot` 托管），用 QQ 官方机器人 WebSocket 长连接收消息；
   - 群消息与私聊消息都进 `route_message()`，依次过：
-    忽略表 → 「设置」指令 → 扩展指令 → 内置指令（备忘 / 查备忘 / 查灵感 / 发文件 /
-    摸鱼 / 帮助）→ 都没命中就兜底**静默收作灵感**；
+    忽略表 → 「设置」指令 → 扩展指令 → 内置指令（备忘 / 查备忘 / 查灵感 / 你好 /
+    发文件 / 摸鱼 / 回旋镖 / 导出 / 帮助）→ 都没命中就兜底**静默收作灵感**；
   - 数据落 `store.py`（SQLite）；发文件走 `send_file.py`（纯 HTTP，不占长连接）；
   - 配置读两处：`settings.py`（本机设置，可网页改）+ `.env`（凭据 / 路径）。
+  - 上线播报：**第一次**连上发「功能介绍」（`intro_msg`），之后每次只发「启动播报」
+    （`startup_msg`）；发过没发过看数据目录的 `onboarded.json`。
 
 跑起来的入口：`python bot.py`（真实启动，需 `.env` 里的 QQ 凭据）。
 
@@ -199,12 +201,56 @@ HELP_BASE = (
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
     "设置 —— 看/改本机设置（网页「配置中心」改的是同一份）；\n"
     "            「设置 <键> <值> / 设置 重置 <键>」\n"
+    "你好 —— 看我都能干什么（说明里写清了：我没有语言生成能力）\n"
     "帮助 —— 显示本菜单\n"
     "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰"
 )
 MEMO_LIST_CMDS = {"查备忘", "查看备忘", "备忘列表", "列备忘"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
 HELP_CMDS = {"帮助", "菜单", "指令", "help"}
+# 「你好」= 自我介绍。回复内容 = 设置里的「功能介绍」（首次上线发的也是它），
+# 所以用户在配置中心改一次，两处一起变。
+HELLO_CMDS = {"你好", "您好", "hi", "hello", "嗨"}
+# 设置里「功能介绍」被清空时的兜底 —— 保证「你好」永远有话说。
+HELLO_FALLBACK = (
+    "你好，我是摸鱼bot 🐟\n"
+    "我只会记事和搬文件：记备忘、收灵感、发文件、摸鱼、回旋镖、导出。\n"
+    "我没有语言生成能力，不会聊天、也不会回答问题。\n"
+    "发「帮助」看完整指令。"
+)
+
+# ── 首次上线的「功能介绍」────────────────────────────────────────
+# 只发一次：**第一次**连上发功能介绍，之后每次上线只发「启动播报」。
+# 🔴 标记写在**数据目录**（安装版 = %LOCALAPPDATA%\memo-bot），不写代码目录 ——
+#    源码版和安装版各记各的，互不干扰；卸载也不动数据。
+_ONBOARD_FILE = "onboarded.json"
+
+
+def intro_text():
+    """「你好」的回复 / 首次上线的自我介绍 —— 两处取的是同一份设置。"""
+    return (_settings.get("intro_msg") or "").strip() or HELLO_FALLBACK
+
+
+def onboarded_done():
+    """第一次连上时发过「功能介绍」没有。文件缺失 / 读坏了都当没发过。"""
+    try:
+        with open(data_path(_ONBOARD_FILE), encoding="utf-8") as fh:
+            return bool(json.load(fh).get("done"))
+    except (OSError, ValueError):
+        return False
+
+
+def mark_onboarded():
+    """记下「功能介绍已发」。**发成功才调** —— 发失败下次上线还能重试。"""
+    try:
+        with open(data_path(_ONBOARD_FILE), "w", encoding="utf-8") as fh:
+            json.dump({"done": True,
+                       "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                      fh, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"[功能介绍·标记写入失败] {type(e).__name__}: {e}", flush=True)
+
+
 # ── 回旋镖：把 N 天以前的旧记录翻一条推回给用户 ───────────────────
 # 指令词只认完整写法，不用「镖」「回旋」这种短词 —— 否则「飞镖」「回旋踢」会被误判。
 BOOMERANG_CMDS = ("回旋镖", "回旋标")
@@ -234,8 +280,9 @@ def strip_at(text):
 SCOPE_GROUP = "group"
 SCOPE_C2C = "c2c"
 C2C_GROUP_NAME = "私聊"
-# 私聊里「非指令文本」的处理：True = 回一句「已收作灵感」；False = 静默收（同群内非 @ 语义）
-C2C_ACK_IDEA = False
+# 私聊里「非指令文本」收作灵感后回不回执 —— 由设置项 `idea_ack` 决定：
+# 留空 = 静默收（默认，跟群内非 @ 一个语义）；填一句就回那一句。
+# 🔴 别再往这里加写死的开关 —— 配置中心里能改，改完重启即可。
 
 
 def chat_target(message, scope):
@@ -264,6 +311,7 @@ def parse_boomerang(text):
     """`回旋镖` / `回旋镖 7` → (True, None) / (True, 7)；不是这个指令 → (False, None)。
 
     天数可以写在指令后面，临时改这一次的回溯范围（不用去配置中心改设置）。
+    🔴 下限是 **0**（不是 1）：`回旋镖 0` = 今天记的也翻得到，刚上手就能试。
     """
     t = (text or "").strip()
     for c in BOOMERANG_CMDS:
@@ -274,7 +322,7 @@ def parse_boomerang(text):
             return True, None
         m = re.match(r"^[ ：:　\t]*(\d{1,4})", rest)
         if m:
-            return True, max(1, min(3650, int(m.group(1))))
+            return True, max(0, min(3650, int(m.group(1))))
         return False, None          # 「回旋镖xx」这种不是指令，落回普通流程
     return False, None
 
@@ -293,9 +341,11 @@ def boomerang_text(days=None, now=None):
     item = pick_boomerang(days, scope, now)
     if not item:
         # 区分「还没攒够天数」和「都推完了」—— 否则用户分不清是没记录还是推过一轮了
+        # 🔴 days=0 时不会有「还没满 0 天」这种话：那时候池子只要非空就一定能挑到，
+        #    挑不到只能是「都推完了」，所以自动落到下面那条。
         if count_boomerang(0, scope, now):
             return (f"🪃 还没有满 {days} 天的旧记录，再等等。\n"
-                    f"（可推范围在「配置中心 → ⑤ 回旋镖」里改）")
+                    f"（可推范围在「配置中心 → 回旋镖」里改；回溯天数填 0 就能翻今天记的）")
         return ("🪃 旧记录都推过一遍了。\n"
                 "（同一条不会推第二次；新记的满天数后会再进池子）")
 
@@ -308,8 +358,11 @@ def boomerang_text(days=None, now=None):
     verb = "记过一条备忘" if item.get("kind") == KIND_MEMO else "冒出过一个想法"
     note = (item.get("note") or "").strip()
     tail = f"\n\n【当时的结论】{note}" if note else ""
+    # 回溯天数可以是 0（今天记的也翻得到）—— 那时候别写「0 天前」，说「今天」
+    head = (f"你今天（{created[:10]}）{verb}："
+            if ago <= 0 else f"你 {ago} 天前（{created[:10]}）{verb}：")
     return (f"🪃 回旋镖！\n"
-            f"你 {ago} 天前（{created[:10]}）{verb}：\n"
+            f"{head}\n"
             f"{(item.get('content') or '').strip()}{tail}\n\n"
             f"…还有后续吗？")
 
@@ -791,12 +844,15 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
-    # 2) 查备忘 / 查灵感 / 帮助
+    # 2) 查备忘 / 查灵感 / 你好 / 帮助
     if text in MEMO_LIST_CMDS:
         await message.reply(content=memo_list_text(10, KIND_MEMO), msg_seq=1)
         return
     if text in IDEA_LIST_CMDS:
         await message.reply(content=memo_list_text(10, KIND_IDEA), msg_seq=1)
+        return
+    if text in HELLO_CMDS:
+        await message.reply(content=intro_text(), msg_seq=1)
         return
     if text in HELP_CMDS:
         await message.reply(content=help_text(), msg_seq=1)
@@ -806,10 +862,12 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     result = handle_event(t["store_id"], t["store_name"], t["sender_id"], "", raw)
     if result:
         print(f"[备忘] {gid} -> {result['content']}", flush=True)
-        try:
-            await message.reply(content="已记到秘书会话 ✅", msg_seq=1)
-        except Exception as e:  # 回执失败不影响已记录
-            print("reply failed:", e, flush=True)
+        ack = (_settings.get("memo_ack") or "").strip()   # 留空 = 静默记下，不回执
+        if ack:
+            try:
+                await message.reply(content=ack, msg_seq=1)
+            except Exception as e:  # 回执失败不影响已记录
+                print("reply failed:", e, flush=True)
         return
 
     # 4.5) 兜底
@@ -820,8 +878,9 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
                         text.strip(), kind=KIND_IDEA)
         print(f"[灵感·私聊] {gid} -> {idea['content']}", flush=True)
-        if C2C_ACK_IDEA:
-            await message.reply(content="💡 已收作灵感", msg_seq=1)
+        idea_ack = (_settings.get("idea_ack") or "").strip()   # 留空 = 静默收下
+        if idea_ack:
+            await message.reply(content=idea_ack, msg_seq=1)
         return
     if mentioned:
         print(f"[未识别] @消息 text={text!r}", flush=True)
@@ -879,9 +938,17 @@ def main():
     class MemoClient(Client):
         async def on_ready(self):
             print(f"[botpy] 已上线：{self.robot.name}", flush=True)
-            # 启动播报（主动推送，群内需开启「机器人主动发言」）
+            # 播报（主动推送，群内需开启「机器人主动发言」）
             # 🔴 目标可以**多个群**（`.env` 的 QQ_GROUP_OPENID 分号分隔，见 groups.py）
-            msg = (_settings.get("startup_msg") or "").strip()
+            # 🔴 **第一次**连上发「功能介绍」（新手引导），之后每次上线只发「启动播报」。
+            first = not onboarded_done()
+            msg = (_settings.get("intro_msg" if first else "startup_msg") or "").strip()
+            if first and not msg:
+                # 「功能介绍」被清空 = 不做引导，退回普通播报
+                first = False
+                msg = (_settings.get("startup_msg") or "").strip()
+            tag = "功能介绍" if first else "启动播报"
+            sent = 0
             for gid in _groups.targets():
                 if not msg:
                     break
@@ -891,9 +958,13 @@ def main():
                     await asyncio.to_thread(
                         sf.send_text_message, msg, gid, sandbox, appid, secret, None, 1
                     )
-                    print(f"[启动播报] {gid}: {msg}", flush=True)
+                    print(f"[{tag}] {gid}: {msg}", flush=True)
+                    sent += 1
                 except Exception as e:
-                    print(f"[启动播报失败] {gid}: {type(e).__name__}: {e}", flush=True)
+                    print(f"[{tag}失败] {gid}: {type(e).__name__}: {e}", flush=True)
+            # 至少发成功一个群才算引导完成 —— 一个都没发成，下次上线重试
+            if first and sent:
+                mark_onboarded()
 
         async def send_file_to_chat(self, message, scope, openid, full, rel, mid,
                                     caption=None, as_file=False):

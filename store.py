@@ -4,6 +4,10 @@
   kind='memo' —— 明确标记的备忘（@bot 发「备忘 xxx」，或「备忘」前缀）
   kind='idea' —— 群里非 @ 的普通文本，自动收集为灵感
 
+🔴 库**第一次建出来**时会塞几条示例（`SEED_ITEMS`）—— 三条灵感介绍页面能干什么、
+   一条备忘介绍怎么用摸鱼bot，免得新用户打开脑内抽屉看到一片空白。
+   老库不塞；`MEMO_NO_SEED=1` 可关。
+
 生产替换：把这里换成 CloudBase PostgreSQL 的 bot_memos 表即可，接口不变。
 """
 import os
@@ -19,15 +23,49 @@ DB = data_path("memos.db")
 KIND_MEMO = "memo"
 KIND_IDEA = "idea"
 
-# 灵感处理状态（只有 kind='idea' 会用到）
-STATUS_OPEN = "open"          # 待处理
-STATUS_DONE = "done"          # 已处理（产生了行动并完成）
-STATUS_DECIDED = "decided"    # 已决议（有结论，但不产生行动）
-STATUS_DROPPED = "dropped"    # 已丢弃（不成立/无效）
+# 记录状态。灵感（kind='idea'）四态都用；备忘（kind='memo'）只用 open / done / dropped
+# （没有「已决议」—— 备忘是「我要做」，要么做完，要么不做了）。
+STATUS_OPEN = "open"          # 待处理 / 没完成
+STATUS_DONE = "done"          # 已处理 / 已完成
+STATUS_DECIDED = "decided"    # 已决议（有结论，但不产生行动）—— 只有灵感用
+STATUS_DROPPED = "dropped"    # 已丢弃（不成立 / 无效 / 不做了）
+
+# ── 首次使用：塞几条示例，别让新用户打开抽屉看到一片空白 ──────────────
+# 三条灵感介绍页面能干什么，一条备忘介绍怎么用摸鱼bot。
+# 🔴 **只在 `memos` 表第一次建出来的时候塞**（判据是建表前它还不存在）——
+#    老库绝不塞：用户可能已经把示例处理掉了，不能又给他塞回来。
+# 🔴 设 `MEMO_NO_SEED=1` 可以关掉（测试、以及想要空库的人）。
+# 这些就是普通记录：能编辑、能完成、能丢弃、能永久删除，和用户自己记的没区别。
+SEED_ITEMS = (
+    (KIND_IDEA, "群里随手发一句，我就悄悄收成灵感 —— 不用 @ 我"),
+    (KIND_IDEA, "看到卡片点一下就能处理：已处理 / 已决议 / 丢弃，网页上直接生效"),
+    (KIND_IDEA, "发「回旋镖」能把很久以前记的东西翻回来，别让它们烂在库里"),
+    (KIND_MEMO, "在群里发「摸鱼」，随机回你一条摸鱼文案"),
+)
+
+
+def _seed(con):
+    """把示例内容写进刚建好的空库。返回塞了几条。"""
+    base = datetime.now()
+    n = len(SEED_ITEMS)
+    for idx, (kind, content) in enumerate(SEED_ITEMS):
+        # 时间各错开一秒 —— 列表和导出里有个自然先后（同一秒排序不稳定）
+        created = (base - timedelta(seconds=n - idx)).isoformat(timespec="seconds")
+        con.execute(
+            "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,content,created_at,kind)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid4()), "", "示例", "", "摸鱼bot", content, created, kind),
+        )
+    return n
 
 
 def init():
     con = sqlite3.connect(DB)
+    # 🔴 建表**之前**先看表在不在 —— 这就是「是不是第一次用」的唯一判据。
+    #    用「表是空的」当判据不行：用户把示例删光了，再启动就又给他塞回来。
+    fresh = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memos'"
+    ).fetchone() is None
     con.execute(
         """CREATE TABLE IF NOT EXISTS memos (
             id           TEXT PRIMARY KEY,
@@ -58,6 +96,9 @@ def init():
     if "boomerang_at" not in cols:
         # 回旋镖推过这条没有（非空 = 推过）—— 避免同一个用户反复收到同一条旧记录
         con.execute("ALTER TABLE memos ADD COLUMN boomerang_at TEXT")
+    # 全新的库才塞示例（老库 fresh=False，一个字节都不动）
+    if fresh and not os.environ.get("MEMO_NO_SEED"):
+        _seed(con)
     con.commit()
     con.close()
 
@@ -180,17 +221,24 @@ def set_idea_status(ids, status, note=None):
     return n
 
 
-# ── 备忘：只有「勾掉 / 没勾掉」两态 ──────────────────────────────
-# 备忘 = 我要做（kind='memo'），不需要灵感那套四态；复用 status 列：
-#   open = 没勾掉，done = 已勾掉，processed_at = 勾掉时间。
-# 勾掉 ≠ 删除：行还在表里，随时能取消（页面上的「✓ 已勾掉」列表里点「← 取消勾掉」）。
+# ── 备忘：没完成 / 已完成 / 已丢弃 三态 ──────────────────────────
+# 备忘 = 我要做（kind='memo'），复用 status 列：
+#   open = 没完成，done = 已完成，dropped = 已丢弃（不做了 / 作废）。
+# 🔴 「已完成」和「已丢弃」都**不是删除**：行还在表里，随时能取消 / 恢复。
+#    真要抹掉得走 delete_items()（页面上「已丢弃」列表里的「永久删除」）。
+# processed_at 记的是最后一次改状态的时间。
 
-def set_memo_done(ids, done=True):
-    """批量勾掉 / 取消勾掉备忘。返回实际改动条数。"""
-    if not ids:
+MEMO_STATUSES = (STATUS_OPEN, STATUS_DONE, STATUS_DROPPED)
+
+
+def set_memo_status(ids, status):
+    """批量改备忘状态（open / done / dropped）。返回实际改动条数。
+
+    🔴 `kind='memo'` 过滤在 SQL 里 —— 传进来灵感 id 也不会被误改。
+    """
+    if not ids or status not in MEMO_STATUSES:
         return 0
     now = datetime.now().isoformat(timespec="seconds")
-    status = STATUS_DONE if done else STATUS_OPEN
     con = sqlite3.connect(DB)
     n = 0
     for i in ids:
@@ -199,6 +247,53 @@ def set_memo_done(ids, done=True):
             (status, now, i, KIND_MEMO),
         )
         n += cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+def set_memo_done(ids, done=True):
+    """批量完成 / 取消完成备忘。返回实际改动条数。
+
+    保留这个签名是因为老调用方（离线操作文件 `抽屉操作.json` 里的 `{"done": true}`、
+    老测试）还在用 —— 内部就是 `set_memo_status`。
+    """
+    return set_memo_status(ids, STATUS_DONE if done else STATUS_OPEN)
+
+
+def delete_items(ids):
+    """**永久删除**这些记录（真删行，不可恢复）。备忘和灵感都能删。返回删除条数。
+
+    🔴 只给「已丢弃」列表的「永久删除」用。页面侧必须先弹确认框 ——
+       这一层不做任何状态检查，调用方负责确认。
+    """
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return 0
+    con = sqlite3.connect(DB)
+    marks = ",".join("?" * len(ids))
+    cur = con.execute(f"DELETE FROM memos WHERE id IN ({marks})", ids)
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+# ── ✏️ 再次编辑正文 ────────────────────────────────────────────
+# 回顾的时候发现写错了字、或者对某件事有了新想法 —— 改正文就行。
+# 🔴 这是用户明确要求：**创建时间戳（created_at）保持不变**，时间轴不会乱。
+
+def update_content(item_id, content):
+    """**只改正文**，不碰创建时间。页面上「✏️ 编辑」走这里。
+
+    🔴 备忘和灵感都能改（不按 kind 过滤）。返回实际改动条数（id 不存在 → 0）。
+    🔴 SQL 里**没有 created_at** —— 这是这个函数存在的全部意义。
+    """
+    if not item_id or content is None:
+        return 0
+    con = sqlite3.connect(DB)
+    cur = con.execute("UPDATE memos SET content=? WHERE id=?", (content, item_id))
+    n = cur.rowcount
     con.commit()
     con.close()
     return n
@@ -218,7 +313,11 @@ _SCOPE_TO_STATUS = {
 
 
 def _boomerang_where(days, scope, now=None):
-    """拼出回旋镖的 WHERE 子句 → (sql 片段, 参数列表)。没有可推范围时返回 (None, [])。"""
+    """拼出回旋镖的 WHERE 子句 → (sql 片段, 参数列表)。没有可推范围时返回 (None, [])。
+
+    🔴 `days=0` 是合法的：cutoff 就是 now，**今天刚记的也进池子** ——
+       刚试用的用户发一句「回旋镖」立刻能看到效果，不该被「还没满 N 天」挡在门外。
+    """
     want_memo = "memo" in (scope or [])
     statuses = [_SCOPE_TO_STATUS[s] for s in (scope or []) if s in _SCOPE_TO_STATUS]
     if not want_memo and not statuses:

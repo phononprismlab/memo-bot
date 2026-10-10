@@ -28,7 +28,8 @@ FILE = data_path("settings.json")
 _LOCK = threading.Lock()
 
 # ── 可设置的键 ───────────────────────────────────────────────────
-# kind: text（一行文本，留空 = 关掉该功能）/ multi（多选，值是一组 code）/ int（整数）
+# kind: text（一行文本，留空 = 关掉该功能）/ area（多行文本，换行有意义）/
+#       multi（多选，值是一组 code）/ int（整数）
 KEYS = {
     "startup_msg": {
         "label": "启动播报",
@@ -44,12 +45,49 @@ KEYS = {
         "env": "OFFWORK_MSG",
         "help": "关机时自动发到群里的话；留空 = 不发",
     },
+    "intro_msg": {
+        "label": "功能介绍（首次上线 / 发「你好」）",
+        "kind": "area",
+        "default": (
+            "你好，我是摸鱼bot 🐟\n"
+            "\n"
+            "我在群里帮你干这些活：\n"
+            "· 记备忘 —— 说「备忘 买猫粮」，我收进脑内抽屉\n"
+            "· 收灵感 —— 不带指令的普通发言，我悄悄记下来\n"
+            "· 发文件 —— 说「发文件 设计说明」，我把文件渲染成图片发出来\n"
+            "· 摸鱼 —— 说「摸鱼」，随机来一条，歇一下\n"
+            "· 回旋镖 —— 把几天前记的旧账翻一条回来\n"
+            "· 导出 —— 把全部备忘 + 灵感导成一个文件发给你\n"
+            "\n"
+            "先说明白一件事：我没有语言生成能力。\n"
+            "不会聊天、不会回答问题、不会替你写东西 —— 我只是个记事本加文件搬运工。\n"
+            "想找 AI 聊天的话，我帮不上忙。\n"
+            "\n"
+            "发「帮助」看完整指令。"
+        ),
+        "help": "机器人第一次连上时自动发的自我介绍；之后每次上线只发「启动播报」。"
+                "群里 / 私聊发「你好」也回这段。留空 = 首次上线不介绍（「你好」改用内置短文案）",
+    },
+    "memo_ack": {
+        "label": "备忘回执",
+        "kind": "text",
+        "default": "已经放进脑内抽屉了",
+        "help": "记下一条备忘后回给用户的那句话；留空 = 不回执（静默记下）",
+    },
+    "idea_ack": {
+        "label": "灵感回执",
+        "kind": "text",
+        "default": "",
+        "help": "把普通发言收作灵感后回的那句话（只在私聊 / @ 机器人时回，"
+                "群里不 @ 的普通发言一律静默收）。"
+                "留空 = 静默收下，不回 —— 这是默认；想让它回一句就填上，例如「💡 已收作灵感」",
+    },
     "bubbles_show": {
         "label": "脑内抽屉展示范围",
         "kind": "multi",
         "default": ["memo", "open"],
         "choices": ["memo", "memo_done", "open", "done", "decided", "dropped"],
-        "choice_labels": {"memo": "备忘", "memo_done": "已勾掉",
+        "choice_labels": {"memo": "备忘", "memo_done": "已完成",
                           "open": "待处理", "done": "已处理",
                           "decided": "已决议", "dropped": "已丢弃"},
         "help": "打开脑内抽屉时，内容流里放哪几类（默认：备忘 + 待处理灵感）",
@@ -58,9 +96,12 @@ KEYS = {
         "label": "回旋镖回溯天数",
         "kind": "int",
         "default": 3,
-        "min": 1,
+        "min": 0,
         "max": 365,
-        "help": "发「回旋镖」时，翻多少天**以前**的记录（默认 3 天；刚记的还不算）",
+        # 🔴 下限是 0，不是 1：填 0 = 今天记的也算，刚上手的人发一句「回旋镖」
+        #    立刻就能看到效果，不会被「还没满 3 天」挡在门外。
+        "help": "发「回旋镖」时，翻多少天以前的记录（默认 3 天；填 0 = 今天记的也算，"
+                "刚上手就能玩）",
     },
     "boomerang_scope": {
         "label": "回旋镖推送范围",
@@ -139,7 +180,7 @@ def normalize(key, raw):
     if key not in KEYS:
         return None, f"没有这个设置项：{key}"
     cfg = KEYS[key]
-    if cfg["kind"] == "text":
+    if cfg["kind"] in ("text", "area"):
         return str(raw if raw is not None else "").strip(), None
     if cfg["kind"] == "int":
         s = str(raw if raw is not None else "").strip()
