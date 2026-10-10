@@ -1,4 +1,4 @@
-"""关机播报：往群里发一条「下班了」。
+"""关机播报：往群 / 私聊发一条「下班了」。
 
 这个文件是干嘛的：把「读配置 + 发送」从**触发方式**里拆出来，让两个触发口共用同一份逻辑。
 
@@ -15,7 +15,6 @@
 留空 = 不发。settings 内部会回退到 `.env` 的 `OFFWORK_MSG`，再回退到内置默认值。
 """
 import datetime as _dt
-import os
 import time
 
 ATTEMPTS = 2          # 默认外层尝试次数（send_file 内部还有瞬时错误重试）
@@ -23,28 +22,28 @@ RETRY_WAIT = 1.0
 
 
 def read_config():
-    """从 .env + settings 读出 (appid, secret, 群列表, sandbox, msg)。
+    """从 .env + settings 读出 (appid, secret, 播报目标, sandbox, msg)。
 
-    🔴 群可以**多个** —— `.env` 的 `QQ_GROUP_OPENID` 用分号分隔（见 `groups.py`）。
+    🔴 播报目标 = `[(scope, openid), ...]`，**群和私聊平级、都可多个** ——
+       用户在配置中心自己勾（`.env` 的 `QQ_PUSH_TARGETS`，见 `push.py`）。
     """
+    import push as _push
     import send_file
     import settings
-    import groups as _groups
 
     env = dict(send_file.load_env())
     appid = (env.get("QQ_BOT_APPID") or "").strip()
     secret = (env.get("QQ_BOT_SECRET") or "").strip()
-    raw = os.getenv("QQ_GROUP_OPENID") or env.get("QQ_GROUP_OPENID") or ""
-    gids = _groups.parse_ids(raw)
+    targets = _push.targets(env)
     sandbox = (env.get("QQ_BOT_SANDBOX") or "").strip().lower() in ("1", "true", "yes")
     msg = (settings.get("offwork_msg") or "").strip()
-    return appid, secret, gids, sandbox, msg
+    return appid, secret, targets, sandbox, msg
 
 
 def send_offwork(log=None, dry_run=False, attempts=ATTEMPTS, retry_wait=RETRY_WAIT):
-    """发一条下班消息（**每个配了 openid 的群都发**）→ (code, 说明文本)。
+    """发一条下班消息（**每个配了 openid 的群 / 私聊用户都发**）→ (code, 说明文本)。
 
-    code: 0 = 全部成功 / 主动跳过；2 = 配置缺失；1 = 有群发失败。
+    code: 0 = 全部成功 / 主动跳过；2 = 配置缺失；1 = 有目标发失败。
 
     关机场景请传 `attempts=1` —— 系统等窗口就那么几秒，重试反而来不及。
     """
@@ -55,10 +54,12 @@ def send_offwork(log=None, dry_run=False, attempts=ATTEMPTS, retry_wait=RETRY_WA
             except Exception:
                 pass
 
-    appid, secret, gids, sandbox, msg = read_config()
+    appid, secret, targets, sandbox, msg = read_config()
     missing = [n for n, v in (("QQ_BOT_APPID", appid), ("QQ_BOT_SECRET", secret)) if not v]
-    if not gids:
-        missing.append("QQ_GROUP_OPENID")
+    if not targets:
+        # 🔴 **一个目标都没勾**才算缺 —— 只勾了私聊也该能发
+        #    （有用户就是完全不用群，见 push.py）
+        missing.append("QQ_PUSH_TARGETS")
     if missing:
         t = "配置缺失：" + ", ".join(missing) + "（检查 .env）"
         _log(t)
@@ -70,36 +71,39 @@ def send_offwork(log=None, dry_run=False, attempts=ATTEMPTS, retry_wait=RETRY_WA
         return 0, t
 
     if dry_run:
-        t = "dry-run：将发送 {} -> 群 {}".format(repr(msg), ", ".join(gids))
+        t = "dry-run：将发送 {} -> {}".format(
+            repr(msg), ", ".join(f"{sc}:{oid}" for sc, oid in targets) or "（无）")
         _log(t)
         return 0, t
 
     import send_file
 
-    _log("发送 {} -> {} 个群".format(repr(msg), len(gids)))
+    _log("发送 {} -> {} 个目标".format(repr(msg), len(targets)))
     failed = 0
-    for gid in gids:
+    for sc, oid in targets:
         last = None
         sent = False
         for i in range(1, attempts + 1):
             try:
                 send_file.send_text_message(
-                    msg, gid, sandbox, appid, secret,
-                    msg_id=None, seq=1, scope=send_file.SCOPE_GROUP,
+                    msg, oid, sandbox, appid, secret,
+                    msg_id=None, seq=1, scope=sc,
                 )
-                _log("发送成功 ✅ {}（第 {} 次尝试）".format(gid, i))
+                _log("发送成功 ✅ {}:{}（第 {} 次尝试）".format(sc, oid, i))
                 sent = True
                 break
             except Exception as exc:                  # noqa: BLE001
                 last = exc
-                _log("{} 第 {} 次失败：{}: {}".format(gid, i, type(exc).__name__, exc))
+                _log("{}:{} 第 {} 次失败：{}: {}".format(
+                    sc, oid, i, type(exc).__name__, exc))
                 if i < attempts:
                     time.sleep(retry_wait)
         if not sent:
             failed += 1
-            _log("{} 全部失败，放弃。最后错误：{}: {}".format(gid, type(last).__name__, last))
+            _log("{}:{} 全部失败，放弃。最后错误：{}: {}".format(
+                sc, oid, type(last).__name__, last))
     if failed:
-        return 1, "{} 个群发送失败".format(failed)
+        return 1, "{} 个目标发送失败".format(failed)
     return 0, "全部发送成功"
 
 

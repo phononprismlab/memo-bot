@@ -9,6 +9,8 @@
   - 配置读两处：`settings.py`（本机设置，可网页改）+ `.env`（凭据 / 路径）。
   - 上线播报：**第一次**连上发「功能介绍」（`intro_msg`），之后每次只发「启动播报」
     （`startup_msg`）；发过没发过看数据目录的 `onboarded.json`。
+    目标 = 用户在配置中心勾选的会话（`.env` 的 `QQ_PUSH_TARGETS`，
+    `group:<id>;c2c:<id>`，群和私聊都可多个、平级，见 `push.py`）。
 
 跑起来的入口：`python bot.py`（真实启动，需 `.env` 里的 QQ 凭据）。
 
@@ -67,7 +69,7 @@ import extensions as _ext
 import ignore as _ignore
 import settings as _settings
 import export as _export
-import groups as _groups
+import push as _push
 
 from paths import data_path
 
@@ -714,14 +716,16 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     """
     t = chat_target(message, scope)
     gid, mid = t["key"], (getattr(message, "id", "") or "")
-    if scope == SCOPE_GROUP:
-        # 记下这个群 —— 配置中心页面据此列出「机器人被拉进过哪些群」，
-        # 用户不用再手动拉群 + 翻日志找 openid（见 groups.py）。
-        try:
-            _groups.note(getattr(message, "group_openid", "") or t["openid"],
-                         getattr(message, "group_name", "") or "")
-        except Exception:
-            pass
+    # 记下这个会话（群 / 私聊都记）—— 配置中心「① 连接 QQ」据此列出
+    # 「机器人在哪些会话里活动过」，用户点着勾选就决定播报发到哪（见 push.py）。
+    # 🔴 不传名字：平台侧根本拿不到 —— 群名接口要白名单，私聊没有查用户信息的接口。
+    #    `botpy.message.GroupMessage.__slots__` 里连 `group_name` 都没有，
+    #    以前那句 `getattr(…, "group_name", "")` 是永远取不到值的死代码。
+    #    名字靠用户自己在配置中心起（`push.set_name`）。
+    try:
+        _push.note(scope, t["openid"])
+    except Exception:
+        pass
     save_last_msg(t["openid"], mid, scope)
     raw = getattr(message, "content", "") or ""
     text = strip_at(raw)
@@ -938,8 +942,10 @@ def main():
     class MemoClient(Client):
         async def on_ready(self):
             print(f"[botpy] 已上线：{self.robot.name}", flush=True)
-            # 播报（主动推送，群内需开启「机器人主动发言」）
-            # 🔴 目标可以**多个群**（`.env` 的 QQ_GROUP_OPENID 分号分隔，见 groups.py）
+            # 播报（主动推送：群内需开启「机器人主动发言」；私聊无需开关）
+            # 🔴 目标由用户自己在配置中心勾选（`.env` 的 `QQ_PUSH_TARGETS`，
+            #    格式 `group:<id>;c2c:<id>`，见 push.py）—— 群和私聊平级，
+            #    **不默认发群**：有人就是完全不想把机器人拉进群。
             # 🔴 **第一次**连上发「功能介绍」（新手引导），之后每次上线只发「启动播报」。
             first = not onboarded_done()
             msg = (_settings.get("intro_msg" if first else "startup_msg") or "").strip()
@@ -948,21 +954,22 @@ def main():
                 first = False
                 msg = (_settings.get("startup_msg") or "").strip()
             tag = "功能介绍" if first else "启动播报"
+            targets = _push.targets()
             sent = 0
-            for gid in _groups.targets():
+            for sc, oid in targets:
                 if not msg:
                     break
                 try:
                     import send_file as sf
 
                     await asyncio.to_thread(
-                        sf.send_text_message, msg, gid, sandbox, appid, secret, None, 1
+                        sf.send_text_message, msg, oid, sandbox, appid, secret, None, 1, sc
                     )
-                    print(f"[{tag}] {gid}: {msg}", flush=True)
+                    print(f"[{tag}] {sc}:{oid}: {msg}", flush=True)
                     sent += 1
                 except Exception as e:
-                    print(f"[{tag}失败] {gid}: {type(e).__name__}: {e}", flush=True)
-            # 至少发成功一个群才算引导完成 —— 一个都没发成，下次上线重试
+                    print(f"[{tag}失败] {sc}:{oid}: {type(e).__name__}: {e}", flush=True)
+            # 至少发成功一个目标才算引导完成 —— 一个都没发成，下次上线重试
             if first and sent:
                 mark_onboarded()
 
@@ -980,7 +987,9 @@ def main():
                 await message.reply(content=f"（{rel} 超过 200MB，发不了）", msg_seq=1)
                 return
 
-            # 私聊没有「主动发言」权限 → 一律被动回复（带触发消息的 msg_id）；
+            # 私聊一律**被动回复**（带触发消息的 msg_id）：用户刚发来一条指令，
+            # 回给「那条消息」语义更准，也不占主动消息额度（主动推送单聊是能用的，
+            # 见 push.py —— 播报那条路走的就是主动推送）。
             # 群优先主动推送，失败再降级为被动回复。
             if scope == SCOPE_C2C:
                 attempts = [(mid, sf.CLI_SEQ_BASE)]

@@ -19,8 +19,10 @@ memos.db
 moyu-recent.json
 # 忽略表（含真实群内昵称 / 发送者 openid）
 ignore.json
-# 已发现的群（含真实群 openid）
+# 已发现的群 / 私聊会话 + 用户起的备注名（含真实 openid）
 groups.json
+c2c.json
+sessions.json
 # 本机设置（网页「⚙ 设置」/ 机器人「设置」指令写的就是它）
 settings.json
 # 「首次上线发过功能介绍」的标记（本机状态，换台机器要重新引导）

@@ -16,8 +16,8 @@
   python send_file.py --file <路径> --user <openid>   # 发单聊
   python send_file.py --file <路径> --passive    强制走被动回复（默认主动推送）
 
-默认主动推送（需群设置里开启「机器人主动在群聊内发言」）；主动推送失败会自动
-降级为被动回复（需 4 分钟内群里 @ 过 bot）。单聊无主动发言权限，一律被动回复。
+默认主动推送（群需开启「机器人主动在群聊内发言」；**单聊无需开关**，实测可主动推送）。
+主动推送失败会自动降级为被动回复（需 4 分钟内群里 @ 过 bot）。
 """
 import argparse
 import base64
@@ -241,7 +241,8 @@ def send_file(file_path, openid, caption, file_type, sandbox, appid, secret, msg
     seq = seq_base
 
     def _with_reply(payload):
-        # 被动回复：带上触发消息的 msg_id 与递增 msg_seq（主动消息个人 bot 无权限）
+        # 被动回复：带上触发消息的 msg_id 与递增 msg_seq。
+        # （主动推送不带 msg_id；群内没开「主动发言」时会报 40034105，才降级走这里）
         nonlocal seq
         if msg_id:
             payload = {**payload, "msg_id": msg_id, "msg_seq": seq}
@@ -352,22 +353,36 @@ def self_test():
     env = {**load_env(), **os.environ}
     appid = (env.get("QQ_BOT_APPID") or "").strip()
     secret = (env.get("QQ_BOT_SECRET") or env.get("QQ_BOT_TOKEN") or "").strip()
-    group = (env.get("QQ_GROUP_OPENID") or "").strip()
+    group = default_group(env)
     sandbox = (env.get("QQ_BOT_SANDBOX") or "").strip().lower() in ("1", "true", "yes")
     print("-- 凭据/配置（来自 .env 或环境变量）--")
     print(f"  QQ_BOT_APPID    : {'已配置' if appid else '缺失'}")
     print(f"  QQ_BOT_SECRET   : {'已配置' if secret else '缺失'}")
-    print(f"  QQ_GROUP_OPENID : {'已配置' if group else '缺失（发送时用 --group）'}")
+    print(f"  默认群目标       : {'已配置' if group else '缺失（发送时用 --group）'}")
     print(f"  QQ_BOT_SANDBOX  : {sandbox}")
     print("=== 自检通过 ===" if ok else "=== 自检失败 ===")
     return 0 if ok else 1
+
+
+def default_group(env=None):
+    """`.env` 里配的第一个**群**目标 —— `--group` 没传时的兜底。
+
+    🔴 群和私聊现在都在同一个键 `QQ_PUSH_TARGETS` 里（`group:<id>;c2c:<id>`，
+       见 `push.py`），这里只挑 `scope=group` 的第一个；要发私聊用 `--user`。
+    """
+    import push as _push
+
+    for sc, oid in _push.targets(env):
+        if sc == _push.SCOPE_GROUP:
+            return oid
+    return ""
 
 
 def main():
     ap = argparse.ArgumentParser(description="发文件到 QQ 群 / 单聊")
     ap.add_argument("--file", help="要发送的本地文件路径")
     ap.add_argument("--caption", default="", help="随文件一起发送的一句话（可选）")
-    ap.add_argument("--group", default=None, help="目标群 openid（默认取 .env 的 QQ_GROUP_OPENID）")
+    ap.add_argument("--group", default=None, help="目标群 openid（默认取 .env 里配的第一个群目标）")
     ap.add_argument("--user", default=None, help="目标单聊用户 openid（与 --group 二选一）")
     ap.add_argument("--type", type=int, default=0, help="覆盖类型 1图片/2视频/3语音/4文件（默认按扩展名）")
     ap.add_argument("--proactive", action="store_true", help="[默认] 主动推送（保留兼容，等价于不加 --passive）")
@@ -390,13 +405,13 @@ def main():
     if args.user:
         scope, group = SCOPE_C2C, args.user.strip()
     else:
-        scope, group = SCOPE_GROUP, (args.group or (env.get("QQ_GROUP_OPENID") or "").strip())
+        scope, group = SCOPE_GROUP, (args.group or default_group(env))
 
-    # 默认主动推送（群内开启「机器人主动发言」后可用）；--passive 则走被动回复。
-    # 单聊没有主动发言权限 → 一律被动回复（需要缓存的 msg_id）。
+    # 默认主动推送（群内开启「机器人主动发言」后可用；单聊无需开关）。
+    # --passive 则走被动回复（需要缓存的 msg_id）。
     last = load_last_msg()
     msg_id = None
-    if args.passive or scope == SCOPE_C2C or not group:
+    if args.passive or not group:
         if not last:
             print("⚠️ 被动回复需要 bot 已缓存最近一条消息：请先在群里 @摸鱼bot（或私聊 bot）发一条消息，")
             print("   然后在 4 分钟内重试（或去掉 --passive 用主动推送）。")
@@ -421,7 +436,7 @@ def main():
         print("缺少 QQ_BOT_APPID / QQ_BOT_SECRET，请在 .env 配置（见 .env.example）。")
         sys.exit(1)
     if not group:
-        print("缺少目标 openid：请传 --group / --user，或在 .env 配 QQ_GROUP_OPENID。")
+        print("缺少目标 openid：请传 --group / --user，或在配置中心勾选播报目标。")
         sys.exit(1)
 
     where = "单聊" if scope == SCOPE_C2C else "群"

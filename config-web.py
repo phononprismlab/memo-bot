@@ -48,9 +48,34 @@ for _stream in (sys.stdout, sys.stderr):
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# 页面要显示的本地图片：URL 路径 → 仓库里的相对路径。
+# 🔴 **白名单**（不吃任意路径）—— 新增图片必须显式加到这里，别写成通配。
+DOC_IMAGES = {
+    # QQ 群里那两个开关的位置截图（用在「① 连接 QQ」的提示块里）
+    "/docs/qq-group-switches.png": os.path.join("docs", "qq-group-switches.png"),
+}
+
+
+def image_mime(blob):
+    """按**文件头**判图片类型，不看扩展名。
+
+    🔴 现有那张 `qq-group-switches.png` 其实是 JPEG（扩展名和内容对不上）。
+       照扩展名发 `image/png` 浏览器多半也能显示（会嗅探），但既然要发就得发对。
+    """
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if blob[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if blob[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "image/webp"
+    return "application/octet-stream"
+
+
 import ignore as _ignore      # noqa: E402  （忽略表：规则读写）
 import settings as _settings  # noqa: E402  （本机设置：settings.json）
-import groups as _groups      # noqa: E402  （已发现的群 / 主动推送目标）
+import push as _push            # noqa: E402  （已发现的会话 / 播报目标，群与私聊统一）
 import moyu as _moyu          # noqa: E402  （摸鱼库：内置库 / 用户自己那份）
 import version as _version    # noqa: E402  （版本号 + 「有没有新版本」检测）
 from paths import data_path, data_dir   # noqa: E402  （数据目录：可写文件落哪）
@@ -541,11 +566,23 @@ ENV_SPEC = {
         "help": "机器人密钥（不是 Token）。已保存后这里不再显示，要改就重新填一遍",
         "check": lambda v: None if len(v) >= 8 else "看起来太短了（应该是一长串随机字符）",
     },
+    # 🔴 下面三个键都标 hidden：页面上**不再有裸 openid 输入框**。
+    #    播报目标改成一个「已发现的会话」勾选列表（见 pushTargetsHTML()），
+    #    勾选/取消勾选由 /api/push 直接写 .env —— 用户不该被要求手抄 openid。
+    "QQ_PUSH_TARGETS": {
+        "label": "播报目标（勾选列表管理）", "group": "bot", "hidden": True,
+        "help": "启动播报 / 关机播报发到哪些会话。格式 group:<openid>;c2c:<openid>。"
+                "由「已发现的会话」列表勾选写入，一般不用手改。",
+        "check": lambda v: None,
+    },
     "QQ_GROUP_OPENID": {
-        "label": "目标群 openid", "group": "bot",
-        "help": "启动播报 / 关机播报发到哪些群，多个用分号隔开。"
-                "不用自己找 openid —— 机器人收到群消息就会记下，"
-                "下面「已发现的群」里点一下就加进来。",
+        "label": "目标群 openid（旧键）", "group": "bot", "hidden": True,
+        "help": "旧版遗留键。仍可识别 —— QQ_PUSH_TARGETS 没配时按群目标使用。",
+        "check": lambda v: None,
+    },
+    "QQ_C2C_OPENID": {
+        "label": "目标私聊用户 openid（旧键）", "group": "bot", "hidden": True,
+        "help": "旧版遗留键。仍可识别 —— QQ_PUSH_TARGETS 没配时按私聊目标使用。",
         "check": lambda v: None,
     },
     "QQ_BOT_SANDBOX": {
@@ -602,6 +639,9 @@ def state_fields():
     out = []
 
     for key, spec in ENV_SPEC.items():
+        if spec.get("hidden"):
+            # 由自绘区块（勾选列表）管理的键，不进表单 —— 免得和勾选列表两份真源打架
+            continue
         raw = envfile.get(key)
         if raw is None:
             raw = os.getenv(key)
@@ -675,8 +715,12 @@ def full_state():
         "ready": bool(appid and secret),
         "version": _version.VERSION,
         "repo": _version.REPO,
-        "groups_found": _groups.all_groups(),
-        "group_targets": _groups.targets(),
+        # 已发现的会话（群 + 私聊统一一张表）+ 当前播报目标
+        # 🔴 目标用 `group:<id>` / `c2c:<id>` 字符串形态给前端 —— 和 .env 里存的一致，
+        #    勾选判断直接 `includes()`，不用再拼。
+        "sessions": _push.sessions(),
+        "push_targets": [f"{sc}:{oid}" for sc, oid in _push.targets()],
+        "push_env_key": "QQ_PUSH_TARGETS",
     }
 
 
@@ -728,6 +772,14 @@ def make_handler(doc):
                 return self._send(200, full_state())
             if path == "/api/browse":
                 return self._send(200, browse_dirs((qs.get("path") or [""])[0]))
+            if path in DOC_IMAGES:
+                # 页面插图（白名单里的那几张）—— 按文件头发正确的 Content-Type
+                try:
+                    with open(os.path.join(HERE, DOC_IMAGES[path]), "rb") as f:
+                        blob = f.read()
+                except OSError:
+                    return self._send(404, {"ok": False, "error": "not found"})
+                return self._send(200, blob, image_mime(blob))
             return self._send(404, {"ok": False, "error": "not found"})
 
         # ── POST ─────────────────────────────────────────────────
@@ -821,19 +873,44 @@ def make_handler(doc):
                         "url": _version.HOMEPAGE.format(repo=_version.REPO),
                     })
 
-                if path == "/api/groups":
-                    # 把「已发现的群」里的一个 openid 追加到推送列表（写 .env 的 QQ_GROUP_OPENID）
-                    oid = str(payload.get("add") or "").strip()
-                    if not oid:
-                        return self._send(400, {"ok": False, "error": "缺少 openid"})
-                    cur = _groups.parse_ids()
-                    if oid not in cur:
-                        cur.append(oid)
-                    _keys, err = write_env({"QQ_GROUP_OPENID": ";".join(cur)})
+                if path == "/api/push":
+                    # 勾选 / 取消勾选一个播报目标（写 .env 的 QQ_PUSH_TARGETS）。
+                    # 🔴 群和私聊**同一个键**：`group:<id>;c2c:<id>`。
+                    #    第一次勾选时 `_push.targets()` 会把旧键（QQ_GROUP_OPENID /
+                    #    QQ_C2C_OPENID）的目标一起读进来 → 老用户的配置不会丢。
+                    sc = str(payload.get("scope") or "").strip()
+                    oid = str(payload.get("openid") or "").strip()
+                    if sc not in _push.SCOPES or not oid:
+                        return self._send(400, {"ok": False, "error": "缺少 scope / openid"})
+                    on = bool(payload.get("on", True))
+                    cur = _push.targets()
+                    item = (sc, oid)
+                    if on and item not in cur:
+                        cur.append(item)
+                    elif not on:
+                        cur = [t for t in cur if t != item]
+                    _keys, err = write_env({"QQ_PUSH_TARGETS": _push.format_targets(cur)})
                     if err:
                         return self._send(400, {"ok": False, "error": err})
-                    return self._send(200, {"ok": True,
-                                            "message": "已加入推送列表（重启机器人后生效）",
+                    print(f"  [配置] 播报目标 {'＋' if on else '－'} {sc}:{oid}"
+                          f"（共 {len(cur)} 个）", flush=True)
+                    return self._send(200, {
+                        "ok": True,
+                        "message": ("已加入播报目标（重启机器人后生效）" if on
+                                    else "已移出播报目标"),
+                        "state": full_state()})
+
+                if path == "/api/session":
+                    # 改某个会话的备注名（只存本机 sessions.json，平台拿不到名字）
+                    sc = str(payload.get("scope") or "").strip()
+                    oid = str(payload.get("openid") or "").strip()
+                    if sc not in _push.SCOPES or not oid:
+                        return self._send(400, {"ok": False, "error": "缺少 scope / openid"})
+                    name = str(payload.get("name") or "").strip()
+                    if not _push.set_name(sc, oid, name):
+                        return self._send(400, {"ok": False, "error": "备注名保存失败"})
+                    print(f"  [配置] 备注名 {sc}:{oid} -> {name or '（清空）'}", flush=True)
+                    return self._send(200, {"ok": True, "message": "备注名已保存",
                                             "state": full_state()})
 
                 if path == "/api/moyu":
@@ -1039,7 +1116,19 @@ PAGE = r"""<!DOCTYPE html>
   .note{font-size:12px; color:var(--dim); margin-top:7px}
   .note.ok{color:#8fe6dc}
   .note.bad{color:#fc8181}
-  /* 清单类（依赖自检 / 数据文件位置 / 已发现的群）：单行 + 省略号，
+  /* 「去 QQ 里开两个开关」提示块 —— 这两项在 QQ 那边管，配置中心碰不到它们；
+     但十个用户九个不看说明书，不开机器人就「装死」，所以直接摆在连接页上。 */
+  .f.warnbox{background:rgba(246,173,85,.07); border:1px solid rgba(246,173,85,.32);
+             border-radius:8px; padding:11px 13px; margin:10px 0}
+  .f.warnbox .lb{color:var(--warn)}
+  .swlist{margin:7px 0 0 17px; padding:0; font-size:12.5px; line-height:1.5}
+  .swlist li{margin-bottom:8px}
+  .swlist li b{color:var(--ink)}
+  .swlist .note{display:block; margin-top:2px}
+  /* QQ 设置页截图：原图 1179×463（约 2.55:1），按容器宽度等比缩放，不放大 */
+  .swshot{display:block; width:100%; max-width:560px; height:auto; margin:9px 0 0;
+          border:1px solid var(--line); border-radius:7px; background:rgba(0,0,0,.2)}
+  /* 清单类（依赖自检 / 数据文件位置 / 播报目标）：单行 + 省略号，
      路径悬停看全文 —— 这样「⑦ 运行方式」才能一屏装下。 */
   .deps{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
         gap:4px 18px; margin-top:4px}
@@ -1051,6 +1140,23 @@ PAGE = r"""<!DOCTYPE html>
   .deps .dep button{flex:0 0 auto}
   .dep > .g, .dep > .b{flex:0 0 auto}
   .dep .g{color:var(--ok)} .dep .b{color:var(--bad)}
+  /* 播报目标列表：一行一个会话 —— 一行要放 勾选框 + 备注名 + 群/私聊标签 +
+     id + 最近一条 + 改名按钮，挤成两列会糊成一团。 */
+  .deps.one{grid-template-columns:1fr}
+  .deps.one .dep{padding:6px 0; border-bottom:1px solid rgba(255,255,255,.06)}
+  .deps.one .dep:last-child{border-bottom:none}
+  .dep input[type=checkbox]{flex:0 0 auto; align-self:center; width:15px; height:15px;
+                            accent-color:#4fd1c5; cursor:pointer}
+  .dep .nm{min-width:96px; max-width:170px; overflow:hidden; text-overflow:ellipsis;
+           white-space:nowrap}
+  .dep .tag{flex:0 0 auto; font-size:10.5px; color:var(--dim);
+            border:1px solid var(--line); border-radius:5px; padding:0 5px}
+  .dep .note{margin:0; flex:1 1 auto; min-width:0; white-space:nowrap;
+             overflow:hidden; text-overflow:ellipsis}
+  .dep .m.pth{flex:0 0 auto}
+  .dep input.rename{flex:1 1 auto; min-width:0; padding:3px 7px; border-radius:7px;
+                    background:rgba(255,255,255,.06); border:1px solid var(--line);
+                    color:var(--ink); font:12.5px/1.4 inherit}
   .rules{display:flex; flex-direction:column; gap:6px; margin-top:8px}
   .rule{display:flex; align-items:center; gap:8px; font-size:12.5px;
     padding:6px 10px; border-radius:9px; background:rgba(255,255,255,.05)}
@@ -1279,36 +1385,87 @@ function renderSections(){
   bindFields();
 }
 
-function botSection(g){
-  const fs = S.fields.filter(f => f.group === g.key);
-  // 凭据还没齐时不显示「已发现的群」—— 那时机器人根本没连上，列表必然是空的
-  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
-    + '</div><div class="body">' + fs.map(fieldHTML).join('')
-    + (S.ready ? discoveredGroupsHTML() : '') + '</div></section>';
+// ⚠️ 「去 QQ 里开两个开关」—— 这两项在 QQ 那边管，配置中心碰不到它们。
+//    但十个人有九个不看说明书；不开的话机器人收不到普通发言、也发不出播报，
+//    用户会以为「机器人坏了」。所以直接摆在「① 连接 QQ」页上，别指望人家去翻安装指南。
+function groupSwitchesHTML(){
+  return '<div class="f warnbox">'
+    + '<div class="lb">⚠️ 还差一步：去 QQ 里开两个开关</div>'
+    + '<div class="hp">把机器人拉进群之后，用<b>手机</b>点群里的机器人头像 → 右上角「设置」'
+    + '→ 打开下面这两项。这两项在 QQ 那边管，配置中心管不到它们。</div>'
+    + '<ol class="swlist">'
+    + '<li><b>机器人可获取的群聊消息范围</b> → 选「获取群内全部消息」'
+    + '<span class="note">不开：只有 @ 它才理你，群里的普通发言它收不到</span></li>'
+    + '<li><b>机器人主动在群聊内发言</b> → 打开'
+    + '<span class="note">不开：它没法主动发东西 —— 上线播报、关机播报都发不出来</span></li>'
+    + '</ol>'
+    + '<img class="swshot" src="/docs/qq-group-switches.png"'
+    + ' alt="QQ 群设置里这两个开关的位置：机器人可获取的群聊消息范围、机器人主动在群聊内发言">'
+    + '<div class="note">开完在群里发一句「备忘 测试」，能收到回执就说明配好了。</div>'
+    + '</div>';
 }
 
-function discoveredGroupsHTML(){
-  const gs = S.groups_found || [];
-  const tg = S.group_targets || [];
-  if(!gs.length){
-    // 一条都没发现时只给一行提示 —— 别为一张空列表占掉半屏
-    return '<div class="f"><div class="lb">已发现的群</div>'
-      + '<div class="note">还没发现群 —— 把机器人拉进群、在群里随便说句话'
-      + '（@ 它，或者发一条备忘），这里就会出现。</div></div>';
+function botSection(g){
+  const fs = S.fields.filter(f => f.group === g.key);
+  // 凭据还没齐时不显示「播报目标」—— 那时机器人根本没连上，列表必然是空的
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">' + fs.map(fieldHTML).join('')
+    + groupSwitchesHTML()
+    + (S.ready ? pushTargetsHTML() : '') + '</div></section>';
+}
+
+// 「最后说话」→ 「3 分钟前」。只做到「天」，再久就显示日期。
+function ago(ts){
+  if(!ts) return '';
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if(d < 60) return '刚刚';
+  if(d < 3600) return Math.floor(d / 60) + ' 分钟前';
+  if(d < 86400) return Math.floor(d / 3600) + ' 小时前';
+  if(d < 86400 * 7) return Math.floor(d / 86400) + ' 天前';
+  const t = new Date(ts * 1000);
+  return (t.getMonth() + 1) + ' 月 ' + t.getDate() + ' 日';
+}
+
+// 播报目标：一张表列**全部会话**（群 + 私聊平级），勾选决定播报发到哪。
+// 🔴 为什么合成一张表、不分「已发现的群 / 已发现的私聊」两个列表：
+//    两种 openid 长得一模一样，分开放反而认不出「这串 id 后面是谁」。
+// 🔴 平台拿不到会话名 —— 群名接口要白名单（个人开发者 11253 无权限），
+//    私聊更是没有任何查用户信息的接口。所以名字只能**用户自己起**；
+//    能自动给的线索只有本机库里的「最近说过什么」（见 push.py）。
+function pushTargetsHTML(){
+  const ss = S.sessions || [];
+  const tg = S.push_targets || [];
+  if(!ss.length){
+    return '<div class="f"><div class="lb">播报目标</div>'
+      + '<div class="note">还没发现任何会话 —— 把机器人拉进群、在群里说句话，'
+      + '或者直接在 QQ 里私聊它一句「你好」，这里就会出现。</div></div>';
   }
-  const rows = gs.map(g => {
-    const on = tg.includes(g.openid);
-    return '<div class="dep"><b>' + esc(g.name || '（还没拿到群名）') + '</b>'
-      + '<span class="m pth" title="' + esc(g.openid) + '">' + esc(g.openid) + '</span>'
-      + (on ? '<span class="note ok">已在推送列表</span>'
-            : '<button data-addgroup="' + esc(g.openid) + '">＋ 加入推送</button>')
+  const rows = ss.map(s => {
+    const k = s.scope + ':' + s.openid;
+    const on = tg.includes(k);
+    const sc = s.scope === 'c2c' ? '私聊' : '群';
+    const nm = s.name || (s.scope === 'c2c' ? '（未命名私聊）' : '（未命名群）');
+    const clue = s.recent
+      ? '<span class="note">最近：' + esc(s.recent)
+        + (s.recent_at ? '（' + esc(ago(s.recent_at)) + '）' : '') + '</span>'
+      : '<span class="note">（还没说过话）</span>';
+    return '<div class="dep" data-scope="' + esc(s.scope) + '"'
+      + ' data-openid="' + esc(s.openid) + '" data-name="' + esc(s.name || '') + '">'
+      + '<input type="checkbox" data-pushtoggle="' + esc(k) + '"' + (on ? ' checked' : '') + '>'
+      + '<b class="nm">' + esc(nm) + '</b>'
+      + '<span class="tag">' + sc + '</span>'
+      + '<span class="m pth" title="' + esc(s.openid) + '">'
+      + esc(s.openid.slice(0, 10)) + '…</span>'
+      + clue
+      + '<button data-rename="1">改名</button>'
       + '</div>';
   }).join('');
-  return '<div class="f"><div class="lb">已发现的群</div>'
-    + '<div class="hp">机器人每收到一条群消息就会记下这个群。'
-    + '点「加入推送」＝把它的 openid 追加到上面的「目标群 openid」，'
-    + '启动播报 / 关机播报就会发过去。</div>'
-    + '<div class="deps">' + rows + '</div></div>';
+  return '<div class="f"><div class="lb">播报目标'
+    + '<span class="tag">启动播报 / 关机播报发到这里</span></div>'
+    + '<div class="hp">机器人见过的会话都列在下面。勾上 = 播报也发到那里；'
+    + '群和私聊平级 —— 只想收私聊，把群取消勾选就行。'
+    + '名字点「改名」自己起（QQ 不给机器人读会话名，只能你来）。</div>'
+    + '<div class="deps one">' + rows + '</div></div>';
 }
 
 function pathRows(){
@@ -1508,12 +1665,51 @@ function bindFields(){
   const ub = $('btn-update');
   if(ub) ub.addEventListener('click', () => checkUpdate(false));
 
-  document.querySelectorAll('[data-addgroup]').forEach(b =>
-    b.addEventListener('click', async () => {
-      const j = await api('/api/groups', {add: b.dataset.addgroup});
+  // 播报目标：勾选 / 取消勾选。群和私聊共用同一个键（见 push.py）
+  document.querySelectorAll('[data-pushtoggle]').forEach(cb =>
+    cb.addEventListener('change', async () => {
+      const k = cb.dataset.pushtoggle;
+      const i = k.indexOf(':');
+      cb.disabled = true;
+      const j = await api('/api/push', {scope: k.slice(0, i), openid: k.slice(i + 1),
+                                        on: cb.checked});
       if(j.state) S = j.state;
       toast(j.ok ? j.message : ('失败：' + (j.error || '')));
       render();
+    }));
+
+  // 改备注名：点「改名」→ 原地换成输入框，回车 / 失焦保存，Esc 取消。
+  // 🔴 用行内输入而不是 window.prompt —— 风格统一，也不会被浏览器拦。
+  document.querySelectorAll('[data-rename]').forEach(b =>
+    b.addEventListener('click', () => {
+      const row = b.closest('.dep');
+      const nm = row.querySelector('.nm');
+      // 🔴 `.nm` 可能已经被换成输入框了（上一次点「改名」留下的）——
+      //    那时按钮还在，再点一下不能抛异常，直接忽略。
+      if(!nm) return;
+      b.disabled = true;                     // 输入框在的时候按钮就没意义了（render 后自然恢复）
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.className = 'rename'; inp.value = row.dataset.name || '';
+      inp.placeholder = '起个名字（留空 = 显示 id）';
+      nm.replaceWith(inp);
+      inp.focus(); inp.select();
+      let done = false;
+      const finish = async (commit) => {
+        if(done) return;
+        done = true;
+        if(commit){
+          const j = await api('/api/session', {scope: row.dataset.scope,
+                                              openid: row.dataset.openid, name: inp.value});
+          if(j.state) S = j.state;
+          toast(j.ok ? j.message : ('失败：' + (j.error || '')));
+        }
+        render();
+      };
+      inp.addEventListener('keydown', e => {
+        if(e.key === 'Enter'){ e.preventDefault(); finish(true); }
+        else if(e.key === 'Escape'){ finish(false); }
+      });
+      inp.addEventListener('blur', () => finish(true));
     }));
 
   const as = $('autostart');

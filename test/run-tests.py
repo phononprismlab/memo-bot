@@ -61,12 +61,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-# 🔴 测试不许碰真实数据目录。`groups.json` 是「群消息路由」写的 ——
-#    route 测试用的是假 openid，曾真的落进 memo-bot/groups.json。统一指到临时目录。
-import groups as _groups_mod            # noqa: E402
-
+# 🔴 测试不许碰真实数据目录。`sessions.json` 是「消息路由」写的 —— route 测试用的是
+#    假 openid，曾真的落进仓库里的 groups.json / c2c.json（踩过两次）。
+#    这里把 `MEMO_DATA_DIR` 指到临时目录，所有走 `paths.data_path()` 的**模块级路径**
+#    （push.FILE / store.DB / settings / .env …）就都落在临时目录里了。
+#    ⚠️ 顺带切断了 push.py 的旧文件迁移 —— 它读 `data_path("groups.json")`，
+#       不设的话测试会去读仓库里的真实 groups.json，把真实 openid 迁进断言。
 _TMP_DATA = tempfile.mkdtemp(prefix="memo_test_data_")
-_groups_mod.FILE = os.path.join(_TMP_DATA, "groups.json")
+os.environ["MEMO_DATA_DIR"] = _TMP_DATA
 
 # 🔴 关掉「首次建库塞示例」（store._seed）。测试的临时库每个都是全新的，
 #    不关的话每段用例都会多出 4 条示例，把一堆「共 N 条」的断言搅乱。
@@ -580,8 +582,14 @@ def test_ideas_bubbles():
               "location.protocol !== 'file:'" in T)
         check("页脚渐隐底色（气泡从黑暗升起，不糊页脚字）",
               "linear-gradient(0deg,#080b14" in T)
-        check("预热等距（i / cnt，按实际条目数），无随机抖动",
-              "spawn(i / cnt)" in T and "const cnt = Math.min(cfg.maxB" in T)
+        check("预热等距（按实际条目数均分），无随机抖动",
+              "spawn((i + 1) / (cnt + 1))" in T and "const cnt = Math.min(cfg.maxB" in T)
+        # 🔴 回归护栏：预热进度**不能从 0 开始**（`i/cnt` 的老写法）。
+        #    warm=0 → animationDelay=0 → 气泡从 bottom:-10vh 往上爬，
+        #    而 floatUp 前 ~9% 全在视口外 → 实测 2.3s 才露头；
+        #    条目只有 1 条时就是「打开抽屉整屏空白 2.3 秒」。
+        check("🔴 预热进度不从 0 开始（否则首屏要等 2.3s 才看到气泡）",
+              "spawn(i / cnt)" not in T)
 
         # --apply：离线导出的操作
         ops_path = os.path.join(tmpdir, "ops.json")
@@ -735,10 +743,23 @@ def test_ideas_bubbles():
         check("serve 启动会等设置拉回来",
               "await refreshSettings()" in T2 and "await detectMode()" in T2)
         check("轮询里也同步设置", "await refreshSettings();" in T2)
-        _boot = T2.index("await detectMode()")
-        check("气泡在设置拉回来之后才铺",
-              T2.index("refill();\n", _boot) > _boot
-              and T2.index("prewarm();", _boot) > _boot)
+        # 🔴 首屏气泡**不等网络**：__DATA__ / __SETTINGS__ 本来就内嵌在页面里，
+        #    detectMode() 那两跳只是用来确认「是不是 serve 模式 / 设置有没有被改过」。
+        #    放在 await 后面的话，任何一跳慢或挂住 = 开屏一个气泡都不铺
+        #    （真机复现：把 /api/ping 延迟 3s → 整整 3 秒气泡总数为 0）。
+        _boot = T2.index("(async ()=>{")
+        _dm = T2.index("await detectMode()", _boot)
+        check("首屏气泡不等网络（先铺后连）",
+              T2.index("refill();", _boot) < _dm
+              and T2.index("prewarm();", _boot) < _dm)
+        check("设置真被改过才重建（没变就别白闪一下）",
+              "JSON.stringify(SHOW) !== showBefore" in T2[_dm:_dm + 400])
+        # 🔴 fetch 默认没有超时 → 服务卡住 = 无限期空白。只读 GET 统一走 apiGet 兜底
+        check("只读接口有超时兜底", "function apiGet" in T2 and "AbortSignal.timeout" in T2)
+        check("启动那两跳走 apiGet",
+              "apiGet('/api/ping')" in T2 and "apiGet('/api/settings')" in T2)
+        check("写操作不走 apiGet（中途 abort 说不清）",
+              "apiGet('/api/delete')" not in T2 and "apiGet('/api/edit')" not in T2)
         # 🔴 同一条灵感不能同时出现两个气泡（用户截图：同一条 19:10 出现两次）——
         #    条目数少于 maxB 时队列会被 refill 循环复用，必须排除「已经在屏幕上的」
         check("取条目时排除在屏条目", "function onStageIds" in T2 and "on.has(it.id)" in T2)
@@ -1734,6 +1755,33 @@ def test_config_web():
         check("页签尺寸锁在「九个能排一行」的档位（改标题要重算宽度）",
               "font:12px/1.2 inherit" in cw.PAGE and "max-width:880px" in cw.PAGE)
 
+        # 9c) 「去 QQ 里开两个开关」提示块 —— 用户不看安装指南就会漏掉这两步，
+        #     不开的话机器人收不到普通发言 / 发不出播报，看起来就像「坏了」。
+        check("页面有「去 QQ 开两个开关」提示块", "function groupSwitchesHTML" in cw.PAGE)
+        check("提示块挂在「① 连接 QQ」分区上（不是别处）",
+              "groupSwitchesHTML()" in
+              cw.PAGE.split("function botSection")[1].split("function ")[0])
+        check("写清了第一条开关：群聊消息范围 = 获取群内全部消息",
+              "机器人可获取的群聊消息范围" in cw.PAGE and "获取群内全部消息" in cw.PAGE)
+        check("写清了第二条开关：机器人主动在群聊内发言",
+              "机器人主动在群聊内发言" in cw.PAGE)
+        check("两条都写了「不开会怎样」", cw.PAGE.count("不开：") >= 2)
+        check("提示块是 HTML 不是裸 markdown（help 走 esc 纯文本）",
+              "**" not in cw.PAGE.split("function groupSwitchesHTML")[1].split("\nfunction ")[0])
+
+        # 9d) 提示块里的 QQ 设置页截图 —— 走白名单静态路由，按文件头发类型
+        check("提示块里插了 QQ 设置页截图",
+              'class="swshot"' in cw.PAGE and 'src="/docs/qq-group-switches.png"' in cw.PAGE)
+        check("截图路由是白名单（不吃任意路径）",
+              "DOC_IMAGES = {" in _csrc and "if path in DOC_IMAGES" in _csrc
+              and "DOC_IMAGES[path]" in _csrc)
+        check("image_mime 按文件头认类型，不看扩展名",
+              cw.image_mime(b"\x89PNG\r\n\x1a\n" + b"x" * 20) == "image/png"
+              and cw.image_mime(b"\xff\xd8\xff\xe0" + b"x" * 20) == "image/jpeg"
+              and cw.image_mime(b"nope") == "application/octet-stream")
+        check("那张截图确实在仓库里",
+              os.path.isfile(os.path.join(ROOT, "docs", "qq-group-switches.png")))
+
         # 8) sync_env：写完 .env 立刻让本进程看到新值
         cw.sync_env()
         check("sync_env 把 .env 灌进 os.environ",
@@ -2107,7 +2155,11 @@ def test_offwork_paths():
     import offwork
 
     cfg = offwork.read_config()
-    check("read_config 返回 5 元组", isinstance(cfg, tuple) and len(cfg) == 5)
+    check("read_config 返回 5 元组（群 / 私聊目标合成一个列表）",
+          isinstance(cfg, tuple) and len(cfg) == 5)
+    check("read_config 的目标是 (scope, openid) 列表",
+          isinstance(cfg[2], list)
+          and all(isinstance(t, tuple) and len(t) == 2 for t in cfg[2]))
     code, text = offwork.send_offwork(dry_run=True)
     check("dry-run 返回 0/2 且不抛", code in (0, 2), text)
     check("dry-run 不取 access_token（不打网络）", "access_token" not in text)
@@ -2225,38 +2277,187 @@ def test_offwork_paths():
               'Trim(FileRead(FileOpen(RepoDir + "\\VERSION")))' in _iss
               and '#define MyAppVersion "' not in _iss)
 
-    # 8) 群发现：不用再手动拉群 + 翻日志找 openid
-    import groups as _g
+    # 8) 会话发现 + 播报目标（push.py）—— 群和私聊**合成一张表**。
+    #    动机：页面上给用户看的是一串 openid，`group_openid` 和 `user_openid` 长得
+    #    几乎一样，分「已发现的群 / 已发现的私聊」两个列表反而认不出「这串 id 后面是谁」。
+    #    合成一张表 + 可改的备注名 + 最近一条消息，才认得出、才选得对。
+    import push as _push
 
-    check("groups.parse_ids 分号分隔", _g.parse_ids("a;b") == ["a", "b"])
-    check("groups.parse_ids 逗号分隔", _g.parse_ids("a,b") == ["a", "b"])
-    check("groups.parse_ids 去重", _g.parse_ids("a;a") == ["a"])
-    check("groups.parse_ids 空 → []", _g.parse_ids("") == [])
+    check("push.py 在位", os.path.isfile(os.path.join(ROOT, "push.py")))
+    # 🔴 护栏：route 测试会用假 openid 调 push.note()，不隔离就写进仓库里的真实文件。
+    check("🔴 测试期间 push.FILE 已指向临时目录（不碰真实 sessions.json）",
+          _TMP_DATA in _push.FILE)
+    check("🔴 旧模块 groups.py / c2c.py 已删（统一到 push.py）",
+          not os.path.isfile(os.path.join(ROOT, "groups.py"))
+          and not os.path.isfile(os.path.join(ROOT, "c2c.py")))
 
-    _gtmp = tempfile.mkdtemp(prefix="groups_")
-    _orig_gfile = _g.FILE
-    _g.FILE = os.path.join(_gtmp, "groups.json")
-    _g._RECENT.clear()
+    # 8a) 目标解析：新键 `group:<id>;c2c:<id>` + 旧键兼容
+    check("parse_targets 带前缀", _push.parse_targets("group:G1;c2c:U2")
+          == [("group", "G1"), ("c2c", "U2")])
+    check("parse_targets 裸 openid 当群（兼容旧 QQ_GROUP_OPENID）",
+          _push.parse_targets("G1") == [("group", "G1")])
+    check("parse_targets 中文前缀 + 去重",
+          _push.parse_targets("群:G1；私聊:U2, group:G1")
+          == [("group", "G1"), ("c2c", "U2")])
+    check("parse_targets 丢掉空 openid",
+          _push.parse_targets("group:;c2c:U9") == [("c2c", "U9")])
+    check("format_targets 往返",
+          _push.format_targets(_push.parse_targets("c2c:U2;group:G1")) == "c2c:U2;group:G1")
+
+    _saved_keys = ("QQ_PUSH_TARGETS", "QQ_GROUP_OPENID", "QQ_C2C_OPENID")
+    _saved_env = {k: os.environ.get(k) for k in _saved_keys}
     try:
-        _g.note("oid-A")
-        _g.note("oid-B")
-        got = [x["openid"] for x in _g.all_groups()]
-        check("groups.note 记下两个群", set(got) == {"oid-A", "oid-B"}, str(got))
-        _g.note("oid-A")                       # 节流窗口内重复 → 不重复记
-        check("groups 重复记录不重复", len(_g.all_groups()) == 2)
+        for _k in _saved_keys:
+            os.environ.pop(_k, None)
+        os.environ["QQ_PUSH_TARGETS"] = "c2c:U2;group:G1"
+        os.environ["QQ_GROUP_OPENID"] = "OLD"
+        check("targets 配了新键就忽略旧键",
+              _push.targets() == [("c2c", "U2"), ("group", "G1")], str(_push.targets()))
+        os.environ["QQ_PUSH_TARGETS"] = ""
+        os.environ["QQ_GROUP_OPENID"] = "G1;G2"
+        os.environ["QQ_C2C_OPENID"] = "U2"
+        check("🔴 targets 没配新键时回退旧两键（老用户升级不丢配置）",
+              _push.targets() == [("group", "G1"), ("group", "G2"), ("c2c", "U2")],
+              str(_push.targets()))
+        check("targets 支持 env dict 兜底（计划任务入口不一定 load_dotenv）",
+              _push.targets({"QQ_PUSH_TARGETS": "group:G9"}) == [("group", "G9")])
     finally:
-        _g.FILE = _orig_gfile
-        _g._RECENT.clear()
-        shutil.rmtree(_gtmp, ignore_errors=True)
+        for _k, _v in _saved_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
+    # 8b) 记录 / 备注名 / 勾选状态
+    import store as _store
+
+    _ptmp = tempfile.mkdtemp(prefix="push_")
+    _orig_pfile, _orig_pdb = _push.FILE, _store.DB
+    _push.FILE = os.path.join(_ptmp, "sessions.json")
+    _store.DB = os.path.join(_ptmp, "none.db")     # 隔离真实库，否则历史会话混进断言
+    _push._RECENT.clear()
+    try:
+        check("sessions 空 → []", _push.sessions() == [])
+        _push.note("group", "G1")
+        _push.note("c2c", "U1", name="张三")
+        _push.note("c2c", "")                      # 空 openid 直接忽略
+        got = [(r["scope"], r["openid"]) for r in _push.sessions()]
+        check("note 记下群和私聊（空 openid 忽略）",
+              sorted(got) == [("c2c", "U1"), ("group", "G1")], str(got))
+        _push.note("group", "G1")                  # 节流窗口内重复 → 不重复记
+        check("note 重复记录不重复", len(_push.sessions()) == 2)
+        check("note 带上的备注名保留",
+              [r["name"] for r in _push.sessions() if r["openid"] == "U1"] == ["张三"])
+        check("set_name 改备注名",
+              _push.set_name("c2c", "U1", "李四")
+              and [r["name"] for r in _push.sessions() if r["openid"] == "U1"] == ["李四"])
+        os.environ["QQ_PUSH_TARGETS"] = "group:G1"
+        try:
+            row = [r for r in _push.sessions() if r["openid"] == "G1"][0]
+            check("sessions 标出哪些已在播报目标里", row["target"] is True)
+            check("sessions 已勾选的排在前面",
+                  _push.sessions()[0]["openid"] == "G1")
+        finally:
+            os.environ.pop("QQ_PUSH_TARGETS", None)
+    finally:
+        _push.FILE, _store.DB = _orig_pfile, _orig_pdb
+        _push._RECENT.clear()
+        shutil.rmtree(_ptmp, ignore_errors=True)
+
+    # 8c) DB 补齐：`sessions.json` 是后加的，不补的话老用户打开页面看到的是空列表；
+    #     「最近说过什么」也来自这里 —— 平台不给会话名，这是唯一能自动拿到的身份线索。
+    _dtmp = tempfile.mkdtemp(prefix="push_db_")
+    _orig_pfile2, _orig_db2 = _push.FILE, _store.DB
+    _push.FILE = os.path.join(_dtmp, "sessions.json")
+    _store.DB = os.path.join(_dtmp, "memos.db")
+    _push._RECENT.clear()
+    try:
+        _con = sqlite3.connect(_store.DB)
+        _con.execute("CREATE TABLE memos (group_id TEXT, content TEXT, created_at TEXT)")
+        _con.executemany("INSERT INTO memos VALUES (?,?,?)", [
+            ("c2c:HIST-1", "第一条", "2026-10-01T10:00:00"),
+            ("c2c:HIST-1", "第二条", "2026-10-02T10:00:00"),
+            ("c2c:HIST-2", "你好", "2026-10-03T10:00:00"),
+            ("GROUPX", "群里的备忘", "2026-10-04T10:00:00"),
+            ("", "无主", "2026-10-05T10:00:00"),
+        ])
+        _con.commit()
+        _con.close()
+        _ss = _push.sessions()
+        got = [(r["scope"], r["openid"]) for r in _ss]
+        check("sessions 从 DB 补出历史会话（群 + 私聊、去重、丢掉空 id）",
+              sorted(got) == [("c2c", "HIST-1"), ("c2c", "HIST-2"), ("group", "GROUPX")],
+              str(got))
+        check("sessions 补齐是只读的（查完不写 sessions.json）",
+              not os.path.exists(_push.FILE))
+        _row = [r for r in _ss if r["openid"] == "HIST-1"][0]
+        check("recent 取的是最近一条（不是最老一条）", _row["recent"] == "第二条",
+              _row["recent"])
+        check("recent_at 是时间戳", _row["recent_at"] > 0, str(_row["recent_at"]))
+        check("群那条也认得出来",
+              [r["recent"] for r in _ss if r["openid"] == "GROUPX"] == ["群里的备忘"])
+    finally:
+        _push.FILE, _store.DB = _orig_pfile2, _orig_db2
+        _push._RECENT.clear()
+        shutil.rmtree(_dtmp, ignore_errors=True)
+
+    # 8d) 迁移：首次把旧的 groups.json + c2c.json 并进 sessions.json（旧文件保留不删）
+    _mtmp = tempfile.mkdtemp(prefix="push_mig_")
+    _orig_pfile3, _orig_mdata = _push.FILE, os.environ.get("MEMO_DATA_DIR")
+    _push.FILE = os.path.join(_mtmp, "sessions.json")
+    os.environ["MEMO_DATA_DIR"] = _mtmp            # 让 data_path("groups.json") 指到这里
+    _push._RECENT.clear()
+    try:
+        with open(os.path.join(_mtmp, "groups.json"), "w", encoding="utf-8") as _f:
+            json.dump({"groups": {"G1": {"name": "长风号", "last": 111}}}, _f)
+        with open(os.path.join(_mtmp, "c2c.json"), "w", encoding="utf-8") as _f:
+            json.dump({"U2": {"name": "", "last": 222}}, _f)
+        _push.note("group", "G3")                  # 触发迁移
+        got = {(r["scope"], r["openid"]): r["name"] for r in _push.sessions()}
+        check("迁移：旧 groups.json → group:，旧 c2c.json → c2c:，备注名保留",
+              got.get(("group", "G1")) == "长风号" and ("c2c", "U2") in got,
+              str(got))
+        check("🔴 迁移后旧文件保留不删",
+              os.path.exists(os.path.join(_mtmp, "groups.json"))
+              and os.path.exists(os.path.join(_mtmp, "c2c.json")))
+        _push.note("c2c", "U2", name="老王")
+        check("迁移只做一次（不覆盖后来改的备注名）",
+              [r["name"] for r in _push.sessions() if r["openid"] == "U2"] == ["老王"])
+    finally:
+        _push.FILE = _orig_pfile3
+        if _orig_mdata is None:
+            os.environ.pop("MEMO_DATA_DIR", None)
+        else:
+            os.environ["MEMO_DATA_DIR"] = _orig_mdata
+        _push._RECENT.clear()
+        shutil.rmtree(_mtmp, ignore_errors=True)
+
+    # 8e) 调用方与页面
     _csrc3 = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
-    check("页面有「已发现的群」区块", "已发现的群" in _csrc3)
-    check("页面有「加入推送」按钮", "data-addgroup" in _csrc3)
+    check("页面有「播报目标」区块", "播报目标" in _csrc3)
+    check("页面有勾选框（data-pushtoggle）", "data-pushtoggle" in _csrc3)
+    check("页面有「改名」入口（data-rename）", "data-rename" in _csrc3)
+    check("配置中心有 /api/push 路由", '"/api/push"' in _csrc3)
+    check("配置中心有 /api/session 路由（改备注名）", '"/api/session"' in _csrc3)
+    check("配置中心把会话列表塞进页面状态",
+          '"sessions": _push.sessions()' in _csrc3 and '"push_targets"' in _csrc3)
+    check("🔴 页面上不再有裸 openid 输入框（两个旧键标 hidden）",
+          _csrc3.count('"hidden": True') >= 3)
     _bsrc = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
-    check("bot 收到群消息会记录群", "_groups.note(" in _bsrc)
-    check("启动播报遍历多个群", "for gid in _groups.targets()" in _bsrc)
+    check("bot 收到消息会记录会话", "_push.note(scope, t[\"openid\"])" in _bsrc)
+    check("🔴 bot 里不再有取群名的死代码（botpy 的 GroupMessage 没这字段）",
+          'getattr(message, "group_name"' not in _bsrc)
+    check("启动播报读 push.targets()",
+          "_push.targets()" in _bsrc and "for sc, oid in targets" in _bsrc)
     _osrc = open(os.path.join(ROOT, "offwork.py"), encoding="utf-8").read()
-    check("关机播报遍历多个群", "for gid in gids" in _osrc)
+    check("关机播报读 push.targets()",
+          "_push.targets(env)" in _osrc and "for sc, oid in targets" in _osrc)
+    check("🔴 sessions.json 进了 .gitignore（含真实 openid + 备注名）",
+          "sessions.json" in open(os.path.join(ROOT, ".gitignore"),
+                                  encoding="utf-8").read())
+    check("🔴 单聊也能主动推送（不再强制被动）",
+          "scope == SCOPE_C2C or not group" not in
+          open(os.path.join(ROOT, "send_file.py"), encoding="utf-8").read())
 
 
 # ── [16] 新手引导：「你好」/ 首次功能介绍 / 可配回执 ──────────────

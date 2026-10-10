@@ -788,12 +788,31 @@ function toast(msg){
   toast._t = setTimeout(()=>toastEl.classList.remove('on'), 2400);
 }
 
+/* 只读接口统一走这里 —— 🔴 `fetch` 默认**没有超时**。
+   本地服务还没起完 / 端口被别的进程占着 / 杀软拦连接时，Promise 会永不 settle，
+   页面就一直等下去。首屏那两跳尤其致命：等不到 = 一个气泡都不铺
+   （真机复现：把 `/api/ping` 延迟 3s → 整整 3 秒气泡总数为 0）。
+   🔴 只给**只读 GET** 加超时；写操作（POST）不加 —— 中途 abort 掉的话，
+      服务端可能照样写进去了，状态反而说不清。 */
+const API_TIMEOUT_MS = 4000;
+function apiGet(url){
+  const opt = {cache:'no-store'};
+  if(typeof AbortSignal !== 'undefined' && AbortSignal.timeout){
+    opt.signal = AbortSignal.timeout(API_TIMEOUT_MS);
+  } else if(typeof AbortController !== 'undefined'){
+    const ac = new AbortController();
+    setTimeout(()=>ac.abort(), API_TIMEOUT_MS);
+    opt.signal = ac.signal;
+  }
+  return fetch(url, opt);
+}
+
 async function detectMode(){
-  // 🔴 file:// 下直接判定离线 —— 否则 fetch('/api/ping') 会被 CORS 拦，
+  // 🔴 file:// 下直接判定离线 —— 否则 apiGet('/api/ping') 会被 CORS 拦，
   //    功能上没问题（catch 住），但会在 console 里留两条红字，看着像坏了
   if(location.protocol !== 'file:'){
     try {
-      const r = await fetch('/api/ping', {cache:'no-store'});
+      const r = await apiGet('/api/ping');
       const j = await r.json();
       if(j && j.ok) MODE = 'serve';
     } catch(e){ MODE = 'offline'; }
@@ -820,7 +839,7 @@ async function refreshFromServer(){
   if(modal.classList.contains('on') || listEl.classList.contains('on')
      || settingsEl.classList.contains('on')) return;
   try{
-    const r = await fetch('/api/items', {cache:'no-store'});
+    const r = await apiGet('/api/items');
     const j = await r.json();
     if(!j || !j.ok) return;
     const incoming = j.items || [];
@@ -1043,10 +1062,16 @@ function minGapMs(cfg){ return BASE_DUR * 1000 / cfg.maxB; }
 // 开局铺满：按「实际能铺几条」均分飞行进度。
 // 🔴 不能按 maxB 分 —— 灵感库常常只有 3~5 条，条目比 maxB 少时
 //    前几条会全挤在底部一小段里（i/maxB 只有 0、0.125、0.25）。
+// 🔴 进度**不能从 0 开始**（`i/cnt` 的老写法）：`warm=0` → `animationDelay=0`
+//    → 气泡老老实实从 `bottom:-10vh` 往上爬。而 `floatUp` 的前 ~9% 全在视口外
+//    （起点在屏下 + 缓动前段慢），实测**要 2.3 秒才露头**。
+//    条目只有 1 条时（cnt=1）就是「打开抽屉 → 整屏空白 2.3 秒」。
+//    改成 `(i+1)/(cnt+1)`：第一条也落在飞行途中，cnt=1 时正好在行程中点（屏幕中央）。
+//    ⇒ 开屏**立刻**看得到气泡，也才符合本函数「把气泡直接放到飞行途中」的原意。
 function prewarm(){
   const cfg = layout();
   const cnt = Math.min(cfg.maxB, streamItems().length);
-  for(let i = 0; i < cnt; i++) spawn(i / cnt);
+  for(let i = 0; i < cnt; i++) spawn((i + 1) / (cnt + 1));
   lastSpawn = Date.now();
 }
 
@@ -1480,7 +1505,7 @@ async function openList(status){
   // 列表开着时轮询是停的 —— 打开前手动同步一次，保证看到的是库里的最新状态
   if(MODE === 'serve'){
     try{
-      const r = await fetch('/api/items', {cache:'no-store'});
+      const r = await apiGet('/api/items');
       const j = await r.json();
       if(j && j.ok){
         const incoming = j.items || [];
@@ -1647,7 +1672,7 @@ function rebuildStream(){
 async function refreshSettings(){
   if(MODE !== 'serve') return;
   try{
-    const r = await fetch('/api/settings', {cache:'no-store'});
+    const r = await apiGet('/api/settings');
     const j = await r.json();
     if(j && j.ok) applySettingsPayload(j.keys);
   }catch(e){}
@@ -1727,16 +1752,24 @@ document.addEventListener('keydown', (e)=>{
   }
 });
 
-// 🔴 启动必须**等设置拉回来再铺气泡** —— 否则第一屏按内嵌的旧范围铺，
-//    服务端已经改过的话会出现「显示了不该显示的类别」。
+// 🔴 启动**先铺气泡、再去连服务**。
+//    页面里的 __DATA__ / __SETTINGS__ 本来就是「渲染那一刻」的快照，够铺第一屏了；
+//    detectMode() 那两跳（/api/ping、/api/settings）只是用来确认「是不是 serve 模式 /
+//    设置有没有被别人改过」。放在 await 后面的话，任何一跳慢或挂住 = 开屏一个气泡都没有
+//    （真机复现：ping 延迟 3s → 3s 空屏）。
 (async ()=>{
-  await detectMode();
   refill();
 
   // 🔴 开局一次性按「飞行进度」均匀铺满 —— 不要 setTimeout 连发，
   //    连发会让所有气泡挤在屏幕底部同一段高度里（真机截图：overlaps 3~5）。
   // 预热位置**等距**（i/cnt），别加随机抖动 —— 抖一下就可能让两个气泡撞在同一高度
   prewarm();
+
+  // 设置真被改过才重建 —— 内嵌快照本来就由同一个服务生成，绝大多数情况一模一样；
+  // 无条件重建会让第一屏白闪一下。
+  const showBefore = JSON.stringify(SHOW);
+  await detectMode();
+  if(JSON.stringify(SHOW) !== showBefore) rebuildStream();
 
   function loop(){
     if(running) spawn();
