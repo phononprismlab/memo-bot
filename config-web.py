@@ -3,13 +3,14 @@
 这个文件是干嘛的：起一个**只监听 127.0.0.1** 的小服务，把一个配置页面摆出来。
 页面上能做的事：
   ① 填 QQ 机器人凭据（AppID / AppSecret / 目标群 openid / 沙箱）  → 写 `.env`
-  ② 改备忘触发词、启动播报、关机通知文案                        → 写 `.env` / `settings.json`
+  ② 改备忘触发词、启动播报文案                                  → 写 `.env` / `settings.json`
   ③ 选「发文件」的搜索根目录（带目录浏览器 + 实测：多少文件、搜一次多久）
   ④ 勾脑内抽屉的展示范围                                        → 写 `settings.json`
   ⑤ 一键开关「开机自启」（注册 / 删除 Windows 计划任务 `MoyuBot`）
   ⑥ 启动 / 停止 / 重启机器人，并自检依赖是否装齐
   ⑦ 管理忽略表（别把同群其他机器人当内容收）
   ⑧ 改「摸鱼」随机抽的内容库（一行一条；改完立刻生效，不用重启）
+  ⑨ 导入 / 列出 / 移除自定义指令（扩展包 `.py` / `.zip`；装完重启才生效）
 
 🔴 只监听 127.0.0.1 —— 这个页面能读写 `.env`（含密钥），绝不对外暴露。
 🔴 AppSecret 读回来只显示「已设置」，**不回显明文**；要改必须重新输入一遍。
@@ -24,6 +25,7 @@
   python config-web.py --port 8770
 """
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -76,14 +78,15 @@ def image_mime(blob):
 import ignore as _ignore      # noqa: E402  （忽略表：规则读写）
 import settings as _settings  # noqa: E402  （本机设置：settings.json）
 import push as _push            # noqa: E402  （已发现的会话 / 播报目标，群与私聊统一）
+import media as _media         # noqa: E402  （收进来的图片：占用统计 / 体积格式化）
 import moyu as _moyu          # noqa: E402  （摸鱼库：内置库 / 用户自己那份）
+import extmgr as _extmgr      # noqa: E402  （自定义指令：扩展包的导入 / 列出 / 移除）
 import version as _version    # noqa: E402  （版本号 + 「有没有新版本」检测）
 from paths import data_path, data_dir   # noqa: E402  （数据目录：可写文件落哪）
 
 # 🔴 .env / 日志 / pid 都是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
 ENV_PATH = data_path(".env")
 ENV_BAK = data_path(".env.bak")
-BOT_PY = os.path.join(HERE, "bot.py")              # 代码：随安装目录走
 LAUNCHER = os.path.join(HERE, "memo-launcher.py")  # 统一启动器（补 sys.path + 定数据目录）
 BOT_LOG = data_path("bot.out.log")
 PID_FILE = data_path("bot.pid")
@@ -295,200 +298,15 @@ def browse_dirs(path):
 
 
 # ── 机器人进程 / 计划任务 ────────────────────────────────────────
-def _pid_alive(pid):
-    if pid <= 0:
-        return False
-    try:
-        if os.name == "nt":
-            # 🔴 两处都要兜底，否则**整个启停流程会被打断**
-            #    （实测踩到：bot_stop 成功 → bot_start 在 _pid_alive 崩 → bot 被停掉却没起来）：
-            #    1) 显式 encoding + errors="replace" —— 中文 Windows 的 tasklist 输出是 GBK，
-            #       而设了 PYTHONUTF8=1 的环境会拿 UTF-8 去解码 → UnicodeDecodeError 直接冒泡。
-            #       表头乱码无所谓，PID 是 ASCII，不影响匹配。
-            #    2) stdout 兜底成 "" —— 受限环境里它可能是 None，`in None` 会抛 TypeError。
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace", timeout=10).stdout or ""
-            return str(pid) in out
-        os.kill(pid, 0)
-        return True
-    except (OSError, subprocess.SubprocessError, ValueError):
-        # ValueError 不是凑数：UnicodeDecodeError 继承自 ValueError，不继承 OSError。
-        # 上面的 encoding 兜底只是把「正常路径」护住了，真出现解码异常时仍会走到这里。
-        return False
-
-
-def bot_pid():
-    """`bot.pid` 里记的进程号（0 = 没记）。"""
-    try:
-        with open(PID_FILE, encoding="utf-8") as f:
-            return int((f.read() or "0").strip())
-    except (OSError, ValueError):
-        return 0
-
-
-def bot_running():
-    """机器人正在跑就返回它的 pid，否则 0。"""
-    pid = bot_pid()
-    return pid if _pid_alive(pid) else 0
-
-
-def _powershell(script, timeout=90):
-    """跑一段 PowerShell，返回 (returncode, stdout+stderr)。
-
-    🔴 强制 UTF-8 输出 —— 中文系统的 PowerShell 默认按 GBK 输出，中文错误信息会变乱码。
-    🔴 `$ErrorActionPreference='Stop'` —— 否则 `Register-ScheduledTask` 这类失败是
-       「非终止错误」，退出码仍是 0，我们就会误报成功。要容忍「找不到」的脚本
-       自己在 cmdlet 上写 `-ErrorAction SilentlyContinue`。
-    """
-    pre = ("$OutputEncoding=[Text.Encoding]::UTF8;"
-           "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-           "$ErrorActionPreference='Stop';")
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-Command", pre + script],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
-        )
-        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
-    except FileNotFoundError:
-        return 127, "找不到 powershell（开机自启开关只在 Windows 上支持）"
-    except subprocess.SubprocessError as e:
-        return 1, f"{type(e).__name__}: {e}"
-
-
-_TASK_CACHE = {"t": 0.0, "v": "unknown"}
-
-
-def task_state(force=False):
-    """计划任务 `MoyuBot` 的状态：'none' / 'ready' / 'running' / 'disabled' / 'unknown'。
-
-    🔴 起一次 PowerShell 要几百毫秒 —— 缓存 2 秒，否则每保存一次页面都要等它。
-    """
-    now = time.time()
-    if not force and now - _TASK_CACHE["t"] < 2.0:
-        return _TASK_CACHE["v"]
-    rc, out = _powershell(
-        f"$t=Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue;"
-        "if($null -eq $t){'NONE'}else{$t.State}", timeout=30)
-    if rc != 0:
-        v = "unknown"
-    else:
-        s = (out or "").strip().splitlines()[-1].strip().lower() if out.strip() else ""
-        v = {"none": "none", "ready": "ready", "running": "running",
-             "disabled": "disabled"}.get(s, "unknown")
-    _TASK_CACHE["t"], _TASK_CACHE["v"] = now, v
-    return v
-
-
-def _pythonw():
-    """跟当前解释器同目录的 pythonw.exe（无控制台窗口），找不到就用当前解释器。"""
-    exe = sys.executable or "python"
-    if os.name == "nt" and os.path.basename(exe).lower() == "python.exe":
-        cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.isfile(cand):
-            return cand
-    return exe
-
-
-def autostart_set(on):
-    """开 / 关开机自启（注册 / 删除计划任务）→ (ok, 人话说明)。"""
-    if os.name != "nt":
-        return False, "开机自启只在 Windows 上支持（靠计划任务实现）"
-
-    def _q(p):
-        return p.replace("'", "''")          # PowerShell 单引号串里，单引号要写两遍
-
-    if on:
-        script = (
-            f"$act=New-ScheduledTaskAction -Execute '{_q(_pythonw())}' "
-            f"-WorkingDirectory '{_q(data_dir())}' "
-            f"-Argument '\"{_q(LAUNCHER)}\" --bot --log \"{_q(BOT_LOG)}\"';"
-            "$trg=New-ScheduledTaskTrigger -AtLogOn;"
-            "$set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
-            "-DontStopIfGoingOnBatteries -StartWhenAvailable "
-            "-ExecutionTimeLimit ([TimeSpan]::Zero) "
-            "-RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) "
-            "-MultipleInstances IgnoreNew;"
-            f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $act -Trigger $trg "
-            "-Settings $set -Force | Out-Null;'OK'"
-        )
-        rc, out = _powershell(script)
-        _TASK_CACHE["t"] = 0.0
-        if rc != 0 or "OK" not in out:
-            return False, out or "注册计划任务失败（可能需要管理员权限）"
-        return True, "已开启开机自启 —— 下次登录 Windows 会自动把机器人跑起来（后台无窗口）"
-
-    script = (f"$t=Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue;"
-              f"if($null -ne $t){{Unregister-ScheduledTask -TaskName '{TASK_NAME}' "
-              "-Confirm:$false};'OK'")
-    rc, out = _powershell(script)
-    _TASK_CACHE["t"] = 0.0
-    if rc != 0 or "OK" not in out:
-        return False, out or "删除计划任务失败"
-    return True, "已关闭开机自启 —— 下次登录不再自动启动（正在跑的机器人不受影响）"
-
-
-def bot_stop():
-    """停掉机器人 → (ok, 说明)。"""
-    pid = bot_running()
-    if not pid:
-        return True, "机器人本来就没在跑"
-    try:
-        # 和 _pid_alive 同一个坑：中文 Windows 的 taskkill 输出是 GBK，
-        # 这里只取返回码不看文本，但解码仍会在 subprocess 内部发生 → 必须显式指定。
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=20)
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        return False, f"停不掉：{type(e).__name__}: {e}"
-    for _ in range(24):
-        if not _pid_alive(pid):
-            return True, f"已停止（pid {pid}）"
-        time.sleep(0.25)
-    return False, f"发了停止信号，但进程 {pid} 还活着 —— 手动看下任务管理器"
-
-
-def bot_start():
-    """启动机器人 → (ok, 说明)。"""
-    if bot_running():
-        return True, "机器人已经在跑了"
-    if task_state() in ("ready", "running"):
-        rc, out = _powershell(f"Start-ScheduledTask -TaskName '{TASK_NAME}';'OK'")
-        if rc != 0 or "OK" not in out:
-            return False, out or "启动计划任务失败"
-    else:
-        # 没注册计划任务（或查不到）→ 直接后台起一个，和桌面入口一个套路：无窗口
-        flags = 0
-        if os.name == "nt":
-            flags = 0x00000008 | 0x08000000      # DETACHED_PROCESS | CREATE_NO_WINDOW
-        try:
-            fh = open(BOT_LOG, "ab")
-            try:
-                subprocess.Popen([_pythonw(), "-u", LAUNCHER, "--bot", "--log", BOT_LOG],
-                                 cwd=data_dir(), stdin=subprocess.DEVNULL,
-                                 stdout=fh, stderr=subprocess.STDOUT,
-                                 creationflags=flags, close_fds=True)
-            finally:
-                fh.close()
-        except OSError as e:
-            return False, f"起不来：{e}"
-    for _ in range(60):                           # 最多等 ~15 秒
-        time.sleep(0.25)
-        pid = bot_running()
-        if pid:
-            return True, f"已启动（pid {pid}）"
-    return False, "进程起了但没等到 bot.pid —— 打开 bot.out.log 看下报了什么错"
-
-
-def bot_restart():
-    ok, msg = bot_stop()
-    if not ok:
-        return False, msg
-    time.sleep(1.5)
-    ok2, msg2 = bot_start()
-    return ok2, f"{msg} → {msg2}"
+# 🔴 这套逻辑抽到 botctl.py 了（配置中心和管家 hub.py 共用，三合一打包后不能重复两份）。
+#    这里直接 import 透传，页面代码（bot_start / bot_stop / autostart_set / task_state …）
+#    的调用处都不用改。`LAUNCHER / BOT_LOG / PID_FILE / TASK_NAME` 仍在本文件顶部定义，
+#    因为它们还被页面响应体（状态查询 / 日志路径）用到。
+from botctl import (  # noqa: E402,F401
+    bot_running, bot_pid, _pid_alive,
+    bot_start, bot_stop, bot_restart,
+    task_state, autostart_set, _pythonw, _powershell,
+)
 
 
 # ── 依赖自检 ────────────────────────────────────────────────────
@@ -571,7 +389,7 @@ ENV_SPEC = {
     #    勾选/取消勾选由 /api/push 直接写 .env —— 用户不该被要求手抄 openid。
     "QQ_PUSH_TARGETS": {
         "label": "播报目标（勾选列表管理）", "group": "bot", "hidden": True,
-        "help": "启动播报 / 关机播报发到哪些会话。格式 group:<openid>;c2c:<openid>。"
+        "help": "启动播报发到哪些会话。格式 group:<openid>;c2c:<openid>。"
                 "由「已发现的会话」列表勾选写入，一般不用手改。",
         "check": lambda v: None,
     },
@@ -605,7 +423,7 @@ ENV_SPEC = {
         "check": check_roots,
     },
     "MEMO_IGNORE": {
-        "label": "忽略关键词（逗号分隔）", "group": "ignore", "default": "",
+        "label": "忽略关键词（逗号分隔）", "group": "behavior", "default": "",
         "help": "消息里出现这些词就整条跳过（不收灵感、也不响应）。"
                 "同群有别的机器人时，把它的名字填进来，免得俩机器人互相刷屏",
         "check": lambda v: None,
@@ -617,15 +435,18 @@ ENV_SPEC = {
 #    所以「播报文案」与「回执文案」分开 —— 三段长文案塞一块必然超屏。
 GROUPS = [
     ("bot", "① 连接 QQ", "在 https://q.qq.com 创建机器人后，把凭据填进来。必填。"),
-    ("behavior", "② 群内行为", "备忘触发词，以及记下备忘 / 收到灵感后回的那句话。"),
-    ("msg", "③ 播报文案", "机器人上线时说什么、关机时说什么、第一次连上时怎么介绍自己。"),
+    ("behavior", "② 群内行为", "备忘触发词、记下备忘 / 收到灵感后回的那句话，以及"
+                              "忽略表（别把同群其他机器人的话当内容收）。"),
+    ("msg", "③ 播报", "机器人上线时说什么、第一次连上时怎么介绍自己，"
+                  "以及播报发到哪些会话。"),
     ("files", "④ 发文件", "「发文件」功能的检索范围。"),
     ("bubbles", "⑤ 脑内抽屉", "轮播页里放哪几类（备忘 / 灵感）。"),
     ("boomerang", "⑥ 回旋镖", "把 N 天前的旧记录翻出来推回给用户（发「回旋镖」触发）。"
                               "回溯天数填 0 就翻今天记的 —— 刚上手也能玩。"),
     ("runtime", "⑦ 运行方式", "开机自启、机器人进程、依赖自检。"),
-    ("ignore", "⑧ 忽略表", "别把同群里其他机器人的话当内容收进来。"),
-    ("moyu", "⑨ 摸鱼库", "「摸鱼」随机抽的那些内容，一行一条。改完保存立刻生效，不用重启。"),
+    ("moyu", "⑧ 摸鱼库", "「摸鱼」随机抽的那些内容，一行一条。改完保存立刻生效，不用重启。"),
+    ("ext", "⑨ 自定义指令", "导入别人做好的指令包（.py / .zip），或把你自己的指令导出分享。"
+                          "装完要重启机器人才生效。"),
 ]
 
 
@@ -665,10 +486,19 @@ def state_fields():
             "default": spec.get("default", ""),
         })
 
-    group_of = {"startup_msg": "msg", "offwork_msg": "msg", "intro_msg": "msg",
+    group_of = {"startup_msg": "msg", "intro_msg": "msg",
                 "memo_ack": "behavior", "idea_ack": "behavior",
-                "bubbles_show": "bubbles",
+                "bubbles_show": "bubbles", "ui_font_scale": "bubbles",
+                # 收图开关与报警阈值都归「② 群内行为」—— 收图是对收消息行为的开关。
+                # 🔴 `image_collect` 本身**不进表单**：它是一个 multi 键顶三个开关，
+                #    由自绘区块（主开关 + 两个子开关）画，和「① 连接 QQ」的勾选列表一个套路。
+                "image_alert_gb": "behavior",
                 "boomerang_days": "boomerang", "boomerang_scope": "boomerang"}
+    # 自绘区块接管的 settings 键：**仍然进字段表**（否则页面拿不到它的值、
+    # `setDirty` 也认不出这个键 —— 保存时会静默丢掉），但打上 `hidden` 让通用渲染器跳过。
+    # 🔴 踩过：一开始是直接 `continue` 跳过它，结果 `S.fields` 里没有这个键，
+    #    `setDirty()` 第一行 `if(!f) return;` 就把每次改动吞了，保存永远说「没有改动」。
+    self_drawn = {"image_collect"}
     for s in _settings.describe():
         out.append({
             "target": "settings", "key": s["key"], "label": s["label"], "help": s["help"],
@@ -676,6 +506,8 @@ def state_fields():
             "required": False, "value": s["value"], "set": _settings.is_set(s["key"]),
             "default": s["default"], "choices": s["choices"],
             "choice_labels": s["choice_labels"],
+            "min": s.get("min"), "max": s.get("max"),
+            "hidden": s["key"] in self_drawn,
         })
     return out
 
@@ -721,6 +553,14 @@ def full_state():
         "sessions": _push.sessions(),
         "push_targets": [f"{sc}:{oid}" for sc, oid in _push.targets()],
         "push_env_key": "QQ_PUSH_TARGETS",
+        # 自定义指令（扩展包）：已装的列表 + 安装目录。
+        # 🔴 `list_items()` 会开一个**子进程**去试加载（扩展是任意代码，不能在本进程
+        #    exec）—— 结果按文件 mtime 缓存，所以只有「刚导入 / 手改过」那一次慢。
+        "ext": {
+            "items": _extmgr.list_items(),
+            "dir": _extmgr.LOCAL_DIR,
+            "accept": list(_extmgr.ACCEPT_EXT),
+        },
     }
 
 
@@ -770,6 +610,16 @@ def make_handler(doc):
                 return self._send(200, doc, "text/html; charset=utf-8")
             if path == "/api/state":
                 return self._send(200, full_state())
+            if path == "/api/images-usage":
+                # 「② 群内行为」那块自绘收图区的只读统计行。
+                # 🔴 只读、不走 POST 守卫（守卫是防**改配置**的跨站写入，读个数字没风险）。
+                try:
+                    u = _media.usage()
+                    u["alert_gb"] = _settings.get("image_alert_gb")
+                    return self._send(200, {"ok": True, "usage": u,
+                                            "human": _media.human(u["bytes"])})
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if path == "/api/browse":
                 return self._send(200, browse_dirs((qs.get("path") or [""])[0]))
             if path in DOC_IMAGES:
@@ -930,12 +780,46 @@ def make_handler(doc):
                                             "message": f"摸鱼库已保存（{info} 条），下次发「摸鱼」立刻生效",
                                             "state": full_state()})
 
+                if path == "/api/ext/import":
+                    # 上传导入：浏览器把文件读成 base64 一起 POST 过来（不走 multipart，
+                    # 省掉一个解析器）。体积上限与 extmgr 里一致。
+                    name = str(payload.get("name") or "")
+                    raw = payload.get("data") or ""
+                    try:
+                        blob = base64.b64decode(raw, validate=False) if raw else b""
+                    except Exception:                                 # noqa: BLE001
+                        return self._send(400, {"ok": False, "error": "文件内容解不开（base64 坏了）"})
+                    if len(blob) > _extmgr.MAX_ZIP_BYTES:
+                        return self._send(400, {
+                            "ok": False,
+                            "error": f"文件太大了（{len(blob) // 1024 // 1024}MB，"
+                                     f"上限 {_extmgr.MAX_ZIP_BYTES // 1024 // 1024}MB）"})
+                    ok, msg, info = _extmgr.import_bytes(
+                        name, blob, overwrite=bool(payload.get("overwrite")))
+                    print(f"  [扩展] 导入 {name}：{msg}", flush=True)
+                    code = 200 if ok else (409 if info.get("conflict") else 400)
+                    return self._send(code, {"ok": ok, "message": msg if ok else None,
+                                             "error": None if ok else msg,
+                                             "conflict": bool(info.get("conflict")),
+                                             "item": info,
+                                             "state": full_state()})
+
+                if path == "/api/ext/remove":
+                    ident = str(payload.get("id") or "")
+                    ok, msg = _extmgr.remove(ident)
+                    print(f"  [扩展] 移除 {ident}：{msg}", flush=True)
+                    return self._send(200 if ok else 400,
+                                      {"ok": ok, "message": msg if ok else None,
+                                       "error": None if ok else msg,
+                                       "state": full_state()})
+
                 if path == "/api/open-folder":
                     # 🔴 只允许打开白名单里的这几个路径 —— 别让页面变成「打开任意目录」的口子
                     what = str(payload.get("what") or "")
                     targets = {"data": data_dir(), "db": data_path("memos.db"),
                                "env": ENV_PATH, "settings": _settings.file_path(),
-                               "log": BOT_LOG, "moyu": _moyu.user_path()}
+                               "log": BOT_LOG, "moyu": _moyu.user_path(),
+                               "ext": _extmgr.LOCAL_DIR}
                     t = targets.get(what)
                     if not t:
                         return self._send(400, {"ok": False, "error": "不认识的路径"})
@@ -1011,6 +895,11 @@ PAGE = r"""<!DOCTYPE html>
     font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
     background:radial-gradient(ellipse 120% 80% at 50% -10%, #17334f 0%, #0d1a2b 45%, #070a11 100%);
     background-attachment:fixed; -webkit-font-smoothing:antialiased;
+    /* 🔴 「界面字号」缩放：整页 zoom。桌面版（memo_gui.py）读同一个设置键。
+       高度**不要**再除一次 zoom —— 实测 Chromium 的 zoom 只缩放内容，
+       不缩放 body 自身那个盒子的高度；再除一次的话 body 会矮一截，
+       底部保存条会悬在半空（真机截图确认过）。 */
+    zoom:var(--z,1);
   }
   /* 🔴 一屏一块的骨架：头 / 页签 / 底部按钮条都固定，只有中间内容区滚动。
      这样切页签时页面不会跳，也不会出现「一路往下拉看不到头」的长页面。
@@ -1125,6 +1014,15 @@ PAGE = r"""<!DOCTYPE html>
   .swlist li{margin-bottom:8px}
   .swlist li b{color:var(--ink)}
   .swlist .note{display:block; margin-top:2px}
+  /* 收图区块（「② 群内行为」里自绘的那块）—— 主开关 + 两个子开关 + 占用行。
+     主开关关掉时整块子开关收起来（.hide），免得用户以为「关了还在收」。 */
+  .icsubs{display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:9px;
+          padding-left:2px}
+  .icsubs.hide{display:none}
+  .icsub{display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer}
+  .icsub input{accent-color:#4fd1c5; width:15px; height:15px}
+  .imgusage{margin-top:9px; padding-top:8px; border-top:1px solid var(--line)}
+  .imgusage .note{margin-top:0}
   /* QQ 设置页截图：原图 1179×463（约 2.55:1），按容器宽度等比缩放，不放大 */
   .swshot{display:block; width:100%; max-width:560px; height:auto; margin:9px 0 0;
           border:1px solid var(--line); border-radius:7px; background:rgba(0,0,0,.2)}
@@ -1137,6 +1035,11 @@ PAGE = r"""<!DOCTYPE html>
   .dep .m{color:var(--dim); font-size:11.5px; flex:1 1 auto; min-width:0;
           white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .pth{font:11.5px/1.5 ui-monospace,Consolas,"Courier New",monospace; color:var(--dim)}
+  /* 「⑨ 自定义指令」里每个扩展注册了哪些指令词 —— 一个个小药丸，扫一眼就知道占没占名字 */
+  .f code{font:11.5px/1.6 ui-monospace,Consolas,"Courier New",monospace;
+    color:var(--ok); background:rgba(79,209,197,.10); border:1px solid rgba(79,209,197,.22);
+    border-radius:5px; padding:1px 6px; margin:0 4px 3px 0; display:inline-block}
+  input[type=file]{font-size:12px; color:var(--dim); max-width:280px}
   .deps .dep button{flex:0 0 auto}
   .dep > .g, .dep > .b{flex:0 0 auto}
   .dep .g{color:var(--ok)} .dep .b{color:var(--bad)}
@@ -1153,7 +1056,11 @@ PAGE = r"""<!DOCTYPE html>
             border:1px solid var(--line); border-radius:5px; padding:0 5px}
   .dep .note{margin:0; flex:1 1 auto; min-width:0; white-space:nowrap;
              overflow:hidden; text-overflow:ellipsis}
-  .dep .m.pth{flex:0 0 auto}
+  /* 🔴 路径必须**允许收缩**（flex-shrink:1），否则长路径会顶穿网格格子、压到右边那一列上
+     —— 实测 `C:/Users/Administrator/AppData/Local/memo-bot\settings.json`（59 字符）
+     能顶出去 133px，连「打开」按钮一起挤出行外。
+     用 0 1 auto 而不是 1 1 auto：短路径时按钮仍紧跟路径，外观不变。 */
+  .dep .m.pth{flex:0 1 auto}
   .dep input.rename{flex:1 1 auto; min-width:0; padding:3px 7px; border-radius:7px;
                     background:rgba(255,255,255,.06); border:1px solid var(--line);
                     color:var(--ink); font:12.5px/1.4 inherit}
@@ -1246,8 +1153,19 @@ async function api(path, body){
 function toast(t){ const el = $('toast'); el.textContent = t; el.classList.add('on');
   clearTimeout(el._t); el._t = setTimeout(()=>el.classList.remove('on'), 2600); }
 
+/* 「界面字号」：把设置里的百分比写进 CSS 变量 --z，整页跟着缩放（见 body 的 zoom）。
+   桌面版 memo_gui.py 读的是同一个设置键，两边字号口径一致。
+   🔴 只认 80–200，别的值一律按 100 —— 手改 settings.json 写坏也不至于把页面撑爆。 */
+function applyFontScale(){
+  const f = (S && S.fields || []).find(x => x.key === 'ui_font_scale');
+  let v = parseInt(f ? f.value : 100, 10);
+  if(!(v >= 80 && v <= 200)) v = 100;
+  document.documentElement.style.setProperty('--z', String(v / 100));
+}
+
 /* ── 渲染 ─────────────────────────────────────────────────── */
 function render(){
+  applyFontScale();       // 保存后 render() 会重跑，字号改完立刻生效
   renderStatus();
   renderTabs();
   renderSections();
@@ -1353,6 +1271,12 @@ function fieldHTML(f){
   } else if(f.kind === 'area'){
     ctl = '<textarea data-k="' + f.key + '" rows="5" spellcheck="false">'
       + esc(v) + '</textarea>';
+  } else if(f.kind === 'int'){
+    // 数字框带上下限（后端 normalize 也会拦，这里是让用户根本填不进去越界值）
+    ctl = '<input type="number" data-k="' + f.key + '" value="' + esc(v) + '"'
+      + (f.min != null ? ' min="' + f.min + '"' : '')
+      + (f.max != null ? ' max="' + f.max + '"' : '')
+      + ' style="max-width:160px">';
   } else {
     ctl = '<input type="text" data-k="' + f.key + '" value="' + esc(v) + '">';
   }
@@ -1373,16 +1297,22 @@ function renderSections(){
   const g = gs.find(x => x.key === ACTIVE_TAB) || gs[0];
   let html = '';
   if(g.key === 'runtime') html = runtimeSection(g);
-  else if(g.key === 'ignore') html = ignoreSection(g);
   else if(g.key === 'moyu') html = moyuSection(g);
+  else if(g.key === 'ext') html = extSection(g);
   else if(g.key === 'bot') html = botSection(g);
+  else if(g.key === 'msg') html = msgSection(g);
+  else if(g.key === 'behavior') html = behaviorSection(g);
   else {
-    const fs = S.fields.filter(f => f.group === g.key);
+    // `hidden` 的字段不进通用表单（由自绘区块画，见 behaviorSection）——
+    // 🔴 但它**留在 S.fields 里**，因为 setDirty / splitDirty 要靠它认键。
+    const fs = S.fields.filter(f => f.group === g.key && !f.hidden);
     html = '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
       + '</div><div class="body">' + fs.map(fieldHTML).join('') + '</div></section>';
   }
   $('sections').innerHTML = html;
   bindFields();
+  // 「② 群内行为」里的占用行是异步取的，画完再去问（不阻塞页面刷新）
+  if(g.key === 'behavior') loadImageUsage(false);
 }
 
 // ⚠️ 「去 QQ 里开两个开关」—— 这两项在 QQ 那边管，配置中心碰不到它们。
@@ -1397,7 +1327,7 @@ function groupSwitchesHTML(){
     + '<li><b>机器人可获取的群聊消息范围</b> → 选「获取群内全部消息」'
     + '<span class="note">不开：只有 @ 它才理你，群里的普通发言它收不到</span></li>'
     + '<li><b>机器人主动在群聊内发言</b> → 打开'
-    + '<span class="note">不开：它没法主动发东西 —— 上线播报、关机播报都发不出来</span></li>'
+    + '<span class="note">不开：它没法主动发东西 —— 上线播报发不出来</span></li>'
     + '</ol>'
     + '<img class="swshot" src="/docs/qq-group-switches.png"'
     + ' alt="QQ 群设置里这两个开关的位置：机器人可获取的群聊消息范围、机器人主动在群聊内发言">'
@@ -1407,14 +1337,100 @@ function groupSwitchesHTML(){
 
 function botSection(g){
   const fs = S.fields.filter(f => f.group === g.key);
-  // 凭据还没齐时不显示「播报目标」—— 那时机器人根本没连上，列表必然是空的
   return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
     + '</div><div class="body">' + fs.map(fieldHTML).join('')
-    + groupSwitchesHTML()
+    + groupSwitchesHTML() + '</div></section>';
+}
+
+// 「③ 播报」= 通用字段（启动播报 / 功能介绍）+ 自绘的播报目标勾选列表。
+// 凭据还没齐时不显示「播报目标」—— 那时机器人根本没连上，列表必然是空的。
+function msgSection(g){
+  const fs = S.fields.filter(f => f.group === g.key && !f.hidden);
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">' + fs.map(fieldHTML).join('')
     + (S.ready ? pushTargetsHTML() : '') + '</div></section>';
 }
 
-// 「最后说话」→ 「3 分钟前」。只做到「天」，再久就显示日期。
+// 收图区块挂载点（挂在「② 群内行为」）。
+// 🔴 为什么收图要自绘、不走通用表单：它是一个 multi 键（`image_collect`）顶三个开关。
+//    通用表单会把它画成一排两个并排的复选框，看不出「这俩关了就全关」这层关系；
+//    而「主开关 + 展开两个子开关」这个形状，跟「① 连接 QQ」的勾选列表是一个套路，
+//    用户看一眼就懂。所以 `image_collect` 被排除在通用字段外（见 state_fields 的 self_drawn）。
+// 「② 群内行为」= 通用字段 + 自绘的收图区块（image_collect 归这组，跟消息接收行为放一起）。
+function behaviorSection(g){
+  const fs = S.fields.filter(f => f.group === g.key && !f.hidden);
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">' + fs.map(fieldHTML).join('')
+    + imageCollectHTML() + '</div></section>';
+}
+
+// 自绘的收图区块。数据真源是 `image_collect` 这一个 multi 键：
+//   []               = 关
+//   ["c2c"]          = 仅私聊
+//   ["group"]        = 仅群聊
+//   ["c2c","group"]  = 都收
+// 主开关 = 里面有没有东西（不是第三个键）；两个子开关都关掉 → 数组空 → 主开关天然关。
+function imageCollectHTML(){
+  const f = S.fields.find(x => x.key === 'image_collect');
+  const v = (fieldValue('image_collect') || []);
+  const on = v.length > 0;
+  const sub = (k, lb) =>
+    '<label class="icsub"><input type="checkbox" data-imgsub="' + k + '"'
+    + (v.includes(k) ? ' checked' : '') + '>' + lb + '</label>';
+  return '<div class="f">'
+    + '<div class="lb">' + esc(f ? f.label : '收集图片') + '<span class="tag">设置文件</span></div>'
+    + '<div class="hp">' + esc(f ? f.help : '') + '</div>'
+    + '<div class="sw"><input type="checkbox" id="img-master"' + (on ? ' checked' : '') + '>'
+    + '<span class="note">' + (on ? '已打开' : '已关闭') + '</span></div>'
+    + '<div class="icsubs' + (on ? '' : ' hide') + '">' + sub('c2c', '私聊') + sub('group', '群聊')
+    + '<span class="note">收哪边？只勾一个也行 —— 两个都取消就等于关掉。</span></div>'
+    + '<div class="imgusage" id="img-usage"><span class="note">正在统计…</span></div>'
+    + '</div>';
+}
+
+// 收图占用那一行。只读、不参与保存；60 秒内不重复请求（切页签会重画）。
+// 🔴 单独一个请求而不是塞进 /api/state：/api/state 是保存后要回读的，
+//    把「磁盘占用」这种随时在变的数字混进去，会让「有没有改动」的比对变脏。
+let IMG_USAGE = null, IMG_USAGE_AT = 0;
+async function loadImageUsage(force){
+  const box = $('img-usage');
+  if(!box) return;
+  const now = Date.now();
+  if(!force && IMG_USAGE && now - IMG_USAGE_AT < 60000){
+    box.innerHTML = IMG_USAGE; return;
+  }
+  let j;
+  try{ j = await api('/api/images-usage'); }
+  catch(e){ box.innerHTML = '<span class="note bad">统计不到：' + esc(e) + '</span>'; return; }
+  if(!box.isConnected) return;            // 切页签已经把它换掉了，别再往里写
+  if(!j.ok){ box.innerHTML = '<span class="note bad">统计不到：' + esc(j.error || '') + '</span>'; return; }
+  const u = j.usage || {};
+  const alertGb = Number(u.alert_gb) || 0;
+  if(!u.count){
+    IMG_USAGE = '<span class="note">还没收过图片。打开上面这个开关之后，'
+      + '收到的图会存到数据目录的 <b>images/</b> 里，打开脑内抽屉就能看到。</span>';
+  } else {
+    const over = alertGb > 0 && Number(u.gb) >= alertGb;
+    IMG_USAGE = '<span class="note">已存 <b>' + u.count + '</b> 张　·　共 <b>'
+      + esc(j.human || mediaHuman(u.bytes)) + '</b>　·　'
+      + (alertGb > 0 ? '超过 ' + alertGb + ' GB 会提醒你' : '未设报警阈值')
+      + '</span>'
+      + (over ? '<span class="note bad">⚠️ 已经超过报警阈值了</span>' : '');
+  }
+  IMG_USAGE_AT = now;
+  box.innerHTML = IMG_USAGE;
+}
+
+// 体积格式化。服务端 media.human() 已经有同样一份 —— 这里只是页面侧的兜底，
+// 正常情况下展示的是接口返回的 `human` 字段（两边口径必须一致，见 test）。
+function mediaHuman(n){
+  n = Number(n) || 0;
+  if(n < 1024) return n + ' B';
+  if(n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if(n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(1) + ' GB';
+}
+
 function ago(ts){
   if(!ts) return '';
   const d = Math.max(0, Math.floor(Date.now() / 1000) - ts);
@@ -1461,7 +1477,7 @@ function pushTargetsHTML(){
       + '</div>';
   }).join('');
   return '<div class="f"><div class="lb">播报目标'
-    + '<span class="tag">启动播报 / 关机播报发到这里</span></div>'
+    + '<span class="tag">启动播报发到这里</span></div>'
     + '<div class="hp">机器人见过的会话都列在下面。勾上 = 播报也发到那里；'
     + '群和私聊平级 —— 只想收私聊，把群取消勾选就行。'
     + '名字点「改名」自己起（QQ 不给机器人读会话名，只能你来）。</div>'
@@ -1508,7 +1524,15 @@ function runtimeSection(g){
     + '<div class="row"><span class="note" id="ver-note">v' + esc(S.version || '?') + '</span>'
     + '<button id="btn-update">检查更新</button>'
     + '<a id="ver-dl" class="dlbtn" style="display:none" target="_blank" rel="noopener">⬇ 下载新版</a></div>'
-    + '<div class="note" id="ver-file" style="display:none"></div></div></div>';
+    + '<div class="note" id="ver-file" style="display:none"></div>'
+    // 🔴 国内直连 github 不稳定（jsdelivr / Releases 都可能连不上），所以除了「⬇ 下载新版」
+    //    再给一条不依赖网络的兜底路：去拿安装包的那个群里翻群文件。
+    //    这行小字**常驻**显示 —— 等检查更新失败才提示就晚了，用户那会儿已经在找下载入口了。
+    // ⚠️ 这段代码整个住在 config-web.py 里那个 PAGE 大字符串中，是 JS ——
+    //    注释只能写 //；写 # 会把整页脚本打崩（浏览器报 Invalid or unexpected token，
+    //    而且单测抓不到）。
+    + '<div class="note" id="ver-hint">国内网络git直连不稳定，可在你下载摸鱼bot的群内寻找最新群文件。</div>'
+    + '</div></div>';
 }
 
 async function checkUpdate(auto){
@@ -1526,7 +1550,8 @@ async function checkUpdate(auto){
     return;
   }
   if(note){
-    if(!j.ok) note.textContent = 'v' + (j.current || cur) + '（检查失败：' + (j.error || '') + '）';
+    // 🔴 别写成「（检查失败：xxx）—— 服务端给的已经是人话，再套一层括号会变成四层括号
+    if(!j.ok) note.textContent = 'v' + (j.current || cur) + '　检查失败：' + (j.error || '');
     else if(j.has_update) note.textContent = '有新版 v' + j.latest + '（当前 v' + j.current + '）';
     else note.textContent = 'v' + j.current + '（已是最新）';
   }
@@ -1547,28 +1572,6 @@ async function checkUpdate(auto){
   }
 }
 
-function ignoreSection(g){
-  const fs = S.fields.filter(f => f.group === g.key);
-  const envs = S.ignore.env || [], files = S.ignore.file || [];
-  const rows = []
-    .concat(envs.map(r => ({r:r, src:'.env 关键词（在上面的输入框里删）', env:true})))
-    .concat(files.map(r => ({r:r, src:'本地规则', env:false})))
-    .map(x => '<div class="rule"><span>' + esc(x.r) + '</span>'
-      + '<span class="src">' + esc(x.src) + '</span>'
-      + (x.env ? '' : '<button data-delrule="' + esc(x.r) + '">删除</button>') + '</div>')
-    .join('') || '<div class="note">列表是空的 —— 所有消息都会正常收。</div>';
-  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
-    + '</div><div class="body">'
-    + fs.map(fieldHTML).join('')
-    + '<div class="f"><div class="lb">再加一条</div>'
-    + '<div class="hp">填昵称或 openid。命中的消息整条跳过（不收灵感、也不回应）。</div>'
-    + '<div class="row"><input type="text" id="rule-add" placeholder="例如：某某机器人">'
-    + '<button id="rule-add-btn">加入</button>'
-    + '<button class="danger" id="rule-clear">清空本地规则</button></div></div>'
-    + '<div class="f"><div class="lb">当前生效 ' + (envs.length + files.length) + ' 条</div>'
-    + '<div class="rules">' + rows + '</div></div>'
-    + '</div></section>';
-}
 
 /* ── 摸鱼库 ───────────────────────────────────────────────── */
 /* 三类各是一个大输入框，三个并排必然超一屏 → 上面一排小按钮切着看。
@@ -1627,10 +1630,114 @@ function moyuSection(g){
     + '</div></section>';
 }
 
+/* ── 自定义指令（扩展包）─────────────────────────────────────── */
+/* 装的是 `extensions/local/` 下的扩展包：一个 .py，或一个含 .py 的目录。
+   🔴 页面只负责**文件的进出**；把指令注册进机器人是 `extensions/__init__.py`
+      在 bot 启动时干的活 —— 所以这里永远要提醒「重启才生效」。
+   🔴 「加载失败 / 撞名」两行必须显示：扩展是任意代码，装进去不一定跑得起来
+      （缺依赖、写错、和别的扩展抢同一个指令词），不说用户就只能干瞪眼。 */
+function extSize(n){
+  n = n || 0;
+  if(n < 1024) return n + ' B';
+  if(n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function extItemHTML(it){
+  const cmds = (it.commands || []).length
+    ? (it.commands || []).map(c => '<code>' + esc(c) + '</code>').join('')
+    : '<span class="note bad">没注册任何指令 —— 这个包装进来是死的</span>';
+  let extra = '';
+  if(it.error) extra += '<div class="note bad">⚠ 加载失败：' + esc(it.error) + '</div>';
+  if((it.dup || []).length) extra += '<div class="note bad">⚠ 指令名和别的扩展撞了：'
+    + esc(it.dup.join('、')) + '（同名的按加载顺序，后面的盖住前面的）</div>';
+  if((it.helps || []).length) extra += '<div class="note">帮助菜单里会多出：'
+    + esc(it.helps.join(' / ')) + '</div>';
+  const extras = it.extra_files || [];
+  if(extras.length) extra += '<div class="note">包里还带了：' + esc(extras.join('、')) + '</div>';
+  return '<div class="f"><div class="lb">' + esc(it.name)
+    + '<span class="tag">' + esc(it.kind === 'dir' ? '指令包' : '单文件') + '</span></div>'
+    + '<div class="hp">' + cmds + '</div>'
+    + '<div class="note">' + esc((it.files || []).join('、') || '')
+    + ' · ' + esc(extSize(it.size)) + '</div>'
+    + extra
+    + '<div class="row"><button class="danger" data-extrm="' + esc(it.id)
+    + '">移除</button></div></div>';
+}
+
+function extSection(g){
+  const E = S.ext || {};
+  const items = E.items || [];
+  const list = items.length ? items.map(extItemHTML).join('')
+    : '<div class="f"><div class="note">还没装任何自定义指令。导入一个 .py 或 .zip 就能用。</div></div>';
+  return '<section><h2>' + esc(g.title) + '</h2><div class="desc">' + esc(g.desc)
+    + '</div><div class="body">'
+    + '<div class="f"><div class="lb">导入一个指令包</div>'
+    + '<div class="hp">' + esc('选一个 .py（单文件指令）或 .zip（指令包）。'
+        + '导入不会自动生效 —— 导完点最下面「保存并重启机器人」（或上面状态行的「重启」）。') + '</div>'
+    + '<div class="row"><input type="file" id="ext-file" accept=".py,.zip">'
+    + '<button class="pri" id="ext-import">导入</button>'
+    + '<button data-open="ext">打开安装目录</button></div>'
+    + '<div class="note" id="ext-msg"></div>'
+    + '<div class="note pth" title="' + esc(E.dir || '') + '">' + esc(E.dir || '') + '</div>'
+    + '</div>'
+    + '<div class="f"><div class="lb">' + esc('已装 ' + items.length + ' 个') + '</div>'
+    + '<div class="hp">' + esc('每个扩展的 help= 那一行会自动进「帮助」菜单。'
+        + '移除只是把文件挪进 extensions/.removed/，不是真删，想找回还在。') + '</div></div>'
+    + list
+    + '</div></section>';
+}
+
+/* 文件 → base64。分块 fromCharCode：一次 apply 太多参数会爆栈。 */
+function fileToB64(file){
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error('读不了这个文件'));
+    fr.onload = () => {
+      const bytes = new Uint8Array(fr.result);
+      let bin = '';
+      for(let i = 0; i < bytes.length; i += 8192)
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+      resolve(btoa(bin));
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+async function extImport(overwrite){
+  const ef = $('ext-file'), msg = $('ext-msg');
+  const f = ef && ef.files && ef.files[0];
+  const say = (t, bad) => { if(msg){ msg.textContent = t; msg.className = 'note' + (bad ? ' bad' : ' ok'); } };
+  if(!f){ say('先选一个 .py 或 .zip 文件', true); return; }
+  if(f.size > 8 * 1024 * 1024){ say('这个文件太大了（上限 8MB）', true); return; }
+  say('正在导入…');
+  let b64;
+  try { b64 = await fileToB64(f); } catch(e){ say(String(e.message || e), true); return; }
+  const j = await api('/api/ext/import', {name: f.name, data: b64, overwrite: !!overwrite});
+  if(j.conflict){
+    if(confirm('已经有一个叫「' + (j.item && j.item.name || '') + '」的扩展了，覆盖它吗？'))
+      return extImport(true);
+    say('已取消（没有覆盖）', true);
+    return;
+  }
+  if(j.ok){
+    if(j.state) S = j.state;
+    toast(j.message || '已导入');
+    render();
+    const m2 = $('ext-msg');
+    if(m2){ m2.textContent = (j.message || '已导入') + ' —— 重启机器人才生效'; m2.className = 'note ok'; }
+  } else {
+    say(j.error || '导入失败', true);
+  }
+}
+
 /* ── 输入绑定 ─────────────────────────────────────────────── */
 function setDirty(k, v){
   const f = S.fields.find(x => x.key === k);
-  if(!f) return;
+  // 🔴 认不出键时**必须吭声**：以前是 `if(!f) return;` 静默吃掉，
+  //    结果是「点了开关 → 看着变了 → 保存说没有改动」这种查半天查不出的鬼故事
+  //    （自绘区块的键一度不在 S.fields 里，就是这么中招的）。
+  if(!f){ console.warn('setDirty: 字段表里没有这个键 ' + k + '，改动会被丢弃'); return; }
   if(JSON.stringify(v) === JSON.stringify(f.value)) delete DIRTY[k];
   else DIRTY[k] = v;
 }
@@ -1652,6 +1759,24 @@ function bindFields(){
       }
     });
   });
+
+  // 收图区块：主开关 + 两个子开关，最终都折算回 `image_collect` 这一个 multi 键。
+  // 🔴 主开关不是第三个数据键 —— 它只是「数组非空」的另一种画法。
+  //    子开关全取消 → 数组空 → 主开关自动回落到「已关闭」（下面的 render() 负责重画）。
+  const im = $('img-master');
+  if(im) im.addEventListener('change', () => {
+    const cur = fieldValue('image_collect') || [];
+    // 打开时给个合理默认：两边都收（用户真想要单边，再取消其一）
+    setDirty('image_collect', im.checked ? (cur.length ? cur : ['c2c', 'group']) : []);
+    render();
+  });
+  document.querySelectorAll('[data-imgsub]').forEach(cb =>
+    cb.addEventListener('change', () => {
+      const vals = [...document.querySelectorAll('[data-imgsub]:checked')].map(i => i.dataset.imgsub);
+      setDirty('image_collect', vals);
+      render();
+    }));
+
   document.querySelectorAll('[data-browse]').forEach(b =>
     b.addEventListener('click', () => openPick(b.dataset.browse)));
   document.querySelectorAll('[data-test]').forEach(b =>
@@ -1660,6 +1785,24 @@ function bindFields(){
     b.addEventListener('click', async () => {
       const j = await api('/api/open-folder', {what: b.dataset.open});
       if(!j.ok) toast('打不开：' + (j.error || ''));
+    }));
+
+  // 自定义指令：导入 / 移除。导入走「读成 base64 → 一个 JSON POST」，
+  // 不走 multipart（省掉一个解析器，也就不用碰 Content-Type 那堆坑）。
+  const ei = $('ext-import');
+  if(ei) ei.addEventListener('click', () => extImport(false));
+  const ef = $('ext-file');
+  if(ef) ef.addEventListener('change', () => {
+    const m = $('ext-msg');
+    if(m && ef.files[0]){ m.textContent = '选好了：' + ef.files[0].name; m.className = 'note'; }
+  });
+  document.querySelectorAll('[data-extrm]').forEach(b =>
+    b.addEventListener('click', async () => {
+      if(!confirm('移除这个扩展？文件会挪进 extensions/.removed/（不是真删，还能捞回来）。')) return;
+      const j = await api('/api/ext/remove', {id: b.dataset.extrm});
+      if(j.state) S = j.state;
+      toast(j.ok ? (j.message || '已移除') : ('移除失败：' + (j.error || '')));
+      render();
     }));
 
   const ub = $('btn-update');
@@ -1937,22 +2080,39 @@ $('pick').addEventListener('click', e => { if(e.target === $('pick')) $('pick').
 """
 
 
-def serve(port=DEFAULT_PORT, open_browser=True, tries=PORT_TRIES):
-    """起本地服务（只监听 127.0.0.1）。"""
+def serve(port=DEFAULT_PORT, open_browser=True, tries=PORT_TRIES, strict=False):
+    """起本地服务（只监听 127.0.0.1）。
+
+    strict=True（管家传了确切端口时）：**只绑这一个端口**，占不到就报错退出。
+    🔴 为什么要这个开关：`ThreadingHTTPServer` 默认 `allow_reuse_address = 1`，
+       Windows 上这个标志允许 bind**别人正在 LISTENING** 的端口（Linux 只管 TIME_WAIT）。
+       于是「绑上了但收不到请求」—— 页面打不开，日志里却一切正常。
+       管家已经先探明端口，这里就不该再顺延（顺延会让管家记的端口和实际不符）。
+    """
     sync_env()                       # 先把 .env 灌进 os.environ，跟 bot 的视角对齐
     handler = make_handler(PAGE)
+
+    # 🔴 严格模式：关掉 allow_reuse_address —— 否则占用检测是假的（见 docstring）
+    class _StrictServer(ThreadingHTTPServer):
+        allow_reuse_address = False
+
+    srv = _StrictServer if strict else ThreadingHTTPServer
     httpd = None
     last_err = None
-    for p in range(port, port + tries):
+    for p in (range(port, port + tries) if not strict else [port]):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", p), handler)
+            httpd = srv(("127.0.0.1", p), handler)
             port = p
             break
         except OSError as e:
             last_err = e
             continue
     if httpd is None:
-        print(f"（{port}~{port + tries - 1} 都起不来：{type(last_err).__name__}: {last_err}）")
+        if strict:
+            print(f"（端口 {port} 被占用，起不来：{type(last_err).__name__}: {last_err}）",
+                  flush=True)
+        else:
+            print(f"（{port}~{port + tries - 1} 都起不来：{type(last_err).__name__}: {last_err}）")
         return 1
 
     url = f"http://127.0.0.1:{port}/"
@@ -1980,8 +2140,11 @@ def main():
     ap = argparse.ArgumentParser(description="摸鱼bot 配置中心（本地网页）")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="起始端口（默认 8770）")
     ap.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ap.add_argument("--strict-port", action="store_true",
+                    help="只用 --port 指定的那一个端口，占了就报错（管家用）")
     args = ap.parse_args()
-    return serve(port=args.port, open_browser=not args.no_browser)
+    return serve(port=args.port, open_browser=not args.no_browser,
+                 strict=args.strict_port)
 
 
 if __name__ == "__main__":

@@ -29,20 +29,60 @@ settings.json
 onboarded.json
 # 用户自己改过的摸鱼库（内置的 moyu-data.json 仍随代码走，这个是本机覆盖）
 moyu-user.json
+# 收进来的图片本体（个人内容，体积大）
+images/
+# 导出的灵感池 / 备忘（正文全是个人内容，等同 memos.db）
+灵感池.md
+备忘.md
+# 🔴 Windows 保留设备名 —— 本机被误重定向建出来过一个 `nul`，
+#    它 `git add` 会往索引里塞一条坏条目（且文件本身删不掉，见 DETAIL-摸鱼bot.md §61）。
+#    这里挡掉，别让它跟着 `git add -A` 进仓库。
+nul
+aux
+con
+prn
+com1
+com2
+com3
+com4
+lpt1
+lpt2
+lpt3
+# 「图片占用超限报过警了」的标记（本机状态）
+image-alert.json
 
 # ── 运行时产物 ───────────────────────────────────────────────
 __pycache__/
 *.pyc
 bot.pid
+# 管家的单实例锁 / 端口状态（本机运行时产物，同 bot.pid 性质）
+hub.pid
+hub-state.json
+# 桌面窗口的单实例锁（同 bot.pid 性质）
+gui.pid
+# 桌面窗口的崩溃日志
+gui-error.log
 bot.out.log
 bot.out.log.*
 botpy.log
 *.log
+# 真机验收探针（一次性的：假数据目录 + 临时脚本 + 截图，不进仓库）
+_probe/
 # brain-drawer.py 的生成物（按需要手动保留）
 脑内抽屉.html
 
 # ── 私有扩展（本地自定义指令，绝不进公开仓库）────────────────
 extensions/local/
+
+# ── 打包（packaging/）────────────────────────────────────────
+# 这里进仓库的只有**脚本和文档**（组装脚本 / .iss / 语言文件 / 图标生成 / 说明书）。
+# 下面这些是**本机按需重建**的产物，加进来会让仓库多出 200MB 二进制。
+# py/     = 装好依赖的 embeddable Python（用 py-embed.zip 解出来再 pip 装依赖）
+# build/  = _build_dist.py 的组装产物
+# output/ = ISCC 编出来的安装包
+packaging/py/
+packaging/build/
+packaging/output/
 
 # ── 依赖 / 虚拟环境 ─────────────────────────────────────────
 node_modules/
@@ -55,3 +95,12 @@ env/
 Thumbs.db
 .idea/
 .vscode/
+
+# ── 本机启动入口 ─────────────────────────────────────────────
+# 快捷方式是本机生成的（里面写死了 pythonw.exe 的绝对路径，换机器就失效），
+# 不进仓库；要重建就跑一遍生成脚本。
+*.lnk
+# 本机一键启动脚本（指向本机 packaging\py\pythonw.exe，对克隆者无用），不进仓库。
+run-gui.cmd
+# 产品文档（按版本号命名的交付文档，不进公开仓库）
+packaging/摸鱼bot-产品文档-*.md

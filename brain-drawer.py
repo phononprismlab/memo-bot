@@ -73,6 +73,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import export  # noqa: E402  （导出：和机器人「导出」指令共用同一套排版）
+import media  # noqa: E402  （收图：图片落在哪、怎么按路径安全地读回来）
 import settings  # noqa: E402  （设置：网页「⚙ 设置」与机器人「设置」指令共用）
 import store  # noqa: E402
 from paths import data_dir  # noqa: E402  （数据目录：输出产物落哪）
@@ -164,6 +165,7 @@ def collect(open_only=False, include_memo=True):
         b = bucket_of(m)
         if open_only and b not in (BUCKET_MEMO, store.STATUS_OPEN):
             continue
+        pics = m.get("images") or []
         items.append({
             "id": m.get("id") or "",
             "t": content,
@@ -171,8 +173,78 @@ def collect(open_only=False, include_memo=True):
             "d": (m.get("created_at") or "")[:16].replace("T", " "),
             "k": m.get("kind") or store.KIND_IDEA,
             "note": m.get("note") or "",
+            # 🔴 标签是**数据不是设置** —— 全部操作都在这一页，配置中心零改动。
+            #    老库这一列是 NULL，`list_memos`/`list_ideas` 已经统一成空数组了。
+            "tags": m.get("tags") or [],
+            # 本地图片的相对路径数组（`images/202610/<sha16>.jpg`）。
+            # 🔴 只给**路径**，不给 base64 —— 一张图能到 20MB，
+            #    内嵌进页面 `__DATA__` 会让首屏直接卡死。
+            #    真正取图走 `GET /img/<yyyyMM>/<name>`，浏览器自己按需加载。
+            # 🔴 宽高也一并带上：`estHeight()` 是**纯计算**函数，拿不到
+            #    「图加载完了没有」，高度必须在数据里，否则轮播等距会被撑破。
+            "pics": [{"rel": p, "w": wh[0], "h": wh[1]}
+                     for p in pics for wh in (image_dims(p),)],
         })
     return items
+
+
+def image_dims(rel):
+    """读图片的宽高（页面要按比例预留高度）。读不到返回 (0, 0)。
+
+    🔴 为什么服务端读而不是让浏览器自己量：`estHeight()` 是**纯计算**函数
+       （决定气泡多高、要不要跨泳道），它拿不到「图片加载完了没有」。
+       所以宽高必须在**数据里**，浏览器渲染前就能算出该占多高。
+       没有这个，图片会把轮播的竖直等距撑破。
+    """
+    fp = media.resolve_path(rel.split("/")[-2] if "/" in rel else "",
+                            rel.split("/")[-1])
+    if not fp:
+        return 0, 0
+    try:
+        head = open(fp, "rb").read(32)
+    except OSError:
+        return 0, 0
+    try:
+        if head.startswith(b"\x89PNG"):
+            w = int.from_bytes(head[16:20], "big")
+            h = int.from_bytes(head[20:24], "big")
+            return w, h
+        if head[:3] == b"\xff\xd8\xff":
+            data = open(fp, "rb").read(65536)
+            i = 2
+            while i < len(data) - 9:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                mk = data[i + 1]
+                if mk in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    return w, h
+                seg = int.from_bytes(data[i + 2:i + 4], "big")
+                i += 2 + seg
+            return 0, 0
+        if head[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(head[6:8], "little"),
+                    int.from_bytes(head[8:10], "little"))
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            # VP8X / VP8L / VP8 三个变体，逐个体裁
+            fourcc = head[12:16]
+            if fourcc == b"VP8 ":
+                w = int.from_bytes(head[26:28], "little") & 0x3FFF
+                h = int.from_bytes(head[28:30], "little") & 0x3FFF
+                return w, h
+            if fourcc == b"VP8L":
+                bits = int.from_bytes(head[21:25], "little")
+                return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+            if fourcc == b"VP8X":
+                w = int.from_bytes(head[24:27], "little") + 1
+                h = int.from_bytes(head[27:30], "little") + 1
+                return w, h
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0, 0
 
 
 TEMPLATE = r"""<!doctype html>
@@ -183,27 +255,83 @@ TEMPLATE = r"""<!doctype html>
 <link rel="icon" href="data:,">
 <title>脑内抽屉__BRAND__</title>
 <style>
+  /* ── 主题 token ────────────────────────────────────────────────
+     🔴 深色是**默认**（`:root`），浅色由 `html[data-theme="light"]` 覆盖同名变量。
+     所有 rgba() 都从 `--w` / `--xxx-rgb` 这几个**分量**派生 —— 换主题只改分量，
+     几十处 rgba 自动跟着翻，不用一条条写覆盖规则。 */
   :root{
-    --ink:#e6edf3; --dim:#8b98a9; --line:rgba(255,255,255,.12);
+    --w:255,255,255;
+    --open-rgb:79,209,197; --done-rgb:104,211,145; --memo-rgb:246,173,85;
+    --decided-rgb:183,148,244; --danger-rgb:252,129,129;
+
+    --ink:#e6edf3; --dim:#8b98a9; --line:rgba(var(--w),.12);
     --open:#4fd1c5; --done:#68d391; --decided:#b794f4; --dropped:#7c8798;
     --memo:#f6ad55; --memo-done:#8b98a9;
+
+    --bub-bg:rgba(var(--w),.055); --bub-bg-hi:rgba(var(--w),.1);
+    --bub-shadow:0 10px 34px rgba(0,0,0,.4); --bub-inset:inset 0 1px 0 rgba(var(--w),.09);
+    --bub-blur:blur(7px);
+
+    --panel:rgba(20,28,42,.96); --scrim:rgba(4,7,12,.75);
+    --sh6:rgba(0,0,0,.6); --sh5:rgba(0,0,0,.5); --sh4:rgba(0,0,0,.4);
+    --topbar-1:#080b14; --topbar-2:rgba(8,11,20,.82); --topbar-3:rgba(8,11,20,0);
+    --footbar-1:#080b14; --footbar-2:rgba(8,11,20,.86); --footbar-3:rgba(8,11,20,0);
+    --page-bg:radial-gradient(ellipse 130% 90% at 50% 118%, #17334f 0%, #0d1a2b 42%, #070a11 100%);
+    /* 水下光斑的三支光色。第一支跟着主色（--open-rgb），后两支是纯装饰色。
+       🔴 也必须是**分量** —— 写死 rgba 的话浅色主题下就是一团错色的斑。 */
+    --glow2-rgb:183,148,244; --glow3-rgb:56,132,255;
+    --glow:
+      radial-gradient(circle 22vmax at 18% 8%, rgba(var(--open-rgb),.13), transparent 62%),
+      radial-gradient(circle 18vmax at 84% 22%, rgba(var(--glow2-rgb),.11), transparent 62%),
+      radial-gradient(circle 26vmax at 50% 96%, rgba(var(--glow3-rgb),.14), transparent 66%);
+
+    --on-accent:#0d1a2b; --note-ink:#8fa3b8; --pill-b:#cbd5e1; --ph:#66717f;
+    --danger:#fc8181; --foot-b:#aab6c4;
+  }
+  /* 浅色 =「水面日光」：底是水面透下来的光，主色跟深色是同一支蓝绿（只是压深一档）。
+     状态色在浅底上整体加深，否则亮色系会发飘、看不清。 */
+  html[data-theme="light"]{
+    --w:11,42,61;
+    --open-rgb:15,143,133; --done-rgb:63,138,74; --memo-rgb:184,121,26;
+    --decided-rgb:107,79,184; --danger-rgb:197,48,48;
+
+    --ink:#0b2a3d; --dim:#5b7b90; --line:rgba(var(--w),.12);
+    --open:#0f8f85; --done:#3f8a4a; --decided:#6b4fb8; --dropped:#6b7472;
+    --memo:#b8791a; --memo-done:#6b7472;
+
+    --bub-bg:#ffffff; --bub-bg-hi:#f4fbff;
+    --bub-shadow:0 8px 26px rgba(11,42,61,.10); --bub-inset:inset 0 1px 0 #ffffff;
+    /* 🔴 浅色**不用毛玻璃**：半透明白 + blur 在浅底上会糊成一片，改实色 + 柔和阴影 */
+    --bub-blur:none;
+
+    --panel:rgba(255,255,255,.97); --scrim:rgba(18,42,58,.42);
+    --sh6:rgba(11,42,61,.22); --sh5:rgba(11,42,61,.18); --sh4:rgba(11,42,61,.14);
+    --topbar-1:#eaf6fd; --topbar-2:rgba(234,246,253,.85); --topbar-3:rgba(234,246,253,0);
+    /* 页脚渐隐的底色取**页面最底那一档**（--page-bg 的 #cbe6f3），否则会在底部压出一条
+       比背景更亮/更暗的横带。 */
+    --footbar-1:#cbe6f3; --footbar-2:rgba(203,230,243,.86); --footbar-3:rgba(203,230,243,0);
+    --page-bg:linear-gradient(180deg,#eef8ff 0%,#d9eef9 55%,#cbe6f3 100%);
+    --glow2-rgb:120,150,220; --glow3-rgb:90,170,200;
+    --glow:
+      radial-gradient(circle 22vmax at 18% 8%, rgba(var(--open-rgb),.10), transparent 62%),
+      radial-gradient(circle 18vmax at 84% 22%, rgba(var(--glow2-rgb),.08), transparent 62%),
+      radial-gradient(circle 26vmax at 50% 96%, rgba(var(--glow3-rgb),.12), transparent 66%);
+
+    --on-accent:#ffffff; --note-ink:#5b7b90; --pill-b:#3d6478; --ph:#8ba3b4;
+    --danger:#c53030; --foot-b:#4d6472;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
   body{
     overflow:hidden; color:var(--ink);
     font:15px/1.6 -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
-    background:
-      radial-gradient(ellipse 130% 90% at 50% 118%, #17334f 0%, #0d1a2b 42%, #070a11 100%);
+    background:var(--page-bg);
     -webkit-font-smoothing:antialiased;
   }
   /* 水下光斑 */
   body::before{
     content:""; position:fixed; inset:-20%; pointer-events:none; opacity:.5;
-    background:
-      radial-gradient(circle 22vmax at 18% 8%, rgba(79,209,197,.13), transparent 62%),
-      radial-gradient(circle 18vmax at 84% 22%, rgba(183,148,244,.11), transparent 62%),
-      radial-gradient(circle 26vmax at 50% 96%, rgba(56,132,255,.14), transparent 66%);
+    background:var(--glow);
     animation:drift 26s ease-in-out infinite alternate;
   }
   @keyframes drift{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(2%,2%,0) scale(1.06)}}
@@ -213,7 +341,7 @@ TEMPLATE = r"""<!doctype html>
   .topbar{
     position:fixed; top:0; left:0; right:0; z-index:22; pointer-events:none;
     padding-bottom:40px;
-    background:linear-gradient(180deg,#080b14 0%,#080b14 54%,rgba(8,11,20,.82) 79%,rgba(8,11,20,0) 100%);
+    background:linear-gradient(180deg,var(--topbar-1) 0%,var(--topbar-1) 54%,var(--topbar-2) 79%,var(--topbar-3) 100%);
   }
   header{
     display:flex; align-items:center; gap:14px; flex-wrap:wrap;
@@ -229,21 +357,41 @@ TEMPLATE = r"""<!doctype html>
   .legend .l-decided i{background:var(--decided)}
   .legend .l-dropped i{background:var(--dropped)}
 
+  /* 主题切换按钮：跟随系统 → 深色 → 浅色 循环。
+     🔴 图标用**内联 SVG**，不用 emoji 字符 —— 部分 Windows 上 emoji 字形会缺
+        （踩过 🫧 U+1FAE7 的坑）。三个图标叠在一起，靠 data-mode 显示其中一个。
+     🔴 `pointer-events:auto` 不能省：它住在 `.topbar` 里，而 topbar 整块是
+        `pointer-events:none`（好让气泡从标题下穿过去）—— 不显式开回来，点下去
+        会**直接穿到背后的气泡上**，按钮看着好好的，就是没反应。 */
+  .themebtn{
+    pointer-events:auto;
+    flex:0 0 auto; width:32px; height:32px; padding:0; margin-left:12px;
+    display:flex; align-items:center; justify-content:center;
+    border-radius:9px; cursor:pointer; color:var(--dim);
+    background:rgba(var(--w),.06); border:1px solid var(--line);
+    transition:.16s;
+  }
+  .themebtn:hover{color:var(--ink); background:rgba(var(--w),.13)}
+  .themebtn .ti{display:none}
+  .themebtn[data-mode="auto"] .ti-auto{display:block}
+  .themebtn[data-mode="dark"] .ti-dark{display:block}
+  .themebtn[data-mode="light"] .ti-light{display:block}
+
   #stage{position:fixed; inset:0; overflow:hidden}
 
   .bubble{
     position:absolute; bottom:-10vh; left:0;
     padding:13px 17px; border-radius:20px;
     max-width:var(--mw,30%);
-    background:rgba(255,255,255,.055);
+    background:var(--bub-bg);
     border:1px solid var(--line);
-    box-shadow:0 10px 34px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.09);
-    -webkit-backdrop-filter:blur(7px); backdrop-filter:blur(7px);
+    box-shadow:var(--bub-shadow), var(--bub-inset);
+    -webkit-backdrop-filter:var(--bub-blur); backdrop-filter:var(--bub-blur);
     cursor:pointer; will-change:transform,opacity;
     animation:floatUp var(--dur) cubic-bezier(.32,.06,.62,.96) forwards;
     border-left:3px solid var(--accent,var(--open));
   }
-  .bubble:hover{animation-play-state:paused; background:rgba(255,255,255,.1)}
+  .bubble:hover{animation-play-state:paused; background:var(--bub-bg-hi)}
   .bubble[data-s="memo"]{--accent:var(--memo)}
   .bubble[data-s="memo_done"]{--accent:var(--memo-done)}
   .bubble[data-s="open"]{--accent:var(--open)}
@@ -259,23 +407,199 @@ TEMPLATE = r"""<!doctype html>
   /* 🔴 勾选框用 CSS 画，不用 ☐ / ☑ 字符 —— 字符字形在部分系统上会缺（踩过 🫧 的坑）。 */
   .bubble .chk{
     flex:0 0 auto; width:15px; height:15px; border-radius:4px; position:relative;
-    border:1.5px solid rgba(255,255,255,.34); background:rgba(255,255,255,.06);
+    border:1.5px solid rgba(var(--w),.34); background:rgba(var(--w),.06);
     cursor:pointer; transition:.15s;
   }
-  .bubble .chk:hover{border-color:var(--memo); background:rgba(246,173,85,.18)}
+  .bubble .chk:hover{border-color:var(--memo); background:rgba(var(--memo-rgb),.18)}
   .bubble .chk.on{background:var(--done); border-color:var(--done)}
   .bubble .chk.on::after{
     content:""; position:absolute; left:4px; top:1px; width:4px; height:8px;
-    border:solid #0d1a2b; border-width:0 2px 2px 0; transform:rotate(45deg);
+    border:solid var(--on-accent); border-width:0 2px 2px 0; transform:rotate(45deg);
   }
   .bubble .txt{word-break:break-word; white-space:pre-wrap}
+  /* ── 图片 ──────────────────────────────────────────────────────
+     落盘的图片（收图功能）。气泡里给缩略，点开是系统浏览器看原图。
+     🔴 `max-height:160px` 必须和 JS 里的 `MAX_IMG_H` 保持一致 ——
+        两处不一致就会撑破轮播的竖直等距（和超长截断是同一个坑）。
+     🔴 `width:auto; height:auto` + `max-width:100%`：按原始宽高比缩，不变形。
+     宽高读不到的老数据高度按 MAX_IMG_H 估（估高安全，估矮会撑破）。 */
+  .bubble .pics{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}
+  .pics img{
+    display:block; max-width:100%; max-height:160px; width:auto; height:auto;
+    border-radius:6px; background:rgba(var(--w),.05); cursor:zoom-in;
+  }
+  /* 浮层里的大图：比气泡缩略大，但要留出正文 / 标签 / 按钮的地方。
+     🔴 卡片本身是 `max-height:76vh; overflow:auto` —— 图给太大就会把
+        正文和操作按钮顶出可视区，用户得先滚过一堆图才够得着「完成」。
+        所以横向图按宽度铺满就够（宽度已经限制了高度），竖向图才需要单限高度。 */
+  #modal .pics{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+  #modal .pics img{
+    display:block; max-width:100%; max-height:220px; width:auto; height:auto;
+    border-radius:8px; background:rgba(var(--w),.05); cursor:zoom-in;
+  }
+  /* 截断提示 —— 只在正文真被截掉时才渲染（见 truncate / isTruncated）。
+     点整张卡片就开浮层看全文，所以这行只是提示，不单独绑事件。 */
+  .bubble .more{
+    margin-top:6px; font-size:11px; letter-spacing:.3px;
+    color:var(--open); opacity:.85;
+  }
   /* 结论 / 备注：只有这条**有**结论时才渲染（已处理 / 已决议 / 已丢弃 常见）。
      没有就不渲染，和以前完全一样 —— 气泡高度会因此变高，估算里已算进去（见 noteHeight）。 */
   .bubble .note{
     margin-top:8px; padding-top:7px; border-top:1px dashed var(--line);
-    font-size:12px; line-height:1.6; color:#8fa3b8;
+    font-size:12px; line-height:1.6; color:var(--note-ink);
     word-break:break-word; white-space:pre-wrap;
   }
+  /* ── 标签 chips ────────────────────────────────────────────────
+     卡片上一行小标签（最多 3 个 + 「+N」），浮层里那一行可增删。
+     配色由标签自己带（`--tc`，后端保证是 #rgb / #rrggbb），
+     底色用 `color-mix` 从它派生 —— 不用再往 style 里塞第二串颜色。
+     🔴 不支持 `color-mix` 的老浏览器会整条声明失效 → 只有透明底，
+        文字色还在（`color:var(--tc)` 是另一条），不会变成看不见的方块。 */
+  .tagrow{display:flex; flex-wrap:wrap; gap:5px; margin-top:8px}
+  .tag{
+    display:inline-flex; align-items:center; gap:4px;
+    padding:2px 8px; border-radius:999px; font-size:11px; line-height:1.5;
+    color:var(--tc,var(--dim)); border:1px solid var(--tc,var(--line));
+    background:color-mix(in srgb, var(--tc,var(--dim)) 14%, transparent);
+  }
+  .tag.more{color:var(--dim); border-color:var(--line); background:rgba(var(--w),.06)}
+  .tag .tx{
+    cursor:pointer; background:none; border:0; padding:0; margin:0;
+    color:inherit; font:inherit;
+  }
+  .tag .tx:hover{text-decoration:underline}
+
+  /* 顶栏「分类」筛选条 */
+  #filter{
+    display:none; align-items:center; gap:7px; flex-wrap:wrap;
+    padding:16px 22px 0; font-size:11.5px; color:var(--dim);
+  }
+  #filter.on{display:flex}
+  #filter .ftitle{opacity:.8}
+  #filter .fchip{
+    pointer-events:auto; display:inline-flex; align-items:center; gap:6px;
+    padding:4px 10px; border-radius:999px; cursor:pointer; transition:.16s;
+    color:var(--tc,var(--dim)); border:1px solid var(--tc,var(--line));
+    background:color-mix(in srgb, var(--tc,var(--dim)) 12%, transparent);
+  }
+  #filter .fchip.all{color:var(--dim); border-color:var(--line); background:rgba(var(--w),.05)}
+  #filter .fchip:hover{background:color-mix(in srgb, var(--tc,var(--dim)) 24%, transparent)}
+  #filter .fchip.all:hover{background:rgba(var(--w),.13)}
+  #filter .fchip.on{
+    color:var(--on-accent); border-color:var(--tc,var(--brand));
+    background:var(--tc,var(--brand)); font-weight:600;
+  }
+  #filter .fchip .cnt{opacity:.75; font-size:10.5px}
+  #filter .fgear{
+    width:19px; height:19px; border-radius:50%; cursor:pointer; padding:0;
+    display:flex; align-items:center; justify-content:center;
+    background:rgba(var(--w),.14); border:0; color:inherit;
+  }
+  #filter .fgear:hover{background:rgba(var(--w),.3)}
+  #filter .fnone{opacity:.75}
+
+  /* 标签管理小浮层（改名 / 配色 / 删除）—— z-index 高过 #settings(46) */
+  #tagmgr{
+    position:fixed; inset:0; z-index:47; display:none;
+    align-items:center; justify-content:center; padding:26px;
+    background:var(--scrim); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+  }
+  #tagmgr.on{display:flex}
+  #tagmgr .panel{
+    width:min(430px,94vw); border-radius:18px; overflow:hidden;
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 24px 70px var(--sh6);
+  }
+  #tagmgr .thead{
+    display:flex; align-items:center; gap:10px; padding:15px 20px;
+    border-bottom:1px solid var(--line);
+  }
+  #tagmgr .thead h2{margin:0; font-size:14.5px; font-weight:700}
+  #tagmgr .thead .cnt{color:var(--dim); font-size:11.5px}
+  #tagmgr .thead button{
+    margin-left:auto; padding:6px 12px; border-radius:9px; cursor:pointer;
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--ink);
+    font:13px/1 inherit;
+  }
+  #tagmgr .thead button:hover{background:rgba(var(--w),.14)}
+  #tagmgr .tbody{padding:16px 20px 6px}
+  #tagmgr .fld{margin-bottom:13px}
+  #tagmgr .fld .fl{
+    display:block; font-size:11.5px; color:var(--dim); margin-bottom:5px;
+  }
+  #tagmgr .fld input[type=text]{
+    width:100%; padding:9px 11px; border-radius:10px;
+    background:rgba(var(--w),.06); border:1px solid var(--line);
+    color:var(--ink); font:14px/1.5 inherit;
+  }
+  #tagmgr .fld input[type=text]:focus{outline:none; border-color:rgba(var(--open-rgb),.6)}
+  #tagmgr .fld input[type=color]{
+    width:100%; height:34px; padding:2px; cursor:pointer; border-radius:10px;
+    background:rgba(var(--w),.06); border:1px solid var(--line);
+  }
+  #tagmgr .tfoot{
+    display:flex; align-items:center; gap:9px; padding:12px 20px 17px;
+    border-top:1px solid var(--line); background:rgba(var(--w),.03);
+  }
+  #tagmgr .tfoot .msg{font-size:11.5px; color:var(--dim); margin-right:auto}
+  #tagmgr .tfoot button{
+    padding:9px 15px; border-radius:10px; cursor:pointer; transition:.16s;
+    background:rgba(var(--w),.07); border:1px solid var(--line); color:var(--ink);
+    font:13.5px/1 inherit;
+  }
+  #tagmgr .tfoot button:hover{background:rgba(var(--w),.14)}
+  #tagmgr .tfoot button.primary{
+    background:rgba(var(--open-rgb),.16); border-color:rgba(var(--open-rgb),.5); color:var(--open);
+  }
+  #tagmgr .tfoot button.danger{
+    background:rgba(var(--danger-rgb),.16); border-color:rgba(var(--danger-rgb),.5); color:var(--danger);
+  }
+  #tagmgr .tfoot button.danger:hover{background:rgba(var(--danger-rgb),.27)}
+
+  /* 浮层里那一行「标签：」（打新标签 + 已有标签的下拉提示） */
+  #modal .tagbox{margin-top:16px}
+  #modal .tagbox .tl{
+    display:block; font-size:11.5px; color:var(--dim); margin-bottom:7px;
+  }
+  #modal .tagbox .cur{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
+  #modal .tagbox .cur .none{color:var(--dim); font-size:12.5px}
+  /* chip 上的 × 用 CSS 画（两条线），不用 ✕ 字符 —— 与勾选框同一套理由 */
+  #modal .tagbox .tag .rm{
+    width:12px; height:12px; position:relative; cursor:pointer; padding:0;
+    background:none; border:0; color:inherit; opacity:.75;
+  }
+  #modal .tagbox .tag .rm:hover{opacity:1}
+  #modal .tagbox .tag .rm::before,
+  #modal .tagbox .tag .rm::after{
+    content:""; position:absolute; left:2px; top:5px; width:8px; height:1.4px;
+    background:currentColor; border-radius:1px;
+  }
+  #modal .tagbox .tag .rm::before{transform:rotate(45deg)}
+  #modal .tagbox .tag .rm::after{transform:rotate(-45deg)}
+  #modal .tagbox .addrow{display:flex; gap:8px; margin-top:9px}
+  #modal .tagbox .addrow input{
+    flex:1 1 auto; min-width:0; padding:8px 11px; border-radius:10px;
+    background:rgba(var(--w),.06); border:1px solid var(--line);
+    color:var(--ink); font:13.5px/1.5 inherit;
+  }
+  #modal .tagbox .addrow input:focus{outline:none; border-color:rgba(var(--open-rgb),.55)}
+  #modal .tagbox .addrow button{
+    flex:0 0 auto; padding:8px 14px; border-radius:10px; cursor:pointer;
+    background:rgba(var(--open-rgb),.16); border:1px solid rgba(var(--open-rgb),.5);
+    color:var(--open); font:13px/1 inherit;
+  }
+  #modal .tagbox .addrow button:hover{background:rgba(var(--open-rgb),.28)}
+  /* 已有标签的下拉提示（datalist 在暗色下太丑，自己画一个）
+     🔴 用 `position:static` 插进文档流 —— 浮层 .card 是 overflow:auto，
+        绝对定位的浮窗会被裁掉。 */
+  #modal .tagbox .sug{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}
+  #modal .tagbox .sug .s{
+    padding:3px 9px; border-radius:999px; cursor:pointer; font-size:11px;
+    color:var(--dim); border:1px dashed var(--line); background:transparent;
+  }
+  #modal .tagbox .sug .s:hover{color:var(--open); border-color:rgba(var(--open-rgb),.55)}
+
   .b-s{font-size:21px}
   .b-m{font-size:16px}
   .b-l{font-size:14px}
@@ -293,14 +617,14 @@ TEMPLATE = r"""<!doctype html>
   #modal{
     position:fixed; inset:0; z-index:40; display:none;
     align-items:center; justify-content:center; padding:26px;
-    background:rgba(4,7,12,.74); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+    background:var(--scrim); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
   }
   #modal.on{display:flex}
   #modal .card{
     max-width:min(620px,92vw); max-height:76vh; overflow:auto;
     padding:26px 28px; border-radius:20px;
-    background:rgba(20,28,42,.94); border:1px solid var(--line);
-    box-shadow:0 24px 70px rgba(0,0,0,.6);
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 24px 70px var(--sh6);
   }
   #modal .meta{
     display:flex; align-items:center; gap:10px;
@@ -310,51 +634,51 @@ TEMPLATE = r"""<!doctype html>
   /* 「✏️ 编辑」入口 —— 改正文用；创建时间不变（这是用户明确要求） */
   #modal .meta .editbtn{
     flex:0 0 auto; padding:4px 10px; border-radius:8px; cursor:pointer;
-    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--dim);
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--dim);
     font:11.5px/1 inherit; letter-spacing:0; transition:.15s;
   }
   #modal .meta .editbtn:hover{
-    color:var(--open); border-color:rgba(79,209,197,.5); background:rgba(79,209,197,.12);
+    color:var(--open); border-color:rgba(var(--open-rgb),.5); background:rgba(var(--open-rgb),.12);
   }
   #modal .body{font-size:16px; line-height:1.8; white-space:pre-wrap; word-break:break-word}
   /* 编辑态：正文换成这个 textarea（.body 同时隐藏） */
   #modal .editbox{
     width:100%; padding:12px 13px; border-radius:12px; min-height:130px; resize:vertical;
-    background:rgba(255,255,255,.06); border:1px solid rgba(79,209,197,.45);
+    background:rgba(var(--w),.06); border:1px solid rgba(var(--open-rgb),.45);
     color:var(--ink); font:15px/1.8 inherit; white-space:pre-wrap;
   }
-  #modal .editbox:focus{outline:none; border-color:rgba(79,209,197,.72)}
+  #modal .editbox:focus{outline:none; border-color:rgba(var(--open-rgb),.72)}
   #modal .editrow{display:flex; align-items:center; gap:9px; margin-top:11px}
   #modal .editrow .ehint{margin-right:auto; font-size:11.5px; color:var(--dim)}
-  #modal .editrow .ehint b{color:#68d391; font-weight:600}
+  #modal .editrow .ehint b{color:var(--done); font-weight:600}
   #modal .editrow button{
     padding:9px 15px; border-radius:10px; cursor:pointer; transition:.16s;
-    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.07); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1 inherit;
   }
-  #modal .editrow button:hover{background:rgba(255,255,255,.14)}
+  #modal .editrow button:hover{background:rgba(var(--w),.14)}
   #modal .editrow button.primary{
-    background:rgba(79,209,197,.16); border-color:rgba(79,209,197,.5); color:#4fd1c5;
+    background:rgba(var(--open-rgb),.16); border-color:rgba(var(--open-rgb),.5); color:var(--open);
   }
-  #modal .editrow button.primary:hover{background:rgba(79,209,197,.28)}
+  #modal .editrow button.primary:hover{background:rgba(var(--open-rgb),.28)}
   #modal .editrow button[disabled]{opacity:.5; cursor:default; transform:none}
   #modal .hint{margin-top:18px; font-size:11.5px; color:var(--dim); line-height:1.7}
 
   /* 处理操作区 */
   #modal .note{
     width:100%; margin-top:18px; padding:10px 12px; border-radius:11px;
-    background:rgba(255,255,255,.06); border:1px solid var(--line);
+    background:rgba(var(--w),.06); border:1px solid var(--line);
     color:var(--ink); font:13.5px/1.6 inherit; resize:vertical; min-height:46px;
   }
-  #modal .note::placeholder{color:#66717f}
-  #modal .note:focus{outline:none; border-color:rgba(79,209,197,.55)}
+  #modal .note::placeholder{color:var(--ph)}
+  #modal .note:focus{outline:none; border-color:rgba(var(--open-rgb),.55)}
   #modal .actions{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px}
   #modal .actions button{
     flex:1 1 auto; min-width:108px; padding:10px 14px; border-radius:11px; cursor:pointer;
-    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.07); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1 inherit; transition:.16s;
   }
-  #modal .actions button:hover{background:rgba(255,255,255,.14); transform:translateY(-1px)}
+  #modal .actions button:hover{background:rgba(var(--w),.14); transform:translateY(-1px)}
   #modal .actions button[data-act="done"]:hover{border-color:var(--done); color:var(--done)}
   #modal .actions button[data-act="decided"]:hover{border-color:var(--decided); color:var(--decided)}
   #modal .actions button[data-act="dropped"]:hover{border-color:var(--dropped); color:var(--dropped)}
@@ -369,36 +693,36 @@ TEMPLATE = r"""<!doctype html>
   }
   .bar .pill{
     pointer-events:auto; padding:5px 11px; border-radius:999px;
-    border:1px solid var(--line); background:rgba(255,255,255,.05);
+    border:1px solid var(--line); background:rgba(var(--w),.05);
   }
-  .bar .pill.live{color:#68d391; border-color:rgba(104,211,145,.42)}
-  .bar .pill.offline{color:#f6ad55; border-color:rgba(246,173,85,.42)}
-  .bar .pill.pending{color:#4fd1c5; border-color:rgba(79,209,197,.5); cursor:pointer}
-  .bar .pill.pending:hover{background:rgba(79,209,197,.15)}
+  .bar .pill.live{color:var(--done); border-color:rgba(var(--done-rgb),.42)}
+  .bar .pill.offline{color:var(--memo); border-color:rgba(var(--memo-rgb),.42)}
+  .bar .pill.pending{color:var(--open); border-color:rgba(var(--open-rgb),.5); cursor:pointer}
+  .bar .pill.pending:hover{background:rgba(var(--open-rgb),.15)}
   /* 归档入口：已处理 / 已决议 / 垃圾桶 */
   .bar .pill.act{cursor:pointer; transition:.16s}
-  .bar .pill.act b{font-weight:600; margin-left:5px; color:#cbd5e1}
-  .bar .pill.act:hover{background:rgba(255,255,255,.13); color:var(--ink)}
+  .bar .pill.act b{font-weight:600; margin-left:5px; color:var(--pill-b)}
+  .bar .pill.act:hover{background:rgba(var(--w),.13); color:var(--ink)}
   .bar .pill.act[data-s="done"]:hover{border-color:var(--done); color:var(--done)}
   .bar .pill.act[data-s="decided"]:hover{border-color:var(--decided); color:var(--decided)}
   .bar .pill.act[data-s="dropped"]:hover{border-color:var(--dropped); color:var(--ink)}
   .bar .pill.act[data-s="memo_done"]:hover{border-color:var(--memo); color:var(--memo)}
   .bar .pill.act.zero{opacity:.42}
   .bar .pill.quit{cursor:pointer}
-  .bar .pill.quit:hover{color:#fc8181; border-color:rgba(252,129,129,.5)}
+  .bar .pill.quit:hover{color:var(--danger); border-color:rgba(var(--danger-rgb),.5)}
 
   /* 归档列表浮层（已处理 / 已决议 / 垃圾桶） */
   #list{
     position:fixed; inset:0; z-index:45; display:none;
     align-items:center; justify-content:center; padding:26px;
-    background:rgba(4,7,12,.74); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+    background:var(--scrim); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
   }
   #list.on{display:flex}
   #list .panel{
     width:min(780px,94vw); max-height:80vh; display:flex; flex-direction:column;
     border-radius:20px; overflow:hidden;
-    background:rgba(20,28,42,.96); border:1px solid var(--line);
-    box-shadow:0 24px 70px rgba(0,0,0,.6);
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 24px 70px var(--sh6);
   }
   #list .lhead{
     display:flex; align-items:center; gap:10px; flex:0 0 auto;
@@ -408,18 +732,18 @@ TEMPLATE = r"""<!doctype html>
   #list .lhead .cnt{color:var(--dim); font-size:12px}
   #list .lhead button{
     margin-left:auto; padding:6px 12px; border-radius:9px; cursor:pointer;
-    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--ink);
     font:13px/1 inherit;
   }
-  #list .lhead button:hover{background:rgba(255,255,255,.14)}
+  #list .lhead button:hover{background:rgba(var(--w),.14)}
   #list .lbody{overflow:auto; padding:10px 12px 14px}
   #list .row{
     display:flex; gap:11px; align-items:flex-start; cursor:pointer;
     padding:11px 13px; border-radius:13px; margin-bottom:6px;
-    background:rgba(255,255,255,.035); border:1px solid transparent;
+    background:rgba(var(--w),.035); border:1px solid transparent;
     border-left:3px solid var(--accent,var(--dim));
   }
-  #list .row:hover{background:rgba(255,255,255,.08); border-color:var(--line); border-left-color:var(--accent)}
+  #list .row:hover{background:rgba(var(--w),.08); border-color:var(--line); border-left-color:var(--accent)}
   #list .row[data-s="open"]{--accent:var(--open)}
   #list .row[data-s="done"]{--accent:var(--done)}
   #list .row[data-s="decided"]{--accent:var(--decided)}
@@ -428,32 +752,32 @@ TEMPLATE = r"""<!doctype html>
   #list .row[data-s="memo_done"]{--accent:var(--memo-done)}
   #list .row .chk{
     flex:0 0 auto; margin-top:2px; width:15px; height:15px; border-radius:4px; position:relative;
-    border:1.5px solid rgba(255,255,255,.34); background:rgba(255,255,255,.06);
+    border:1.5px solid rgba(var(--w),.34); background:rgba(var(--w),.06);
     cursor:pointer; transition:.15s;
   }
-  #list .row .chk:hover{border-color:var(--memo); background:rgba(246,173,85,.18)}
+  #list .row .chk:hover{border-color:var(--memo); background:rgba(var(--memo-rgb),.18)}
   #list .row .chk.on{background:var(--done); border-color:var(--done)}
   #list .row .chk.on::after{
     content:""; position:absolute; left:4px; top:1px; width:4px; height:8px;
-    border:solid #0d1a2b; border-width:0 2px 2px 0; transform:rotate(45deg);
+    border:solid var(--on-accent); border-width:0 2px 2px 0; transform:rotate(45deg);
   }
   #list .row .c{flex:1 1 auto; min-width:0}
   #list .row .m{font-size:10.5px; color:var(--dim); letter-spacing:.5px; margin-bottom:4px}
   #list .row .x{font-size:13.5px; line-height:1.65; white-space:pre-wrap; word-break:break-word}
-  #list .row .n{font-size:12px; color:#8fa3b8; margin-top:6px; white-space:pre-wrap}
+  #list .row .n{font-size:12px; color:var(--note-ink); margin-top:6px; white-space:pre-wrap}
   #list .row .ops{
     flex:0 0 auto; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;
   }
   #list .row .ops button{
     padding:6px 10px; border-radius:8px; cursor:pointer; white-space:nowrap;
-    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--dim);
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--dim);
     font:11.5px/1 inherit; transition:.15s;
   }
-  #list .row .ops button:hover{color:var(--open); border-color:rgba(79,209,197,.5); background:rgba(79,209,197,.12)}
+  #list .row .ops button:hover{color:var(--open); border-color:rgba(var(--open-rgb),.5); background:rgba(var(--open-rgb),.12)}
   #list .row .ops button[disabled]{opacity:.5; cursor:default}
   /* 「已丢弃」列表里的永久删除 —— 唯一会真删数据的按钮，红色单独标出来 */
-  #list .row .ops button.danger{color:#fc8181; border-color:rgba(252,129,129,.4)}
-  #list .row .ops button.danger:hover{color:#fc8181; border-color:rgba(252,129,129,.6); background:rgba(252,129,129,.14)}
+  #list .row .ops button.danger{color:var(--danger); border-color:rgba(var(--danger-rgb),.4)}
+  #list .row .ops button.danger:hover{color:var(--danger); border-color:rgba(var(--danger-rgb),.6); background:rgba(var(--danger-rgb),.14)}
   #list .row .ops button.danger[disabled]{color:var(--dim); border-color:var(--line)}
   #list .empty{padding:36px 10px; text-align:center; color:var(--dim); font-size:13.5px}
 
@@ -461,53 +785,53 @@ TEMPLATE = r"""<!doctype html>
   #confirm{
     position:fixed; inset:0; z-index:48; display:none;
     align-items:center; justify-content:center; padding:26px;
-    background:rgba(4,7,12,.76); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+    background:var(--scrim); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
   }
   #confirm.on{display:flex}
   #confirm .panel{
     width:min(460px,94vw); border-radius:18px; overflow:hidden;
-    background:rgba(20,28,42,.97); border:1px solid var(--line);
-    box-shadow:0 24px 70px rgba(0,0,0,.6);
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 24px 70px var(--sh6);
   }
   #confirm .chead{padding:16px 20px 0}
-  #confirm .chead h2{margin:0; font-size:15px; font-weight:700; color:#fc8181}
+  #confirm .chead h2{margin:0; font-size:15px; font-weight:700; color:var(--danger)}
   #confirm .cbody{padding:9px 20px 0; color:var(--dim); font-size:13px; line-height:1.7}
   #confirm .cbody .q{
     color:var(--ink); font-size:13px; line-height:1.65; margin-top:9px; padding:9px 11px;
     max-height:170px; overflow:auto; border-radius:10px;
-    background:rgba(255,255,255,.05); border:1px solid var(--line);
+    background:rgba(var(--w),.05); border:1px solid var(--line);
     white-space:pre-wrap; word-break:break-word;
   }
   #confirm .noask{
     display:flex; align-items:center; gap:8px; margin:14px 20px 0;
     font-size:12.5px; color:var(--dim); cursor:pointer; user-select:none;
   }
-  #confirm .noask input{width:14px; height:14px; margin:0; cursor:pointer; accent-color:#fc8181}
+  #confirm .noask input{width:14px; height:14px; margin:0; cursor:pointer; accent-color:var(--danger)}
   #confirm .noask:hover{color:var(--ink)}
   #confirm .cfoot{display:flex; gap:9px; justify-content:flex-end; padding:16px 20px 18px}
   #confirm .cfoot button{
     padding:9px 16px; border-radius:10px; cursor:pointer; transition:.16s;
-    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.07); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1 inherit;
   }
-  #confirm .cfoot button:hover{background:rgba(255,255,255,.14)}
+  #confirm .cfoot button:hover{background:rgba(var(--w),.14)}
   #confirm .cfoot button.danger{
-    background:rgba(252,129,129,.16); border-color:rgba(252,129,129,.5); color:#fc8181;
+    background:rgba(var(--danger-rgb),.16); border-color:rgba(var(--danger-rgb),.5); color:var(--danger);
   }
-  #confirm .cfoot button.danger:hover{background:rgba(252,129,129,.27)}
+  #confirm .cfoot button.danger:hover{background:rgba(var(--danger-rgb),.27)}
 
   /* 设置浮层 —— 改的是 memo-bot/settings.json，与机器人「设置」指令同一份 */
   #settings{
     position:fixed; inset:0; z-index:46; display:none;
     align-items:center; justify-content:center; padding:26px;
-    background:rgba(4,7,12,.74); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
+    background:var(--scrim); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
   }
   #settings.on{display:flex}
   #settings .panel{
     width:min(640px,94vw); max-height:82vh; display:flex; flex-direction:column;
     border-radius:20px; overflow:hidden;
-    background:rgba(20,28,42,.96); border:1px solid var(--line);
-    box-shadow:0 24px 70px rgba(0,0,0,.6);
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 24px 70px var(--sh6);
   }
   #settings .shead{
     display:flex; align-items:center; gap:10px; flex:0 0 auto;
@@ -517,36 +841,36 @@ TEMPLATE = r"""<!doctype html>
   #settings .shead .sub{color:var(--dim); font-size:11.5px}
   #settings .shead button{
     margin-left:auto; padding:6px 12px; border-radius:9px; cursor:pointer;
-    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--ink);
     font:13px/1 inherit;
   }
-  #settings .shead button:hover{background:rgba(255,255,255,.14)}
+  #settings .shead button:hover{background:rgba(var(--w),.14)}
   #settings .sbody{overflow:auto; padding:6px 20px 10px}
   #settings .shint{
     flex:0 0 auto; padding:10px 20px; font-size:11.5px; color:var(--dim); line-height:1.65;
-    border-top:1px solid var(--line); background:rgba(255,255,255,.03);
+    border-top:1px solid var(--line); background:rgba(var(--w),.03);
   }
   #settings .shint code{
-    background:rgba(255,255,255,.1); padding:1px 5px; border-radius:5px; font-size:11px;
+    background:rgba(var(--w),.1); padding:1px 5px; border-radius:5px; font-size:11px;
   }
-  #settings .item{padding:14px 0; border-bottom:1px solid rgba(255,255,255,.07)}
+  #settings .item{padding:14px 0; border-bottom:1px solid rgba(var(--w),.07)}
   #settings .item:last-child{border-bottom:none}
   #settings .item .lb{font-size:13.5px; font-weight:600; margin-bottom:3px}
   #settings .item .hp{font-size:11.5px; color:var(--dim); margin-bottom:9px}
   #settings .item input[type=text]{
     width:100%; box-sizing:border-box; padding:9px 11px; border-radius:10px;
-    background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--ink);
+    background:rgba(var(--w),.06); border:1px solid var(--line); color:var(--ink);
     font:13.5px/1.4 inherit;
   }
-  #settings .item input[type=text]:focus{outline:none; border-color:rgba(79,209,197,.55)}
+  #settings .item input[type=text]:focus{outline:none; border-color:rgba(var(--open-rgb),.55)}
   #settings .item .chks{display:flex; gap:16px; flex-wrap:wrap}
   #settings .item .chks label{display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer}
-  #settings .item .chks input{accent-color:#4fd1c5; width:15px; height:15px}
+  #settings .item .chks input{accent-color:var(--open); width:15px; height:15px}
   #settings .item .rst{
     margin-top:9px; padding:5px 10px; border-radius:8px; cursor:pointer;
     background:transparent; border:1px solid var(--line); color:var(--dim); font:11.5px/1 inherit;
   }
-  #settings .item .rst:hover{color:var(--ink); background:rgba(255,255,255,.08)}
+  #settings .item .rst:hover{color:var(--ink); background:rgba(var(--w),.08)}
   #settings .sfoot{
     display:flex; align-items:center; gap:10px; flex:0 0 auto;
     padding:13px 20px; border-top:1px solid var(--line);
@@ -554,15 +878,15 @@ TEMPLATE = r"""<!doctype html>
   #settings .sfoot .msg{margin-left:auto; font-size:12px; color:var(--dim)}
   #settings .sfoot button{
     padding:8px 18px; border-radius:10px; cursor:pointer; font:13px/1 inherit;
-    background:rgba(79,209,197,.16); border:1px solid rgba(79,209,197,.5); color:#4fd1c5;
+    background:rgba(var(--open-rgb),.16); border:1px solid rgba(var(--open-rgb),.5); color:var(--open);
   }
-  #settings .sfoot button:hover{background:rgba(79,209,197,.28)}
+  #settings .sfoot button:hover{background:rgba(var(--open-rgb),.28)}
 
   #toast{
     position:fixed; left:50%; bottom:8vh; transform:translate(-50%,14px);
     z-index:60; max-width:82vw; padding:11px 18px; border-radius:12px; font-size:13px;
-    background:rgba(26,36,52,.97); border:1px solid var(--line); color:var(--ink);
-    box-shadow:0 14px 40px rgba(0,0,0,.5);
+    background:var(--panel); border:1px solid var(--line); color:var(--ink);
+    box-shadow:0 14px 40px var(--sh5);
     opacity:0; pointer-events:none; transition:.22s;
   }
   #toast.on{opacity:1; transform:translate(-50%,0)}
@@ -575,14 +899,15 @@ TEMPLATE = r"""<!doctype html>
   #empty.on{display:flex}
   #empty .big{font-size:38px}
 
-  /* 🔴 页脚同 topbar：给一层向上渐隐的底色，气泡「从黑暗里升起」而不是糊在页脚字上 */
+  /* 🔴 页脚同 topbar：给一层向上渐隐的底色，气泡「从黑暗里升起」而不是糊在页脚字上。
+     底色也必须走 token —— 写死 #080b14 的话浅色主题下底部会压出一条黑带。 */
   footer{
     position:fixed; left:0; right:0; bottom:0; z-index:20;
     padding:26px 22px 10px; font-size:11.5px; color:var(--dim);
     display:flex; gap:16px; pointer-events:none; flex-wrap:wrap;
-    background:linear-gradient(0deg,#080b14 0%,#080b14 56%,rgba(8,11,20,.86) 79%,rgba(8,11,20,0) 100%);
+    background:linear-gradient(0deg,var(--footbar-1) 0%,var(--footbar-1) 56%,var(--footbar-2) 79%,var(--footbar-3) 100%);
   }
-  footer b{color:#aab6c4; font-weight:600}
+  footer b{color:var(--foot-b); font-weight:600}
   @media (max-width:640px){
     header{padding:12px 14px 0} .legend{display:none}
     .bar{padding:8px 14px 0}
@@ -592,6 +917,45 @@ TEMPLATE = r"""<!doctype html>
 </style>
 </head>
 <body>
+<script>
+/* 主题初始化 —— 单独一段，放在 <body> 最前面。
+   🔴 必须在**首屏渲染前**把 data-theme 定下来，否则会先闪一下深色再跳浅色（FOUC），
+      所以它不能等到页面底部那个大 <script> 才跑。 */
+(function(){
+  var KEY = 'memo-drawer-theme';                 // auto | dark | light
+  var NAME = {auto:'跟随系统', dark:'深色', light:'浅色'};
+  function stored(){
+    try{ return localStorage.getItem(KEY) || 'auto'; }catch(e){ return 'auto'; }
+  }
+  function sysLight(){
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+  }
+  function apply(mode){
+    var real = (mode === 'auto') ? (sysLight() ? 'light' : 'dark') : mode;
+    document.documentElement.setAttribute('data-theme', real);
+    var b = document.getElementById('btn-theme');
+    if(b){ b.setAttribute('data-mode', mode); b.title = '主题：' + NAME[mode] + '（点击切换）'; }
+  }
+  apply(stored());                    // 此时按钮还没解析出来，没关系 —— 下面 DOMContentLoaded 会再同步一次
+  if(window.matchMedia){
+    var mq = window.matchMedia('(prefers-color-scheme: light)');
+    var onSys = function(){ if(stored() === 'auto') apply('auto'); };   // 跟随系统时要实时跟
+    if(mq.addEventListener) mq.addEventListener('change', onSys);
+    else if(mq.addListener) mq.addListener(onSys);                      // 老 Chrome 的写法
+  }
+  document.addEventListener('DOMContentLoaded', function(){
+    apply(stored());                  // 这次能拿到按钮了，图标和提示一起同步
+    var b = document.getElementById('btn-theme');
+    if(!b) return;
+    b.addEventListener('click', function(){
+      var order = ['auto','dark','light'];
+      var next = order[(order.indexOf(stored()) + 1) % order.length];
+      try{ localStorage.setItem(KEY, next); }catch(e){}
+      apply(next);
+    });
+  });
+})();
+</script>
 <div class="topbar">
   <header>
     <h1>🗂 脑内抽屉<span>__BRAND__</span></h1>
@@ -602,6 +966,22 @@ TEMPLATE = r"""<!doctype html>
       <span class="l-decided"><i></i>已决议</span>
       <span class="l-dropped"><i></i>已丢弃</span>
     </div>
+    <button class="themebtn" id="btn-theme" data-mode="auto" title="主题：跟随系统（点击切换）">
+      <svg class="ti ti-auto" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+        <circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M10 3a7 7 0 0 0 0 14z" fill="currentColor"/>
+      </svg>
+      <svg class="ti ti-dark" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+        <path d="M10 2.6a7.4 7.4 0 1 0 7.4 7.4A5.8 5.8 0 0 1 10 2.6z" fill="currentColor"/>
+      </svg>
+      <svg class="ti ti-light" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+        <circle cx="10" cy="10" r="3.5" fill="currentColor"/>
+        <g stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none">
+          <path d="M10 2.4v2M10 15.6v2M2.4 10h2M15.6 10h2"/>
+          <path d="M4.6 4.6l1.4 1.4M14 14l1.4 1.4M15.4 4.6L14 6M6 14l-1.4 1.4"/>
+        </g>
+      </svg>
+    </button>
   </header>
   <div class="bar">
     <span class="pill" id="mode">检测中…</span>
@@ -611,10 +991,15 @@ TEMPLATE = r"""<!doctype html>
     <span class="pill act" id="btn-decided" data-s="decided">📌 已决议<b>0</b></span>
     <span class="pill act" id="btn-dropped" data-s="dropped">🗑 垃圾桶<b>0</b></span>
     <span class="pill act" id="btn-settings" title="内容流放哪几类">⚙ 设置</span>
+    <span class="pill act" id="btn-tags" title="按标签只看某一类">🏷 分类<b>0</b></span>
     <span class="pill act" id="btn-export" style="display:none"
-          title="把全部备忘 + 灵感导出成一个文件；想导 json / txt 就在群里发「导出 json」">⬇ 导出</span>
+          title="把全部备忘 + 灵感导出成一个文件，可以连图片原图一起打包（zip）；本地下载没有大小限制">⬇ 导出</span>
     <span class="pill quit" id="btn-quit" style="display:none">⏻ 停止服务</span>
   </div>
+  <!-- 标签筛选条：点「🏷 分类」展开。点某个标签 = 只轮播带这个标签的条目。
+       🔴 与「⚙ 设置」里的 bubbles_show 是**两个独立维度**，可以叠加：
+          bubbles_show 管「哪些状态」，标签管「哪一类」。 -->
+  <div id="filter"></div>
 </div>
 
 <div id="stage"></div>
@@ -625,12 +1010,24 @@ TEMPLATE = r"""<!doctype html>
   <div class="meta"><span class="mtxt"></span><button class="editbtn" id="btn-edit"
     title="改正文；创建时间不变">✏️ 编辑</button></div>
   <div class="body"></div>
+  <!-- 收图：这条挂的图片（大图）。没有图时整块 display:none，见 openModal -->
+  <div class="pics" style="display:none"></div>
   <textarea class="editbox" id="editbox" rows="6" style="display:none"
     placeholder="改这一条的正文…"></textarea>
   <div class="editrow" id="editrow" style="display:none">
     <span class="ehint">只改正文 · <b>创建时间不变</b> · Esc 取消</span>
     <button id="ecancel">取消</button>
     <button id="esave" class="primary">保存</button>
+  </div>
+  <!-- 标签行：已打的点 × 去掉；下面输入框打新的。见 renderTagRow() -->
+  <div class="tagbox" id="tagbox">
+    <span class="tl">标签</span>
+    <div class="cur" id="tagcur"></div>
+    <div class="addrow">
+      <input type="text" id="tagnew" maxlength="20" placeholder="打一个标签，回车加…">
+      <button id="tagadd">加上</button>
+    </div>
+    <div class="sug" id="tagsug"></div>
   </div>
   <textarea class="note" id="note" rows="2" placeholder="结论 / 备注（可选）"></textarea>
   <div class="actions ideaact">
@@ -679,6 +1076,28 @@ TEMPLATE = r"""<!doctype html>
   <div class="sfoot">
     <button id="ssave">保存</button>
     <span class="msg" id="smsg"></span>
+  </div>
+</div></div>
+
+<div id="tagmgr"><div class="panel">
+  <div class="thead">
+    <h2>🏷 标签管理</h2><span class="cnt" id="tgm-cnt"></span>
+    <button id="tgm-close">✕ 关闭</button>
+  </div>
+  <div class="tbody">
+    <div class="fld">
+      <label class="fl" for="tgm-name">标签名（1–20 字）</label>
+      <input type="text" id="tgm-name" maxlength="20" placeholder="标签名">
+    </div>
+    <div class="fld">
+      <label class="fl" for="tgm-color">配色</label>
+      <input type="color" id="tgm-color" value="#4fd1c5">
+    </div>
+  </div>
+  <div class="tfoot">
+    <span class="msg" id="tgm-msg"></span>
+    <button class="danger" id="tgm-del" title="从字典和所有卡片上摘掉这个标签">🗑 删除</button>
+    <button class="primary" id="tgm-save">保存</button>
   </div>
 </div></div>
 
@@ -736,8 +1155,42 @@ function settingValue(key){
 }
 let SHOW = settingValue('bubbles_show') || ['memo', 'open'];
 
-function streamItems(){ return IDEAS.filter(x => SHOW.includes(x.s)); }
+/* ── 标签 ────────────────────────────────────────────────────
+   🔴 标签是**数据不是设置** —— 字典在库里（`store.tags_all()`），
+      全部操作都在这一页，配置中心零改动。
+      每张卡片的标签名数组在 `it.tags`（服务端已经把旧库的 NULL 收成空数组）。
+   🔴 筛选态存 localStorage：它是**这台浏览器上的临时视角**，
+      不是「这个库的设定」，不该跟着库走（和主题偏好同一个道理）。
+   🔴 筛选与 `bubbles_show` 是**两个独立维度**，叠加生效：
+      bubbles_show 管「哪些状态」，标签管「哪一类」。 */
+const TAGS_KEY = 'memo-drawer-tagfilter';
+let TAGDICT = [];                                        // [{name,color,count}]
+let TAGFILTER = lsGet(TAGS_KEY, null);                   // null = 全部；否则是标签名
+
+function tagColor(name){
+  const t = TAGDICT.find(x => x.name === name);
+  return t ? t.color : '#8b98a9';
+}
+// 未筛选时用服务端给的 count；筛选中时可以就地更新（见 refreshTags 的乐观写法）
+function tagCount(name){
+  return IDEAS.filter(x => (x.tags || []).includes(name)).length;
+}
+
+function streamItems(){
+  let out = IDEAS.filter(x => SHOW.includes(x.s));
+  if(TAGFILTER) out = out.filter(x => (x.tags || []).includes(TAGFILTER));
+  return out;
+}
 function countBy(s){ return IDEAS.filter(x => x.s === s).length; }
+
+/* 筛完之后没有任何条目 —— 落回「全部」，免得页面看着像空了。
+   🔴 这是必要的：筛一个标签、然后把最后一条带这个标签的处理掉，
+      不落回的话屏上会一条气泡都没有，用户以为东西丢了。 */
+function ensureFilterAlive(){
+  if(!TAGFILTER) return;
+  if(TAGDICT.some(t => t.name === TAGFILTER)) return;
+  TAGFILTER = null; lsSet(TAGS_KEY, null);
+}
 
 function updateCounts(){
   nEl.textContent = streamItems().length;
@@ -748,6 +1201,12 @@ function updateCounts(){
     const n = countBy(s);
     el.querySelector('b').textContent = n;
     el.classList.toggle('zero', n === 0);
+  }
+  // 顶栏「分类」上的数字 = 库里一共有几个标签（0 就淡掉，和归档入口一致）
+  const bt = document.getElementById('btn-tags');
+  if(bt){
+    bt.querySelector('b').textContent = TAGDICT.length;
+    bt.classList.toggle('zero', TAGDICT.length === 0);
   }
 }
 updateCounts();
@@ -822,7 +1281,21 @@ async function detectMode(){
     modeEl.textContent = '● 已连本地库 · 处理即刻写库';
     document.getElementById('btn-quit').style.display = '';
     document.getElementById('btn-export').style.display = '';
+    // 导出按钮要不要给「zip」选项，取决于库里到底有没有图。
+    // 🔴 这里自己数一遍、不从服务端要 —— 少一次请求，而且条目就在手上。
+    try {
+      window.__IMG_COUNT = (IDEAS || []).reduce(
+        (n, x) => n + ((x.pics && x.pics.length) ? x.pics.length : 0), 0);
+    } catch(e){ window.__IMG_COUNT = 0; }
     await refreshSettings();                    // 展示范围以服务端为准（可能被指令改过）
+    // 🔴 `__DATA__` 是**服务启动那一刻**的快照 —— 服务是常驻的，可能已经跑了好几天，
+    //    期间库里新增 / 删除的条目都不在里面。只靠 20s 的定时轮询的话，开屏头 20 秒
+    //    看到的是旧数据（真机实测：服务起了很久后，页面只认得 3 条，库里其实 5 条）。
+    //    连上服务后**立刻同步一次**，再渲染标签条 / 计数。
+    await refreshFromServer();
+    await loadTags();                           // 标签字典（旧库没这个表也没关系，返回空）
+    ensureFilterAlive();                        // 筛选的标签被删了就落回「全部」
+    renderFilter();
     updateCounts();
     setInterval(refreshFromServer, 20000);      // 实时：bot 新收的灵感自动进流
   } else {
@@ -847,7 +1320,8 @@ async function refreshFromServer(){
     for(const it of IDEAS){
       const s = byId.get(it.id);
       // `t` 也要跟 —— 别的窗口（或别的机器）编辑过正文，这里得看到新文本
-      if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; }
+      // 🔴 `tags` 也要跟 —— 别的窗口打过标签，这边得看到（数组整份替换，不做增量合并）
+      if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; it.tags = s.tags || []; }
     }
     const known = new Set(IDEAS.map(x => x.id));
     for(const x of incoming){ if(!known.has(x.id)) IDEAS.push(x); }
@@ -1025,20 +1499,41 @@ function noteHeight(note, widthPx){
   if(!note) return 0;
   return NOTE_BOX + wrappedLines(note, widthPx / NOTE_FONT) * NOTE_FONT * 1.6;
 }
-function estHeight(text, widthPx, note){
+// ── 图片占的高度 ────────────────────────────────────────────────
+// 🔴 高度模型**必须**把图算进去，否则带图的气泡实际高度远超估算，
+//    轮播的竖直等距（126vh/maxB）会立刻被撑破 —— 和当初超长截断是同一个坑。
+// 取法：按原始宽高比把图缩到容器宽度，与 `MAX_IMG_H` 取小（见 CSS 的 max-height）。
+const MAX_IMG_H = 160;    // 单张图最大高度（跟 .bubble img 的 max-height 一致）
+const IMG_GAP = 6;        // 图与图、图与正文之间的间距
+function picHeight(pics, widthPx){
+  let h = 0;
+  for(const p of (pics || [])){
+    // pics 每项是 `{rel, w, h}`（服务端 image_dims 读出来的原始宽高）。
+    // 也兼容「只有路径」的老数据 —— 那种一律按最大高度估。
+    const w = (p && p.w) || 0, ph = (p && p.h) || 0;
+    // 🔴 宽高读不到（老数据 / 格式没认出来）就按**最大高度**算 ——
+    //    估矮了会撑破轮播，估高了只是多留点空隙，后者安全得多。
+    const one = (w > 0 && ph > 0)
+      ? Math.min(widthPx * ph / w, MAX_IMG_H)
+      : MAX_IMG_H;
+    h += one + IMG_GAP;
+  }
+  return h;
+}
+function estHeight(text, widthPx, note, pics){
   const fp = fontSize(String(text == null ? '' : text).length);
   const lines = wrappedLines(text, widthPx / fp);
-  return lines * fp * 1.7 + BUB_PAD + noteHeight(note, widthPx);
+  return lines * fp * 1.7 + BUB_PAD + noteHeight(note, widthPx) + picHeight(pics, widthPx);
 }
 function isLongText(it){
   const cfg = layout();
   const laneW = (cfg.w - cfg.gap) / 100 * innerWidth - BUB_PAD;
   const fullW = (100 - 2 * cfg.gap) / 100 * innerWidth - BUB_PAD;
-  const hLane = estHeight(it.t, laneW, it.note);
+  const hLane = estHeight(truncate(it.t), laneW, it.note, it.pics);
   const budget = innerHeight * 1.26 / cfg.maxB * 0.9;   // 竖直间距留 10% 余量
   // 只有「泳道里装不下」**且**「横过来能明显变矮（至少省 25%）」才跨泳道，
   // 否则为了跨而跨，反而把整条舞台的错位节奏打乱
-  return hLane > budget && estHeight(it.t, fullW, it.note) < hLane * 0.75;
+  return hLane > budget && estHeight(truncate(it.t), fullW, it.note, it.pics) < hLane * 0.75;
 }
 const hasLongOnStage = () =>
   [...stage.children].some(el => el.dataset.long === '1');
@@ -1050,6 +1545,25 @@ function sizeClass(n){
   if(n<=110) return 'b-l';
   return 'b-xl';
 }
+
+// ── 超长正文截断 ──────────────────────────────────────────────
+// 气泡里只显示前 TRUNC_CHARS 字 / 前 TRUNC_LINES 行，点卡片开浮层看全文。
+// 🔴 **必须同时限「字数」和「行数」**：只限字数的话，140 个换行符能撑出 140 行
+//    （wrappedLines 是按 `\n` 分段数的），气泡又变成一根竖条。
+// 🔴 这个截断**同时**决定渲染和 estHeight()，两处必须走同一个函数 ——
+//    只改渲染不改高度模型，轮播的竖直等距（126vh/maxB）会立刻被撑破。
+const TRUNC_CHARS = 140;
+const TRUNC_LINES = 6;
+function truncate(text){
+  const t = String(text == null ? '' : text);
+  let cut = false;
+  let out = t;
+  const lines = t.split('\n');
+  if(lines.length > TRUNC_LINES){ out = lines.slice(0, TRUNC_LINES).join('\n'); cut = true; }
+  if(out.length > TRUNC_CHARS){ out = out.slice(0, TRUNC_CHARS); cut = true; }
+  return cut ? out.replace(/\s+$/, '') + '…' : t;
+}
+function isTruncated(text){ return truncate(text) !== String(text == null ? '' : text); }
 
 // warm ∈ [0,1)：开局「预热」——用负 animation-delay 把气泡直接放到飞行途中，
 // 而不是让它们都从底部一个接一个冒出来（那样前 20 秒会挤成一坨，实测重叠 3~5 处）。
@@ -1106,7 +1620,8 @@ function spawn(warm){
     }
   }
 
-  const n = it.t.length;
+  const shown = truncate(it.t);        // 气泡里显示的部分（截断后的）
+  const n = shown.length;
   const el = document.createElement('div');
   el.className = 'bubble ' + sizeClass(n);
   el.dataset.s = it.s;
@@ -1151,8 +1666,50 @@ function spawn(warm){
   hd.append(meta);
   const txt = document.createElement('div');
   txt.className = 'txt';
-  txt.textContent = it.t;              // 🔴 全文不截断，且原样保留换行（容器是 pre-wrap）
+  // 🔴 这里放的是**截断后**的 shown（不是 it.t）—— 全文留给浮层（openModal 用 it.t）。
+  //    截断规则见 truncate()：同时限字数与行数。
+  txt.textContent = shown;
   el.append(hd, txt);
+  if(isTruncated(it.t)){
+    const more = document.createElement('div');
+    more.className = 'more';
+    more.textContent = '点击展开全文';
+    el.append(more);
+  }
+  // 🔴 标签 chips：最多 3 个 + 「+N」。点 chip = 直接按这个标签筛（和顶栏「分类」等价），
+  //    这是最顺手的入口 —— 看到一张想看的卡片，点它身上的标签就只看这一类了。
+  if(it.tags && it.tags.length){
+    const tr = document.createElement('div');
+    tr.className = 'tagrow';
+    for(const name of it.tags.slice(0, 3)){
+      const chip = document.createElement('span');
+      chip.className = 'tag';
+      chip.style.setProperty('--tc', tagColor(name));
+      const tx = document.createElement('span');
+      tx.className = 'tx';
+      tx.textContent = name;
+      tx.addEventListener('click', (e)=>{
+        e.stopPropagation();
+        TAGFILTER = name; lsSet(TAGS_KEY, name);
+        filterEl.classList.add('on');
+        onFilterChange();
+      });
+      chip.append(tx);
+      tr.append(chip);
+    }
+    if(it.tags.length > 3){
+      const more = document.createElement('span');
+      more.className = 'tag more';
+      more.textContent = '+' + (it.tags.length - 3);
+      more.title = it.tags.slice(3).join('、');
+      tr.append(more);
+    }
+    el.append(tr);
+  }
+  // 图片：本地已落盘的那几张。点开浮层看大图。
+  if(it.pics && it.pics.length){
+    el.append(makePics(it.pics));
+  }
   // 🔴 有结论就把结论一起显示（已处理 / 已决议 / 已丢弃 常见）；
   //    没有结论**不渲染**这个节点 —— 与以前完全一致。
   if(it.note){
@@ -1166,15 +1723,49 @@ function spawn(warm){
   setTimeout(()=>el.remove(), (dur + delay)*1000 + 400);   // delay 为负 → 剩余寿命更短
 }
 
+/* ── 图片 ───────────────────────────────────────────────── */
+// 条目挂的本地图片（`images/202610/<sha16>.jpg`）。
+// 🔴 `loading="lazy"`：抽屉里同时在飞的卡片可能有十几张，每张几 MB，
+//    全量加载会把首屏拖死。浏览器自己按视口决定加载哪张。
+// 🔴 图片走 `/img/<yyyyMM>/<name>`（服务端做目录包含校验），
+//    **不要**内嵌 base64 —— 一张能到 20MB，页面会直接卡死。
+function makePics(pics, big){
+  const box = document.createElement('div');
+  box.className = 'pics' + (big ? ' big' : '');
+  for(const p of pics){
+    const rel = (p && p.rel) ? p.rel : p;      // 兼容「只给了路径」的老数据
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = '图片';
+    // rel 是 `images/<yyyyMM>/<name>`，而路由挂在 `/img/` 下 ——
+    // 🔴 前缀是 **`/img/`**，不是 `/`。写错就是整片 404（真机踩过）。
+    img.src = '/img/' + String(rel).replace(/^images\//, '').replace(/^\/+/, '');
+    img.addEventListener('click', (e)=>{ e.stopPropagation(); window.open(img.src, '_blank'); });
+    box.append(img);
+  }
+  return box;
+}
+
 /* ── 浮层 ───────────────────────────────────────────────── */
 function openModal(it){
   current = it;
   modal.querySelector('.meta .mtxt').textContent = (LABEL[it.s]||'') + ' · ' + it.d;
   modal.querySelector('.body').textContent = it.t;
+  // 浮层里给**大图**（气泡里那张是缩过的，看不清）
+  const pbox = modal.querySelector('.pics');
+  pbox.innerHTML = '';
+  if(it.pics && it.pics.length){
+    pbox.append(makePics(it.pics, true));
+    pbox.style.display = '';
+  } else {
+    pbox.style.display = 'none';
+  }
   const isMemo = it.k === 'memo';
   // 备忘没有「结论」这个概念 —— 换一套操作区（完成 / 丢弃 / 恢复）
   noteEl.value = it.note || '';
   setEditMode(false);            // 复位编辑态（正文 / 结论框 / 两个操作区的显隐都在里面）
+  renderTagRow();                // 标签行跟着当前这条走
   if(isMemo) syncMemoActions(it);
   modal.classList.add('on');
 }
@@ -1258,6 +1849,8 @@ function setEditMode(on){
   noteEl.style.display = (on || isMemo) ? 'none' : '';
   modal.querySelector('.ideaact').style.display = (on || isMemo) ? 'none' : '';
   modal.querySelector('.memoact').style.display = (on || !isMemo) ? 'none' : '';
+  // 编辑态下把标签行也收起来 —— 和「结论框 / 操作区」一个道理：一次只做一件事
+  document.getElementById('tagbox').style.display = on ? 'none' : '';
   // 底部提示在编辑态下是错的（「空格暂停/继续」这时候是打字）—— 直接收起来
   modal.querySelector('.hint').style.display = on ? 'none' : '';
   if(on){
@@ -1318,11 +1911,21 @@ async function applyEdit(it, text){
    气泡是生成时就定死的 DOM 快照 —— 不就地改的话得等它飘走再重来，
    用户会以为「改了没生效」。 */
 function paintText(id, text){
+  const shown = truncate(text);        // 跟新建气泡走同一套截断（否则改了正文就撑破等距）
   for(const el of stage.children){
     if(el.dataset.id !== id) continue;
     const txt = el.querySelector('.txt');
-    if(txt) txt.textContent = text;
-    el.className = 'bubble ' + sizeClass(text.length);
+    if(txt) txt.textContent = shown;
+    el.className = 'bubble ' + sizeClass(shown.length);
+    // 改完可能从「截断」变成「不截断」（或反过来），提示行要跟着增删
+    const more = el.querySelector('.more');
+    if(isTruncated(text) && !more){
+      const m = document.createElement('div');
+      m.className = 'more'; m.textContent = '点击展开全文';
+      el.append(m);
+    } else if(!isTruncated(text) && more){
+      more.remove();
+    }
   }
 }
 
@@ -1408,6 +2011,18 @@ function makeRow(it){
     n.className = 'n';
     n.textContent = '结论：' + it.note;
     c.append(n);
+  }
+  if(it.tags && it.tags.length){
+    const tr = document.createElement('div');
+    tr.className = 'tagrow';
+    for(const name of it.tags){
+      const chip = document.createElement('span');
+      chip.className = 'tag';
+      chip.style.setProperty('--tc', tagColor(name));
+      chip.textContent = name;
+      tr.append(chip);
+    }
+    c.append(tr);
   }
   const ops = document.createElement('div');
   ops.className = 'ops';
@@ -1512,7 +2127,7 @@ async function openList(status){
         const byId = new Map(incoming.map(x=>[x.id, x]));
         for(const it of IDEAS){
           const s = byId.get(it.id);
-          if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; }
+          if(s){ it.s = s.s; if(s.note) it.note = s.note; if(s.t) it.t = s.t; it.tags = s.tags || []; }
         }
         const known = new Set(IDEAS.map(x=>x.id));
         for(const x of incoming){ if(!known.has(x.id)) IDEAS.push(x); }
@@ -1724,13 +2339,277 @@ document.getElementById('btn-settings').addEventListener('click', openSettings);
 
 /* 「⬇ 导出」：让浏览器直接「另存为」。
    走服务端 /api/export —— 和机器人「导出」指令共用 export.py 里同一套排版，
-   两边导出来的文件长得一模一样。想导 json / txt 就在群里发「导出 json」。 */
+   两边导出来的文件长得一模一样。
+   🔴 zip 会连**图片原图**一起打包，所以只在已经开始收图时才给这个选项
+      （一条图都没有时导出个空 images/ 只会让人以为坏了）。
+   🔴 抽屉走本地 HTTP 下载，**不受机器人那个 10MB 上限**约束 —— 想导 zip 就在这导。 */
 document.getElementById('btn-export').addEventListener('click', ()=>{
-  location.href = '/api/export?format=md';
+  const fmts = ['md', 'json', 'txt'];
+  if((window.__IMG_COUNT || 0) > 0) fmts.push('zip');
+  const say = window.prompt(
+    '导出格式？填一个：\n' + fmts.join(' / ')
+    + ((window.__IMG_COUNT || 0) > 0
+        ? '\n\nzip = 文字 + 图片原图一起打包（本地下载没有 10MB 限制）'
+        : '\n\n（打开收图之后这里会多一个 zip 选项，能把图片原图一起打包）'),
+    'md');
+  if(say === null) return;
+  const f = String(say).trim().toLowerCase().replace(/^\./, '');
+  if(!fmts.includes(f)){ alert('只认这几个：' + fmts.join(' / ')); return; }
+  location.href = '/api/export?format=' + encodeURIComponent(f);
 });
 document.getElementById('sclose').addEventListener('click', ()=> settingsEl.classList.remove('on'));
 settingsEl.addEventListener('click', (e)=>{ if(e.target === settingsEl) settingsEl.classList.remove('on'); });
 document.getElementById('ssave').addEventListener('click', saveSettings);
+
+/* ── 🏷 标签 ────────────────────────────────────────────────
+   三条路径：
+     · 卡片 / 浮层里打标签      → POST /api/item/tags  （覆盖某条的标签）
+     · 顶栏「分类」筛选         → 纯前端过滤，只写 localStorage
+     · 标签订阅里的小齿轮       → POST /api/tags/rename | /delete | /color
+   🔴 全部只在 serve 模式下可用 —— 离线（file://）没有服务，只能看不能改。
+      和「永久删除」一样：离线按钮 disabled + title 说明原因。 */
+
+const filterEl = document.getElementById('filter');
+const tagmgrEl = document.getElementById('tagmgr');
+
+async function postJSON(url, body){
+  const r = await fetch(url, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(()=>({ok:false, error:'返回的不是 JSON'}));
+  if(!j || !j.ok) throw new Error((j && j.error) || '写入失败');
+  return j;
+}
+
+async function loadTags(){
+  if(MODE !== 'serve') return;
+  try{
+    const r = await apiGet('/api/tags');
+    const j = await r.json();
+    if(j && j.ok) TAGDICT = j.tags || [];
+  }catch(e){}
+}
+
+function renderFilter(){
+  filterEl.innerHTML = '';
+  const title = document.createElement('span');
+  title.className = 'ftitle';
+  title.textContent = '分类';
+  filterEl.append(title);
+
+  const all = document.createElement('span');
+  all.className = 'fchip all' + (TAGFILTER ? '' : ' on');
+  all.textContent = '全部';
+  all.title = '不限标签';
+  all.addEventListener('click', ()=>{ TAGFILTER = null; lsSet(TAGS_KEY, null); onFilterChange(); });
+  filterEl.append(all);
+
+  if(!TAGDICT.length){
+    const none = document.createElement('span');
+    none.className = 'fnone';
+    none.textContent = '还没有标签 —— 点开一张卡片，在「标签」那一行加一个';
+    filterEl.append(none);
+    return;
+  }
+  for(const t of TAGDICT){
+    const chip = document.createElement('span');
+    chip.className = 'fchip' + (TAGFILTER === t.name ? ' on' : '');
+    chip.style.setProperty('--tc', t.color);
+    chip.title = '只看带「' + t.name + '」的条目';
+    // 🔴 把标签名落到 data 上 —— 名字是用户随便起的，可能互相包含（「生活」/「生活用品」），
+    //    靠文本匹配会点错；测的、点的都按这个属性来。
+    chip.dataset.tag = t.name;
+    // 🔴 点击绑在**整条 chip**上，不是只绑在名字那两个字上 ——
+    //    只绑 inner span 的话，点到边距 / 条目数上就没反应（看着能点，其实点空了）。
+    //    小齿轮自己 stopPropagation，所以点齿轮不会顺带筛。
+    chip.addEventListener('click', ()=>{
+      // 再点一次「取消选中」= 回到全部，不用先点「全部」
+      TAGFILTER = (TAGFILTER === t.name) ? null : t.name;
+      lsSet(TAGS_KEY, TAGFILTER);
+      onFilterChange();
+    });
+
+    const tx = document.createElement('span');
+    tx.className = 'fname';
+    tx.textContent = t.name;
+    const cnt = document.createElement('span');
+    cnt.className = 'cnt';
+    cnt.textContent = tagCount(t.name);
+    // 小齿轮 → 改名 / 配色 / 删除（配置中心零改动，管理入口就在这儿）
+    const gear = document.createElement('button');
+    gear.className = 'fgear';
+    gear.title = '管理这个标签（改名 / 配色 / 删除）';
+    gear.textContent = '⚙';
+    gear.addEventListener('click', (e)=>{ e.stopPropagation(); openTagMgr(t); });
+    chip.append(tx, cnt, gear);
+    filterEl.append(chip);
+  }
+}
+
+function onFilterChange(){
+  renderFilter();
+  rebuildStream();
+  toast(TAGFILTER ? ('只看「' + TAGFILTER + '」') : '显示全部');
+}
+
+function toggleFilter(){
+  filterEl.classList.toggle('on');
+  if(filterEl.classList.contains('on')) renderFilter();
+}
+
+document.getElementById('btn-tags').addEventListener('click', toggleFilter);
+
+/* ── 标签管理浮层 ────────────────────────────────────────── */
+let tagEditing = null;          // 正在编辑的标签名
+
+function openTagMgr(t){
+  tagEditing = t.name;
+  document.getElementById('tgm-cnt').textContent = '共 ' + t.count + ' 条带这个标签';
+  document.getElementById('tgm-name').value = t.name;
+  document.getElementById('tgm-color').value = /^#[0-9a-fA-F]{6}$/.test(t.color) ? t.color : '#4fd1c5';
+  document.getElementById('tgm-msg').textContent =
+    MODE === 'serve' ? '' : '离线模式只能看 —— 用桌面「脑内抽屉」打开再改';
+  tagmgrEl.classList.add('on');
+}
+
+async function saveTagMgr(){
+  const msg = document.getElementById('tgm-msg');
+  if(MODE !== 'serve'){ msg.textContent = '离线模式改不了'; return; }
+  const name = document.getElementById('tgm-name').value.trim();
+  const color = document.getElementById('tgm-color').value;
+  if(!name){ msg.textContent = '标签名不能为空'; return; }
+  if(name.length > 20){ msg.textContent = '标签名最多 20 个字'; return; }
+  try{
+    // 改名（含全表替换）+ 配色，两步都走服务端；改名的目标名撞已有标签时是**合并**
+    if(name !== tagEditing){
+      await postJSON('/api/tags/rename', {from: tagEditing, to: name});
+      if(TAGFILTER === tagEditing) TAGFILTER = name;
+    }
+    await postJSON('/api/tags/color', {name: name, color: color});
+    lsSet(TAGS_KEY, TAGFILTER);
+    // 本页面这份快照也要跟着改 —— 不然卡片上的 chip 还是旧名字/旧色
+    for(const it of IDEAS){
+      if(it.tags && it.tags.includes(tagEditing)){
+        it.tags = it.tags.map(x => x === tagEditing ? name : x);
+      }
+    }
+    await loadTags();
+    tagmgrEl.classList.remove('on');
+    renderFilter();
+    onFilterChange();
+    toast('标签已更新');
+  }catch(err){
+    msg.textContent = '保存失败：' + err.message;
+  }
+}
+
+async function deleteTagMgr(){
+  const msg = document.getElementById('tgm-msg');
+  if(MODE !== 'serve'){ msg.textContent = '离线模式改不了'; return; }
+  if(!window.confirm('删除标签「' + tagEditing + '」？\n所有卡片上这个标签都会摘掉（卡片本身不动）。')) return;
+  try{
+    await postJSON('/api/tags/delete', {name: tagEditing});
+    for(const it of IDEAS){
+      if(it.tags) it.tags = it.tags.filter(x => x !== tagEditing);
+    }
+    if(TAGFILTER === tagEditing) TAGFILTER = null;
+    lsSet(TAGS_KEY, TAGFILTER);
+    await loadTags();
+    tagmgrEl.classList.remove('on');
+    renderFilter();
+    onFilterChange();
+    toast('标签已删除');
+  }catch(err){
+    msg.textContent = '删除失败：' + err.message;
+  }
+}
+
+document.getElementById('tgm-save').addEventListener('click', saveTagMgr);
+document.getElementById('tgm-del').addEventListener('click', deleteTagMgr);
+document.getElementById('tgm-close').addEventListener('click', ()=> tagmgrEl.classList.remove('on'));
+tagmgrEl.addEventListener('click', (e)=>{ if(e.target === tagmgrEl) tagmgrEl.classList.remove('on'); });
+
+/* ── 浮层里的标签行 ──────────────────────────────────────── */
+function renderTagRow(){
+  const cur = document.getElementById('tagcur');
+  const sug = document.getElementById('tagsug');
+  cur.innerHTML = '';
+  sug.innerHTML = '';
+  if(!current) return;
+  const mine = current.tags || [];
+
+  if(MODE !== 'serve'){
+    const n = document.createElement('span');
+    n.className = 'none';
+    n.textContent = mine.length ? mine.join('、') + '（离线只读）' : '离线模式改不了标签';
+    cur.append(n);
+    document.getElementById('tagadd').disabled = true;
+    document.getElementById('tagnew').disabled = true;
+    return;
+  }
+  document.getElementById('tagadd').disabled = false;
+  document.getElementById('tagnew').disabled = false;
+
+  if(!mine.length){
+    const n = document.createElement('span');
+    n.className = 'none';
+    n.textContent = '还没打标签';
+    cur.append(n);
+  }
+  for(const name of mine){
+    const chip = document.createElement('span');
+    chip.className = 'tag';
+    chip.style.setProperty('--tc', tagColor(name));
+    const tx = document.createElement('span');
+    tx.textContent = name;
+    const rm = document.createElement('button');
+    rm.className = 'rm';
+    rm.title = '去掉这个标签';
+    rm.addEventListener('click', (e)=>{ e.stopPropagation(); setTags(mine.filter(x => x !== name)); });
+    chip.append(tx, rm);
+    cur.append(chip);
+  }
+  // 已有标签里还没打上的 → 点一下就加上（不打字）
+  for(const t of TAGDICT){
+    if(mine.includes(t.name)) continue;
+    const s = document.createElement('span');
+    s.className = 's';
+    s.textContent = '+ ' + t.name;
+    s.addEventListener('click', (e)=>{ e.stopPropagation(); setTags([...mine, t.name]); });
+    sug.append(s);
+  }
+}
+
+async function setTags(names){
+  if(!current || MODE !== 'serve') return;
+  try{
+    await postJSON('/api/item/tags', {id: current.id, tags: names});
+    current.tags = names;
+    await loadTags();
+    renderTagRow();
+    renderFilter();
+    updateCounts();
+  }catch(err){
+    toast('标签保存失败：' + err.message);
+  }
+}
+
+document.getElementById('tagadd').addEventListener('click', ()=>{
+  const i = document.getElementById('tagnew');
+  const name = i.value.trim();
+  if(!name || !current) return;
+  if(name.length > 20){ toast('标签名最多 20 个字'); return; }
+  if((current.tags || []).includes(name)){ toast('已经打过了'); i.value = ''; return; }
+  i.value = '';
+  setTags([...(current.tags || []), name]);
+});
+document.getElementById('tagnew').addEventListener('keydown', (e)=>{
+  // 🔴 回车加标签时**别让事件冒到 document** —— 否则会触发全局的空格/快捷键处理，
+  //    而且回车在这个输入框里本来就该是「确认」
+  if(e.key === 'Enter'){ e.preventDefault(); e.stopPropagation(); document.getElementById('tagadd').click(); }
+});
 
 /* ── 键盘 / 启动 ─────────────────────────────────────────── */
 // 暂停 = 不再生成新气泡（已在飘的继续飘完，避免半路卡住）
@@ -1879,9 +2758,13 @@ def _make_handler(doc):
     """本地服务的请求处理器。
 
     静态页 + `GET /api/ping` / `GET /api/items`（备忘 + 灵感，`/api/ideas` 是旧别名）
-    + `GET /api/export` / `GET|POST /api/settings`
+    + `GET /api/export` / `GET|POST /api/settings` / `GET /api/tags`
+    + `GET /img/<yyyyMM>/<name>`（收图：把落盘的图片吐给 `<img>`）
+    + `GET /api/images/usage`（图片占用概况）
     + `POST /api/status`（灵感改状态）/ `POST /api/memo`（备忘改状态）
     + `POST /api/edit`（**改正文，创建时间不变**）
+    + `POST /api/item/tags`（覆盖某条的标签）
+    + `POST /api/tags/rename|delete|color`（标签字典的写操作）
     + `POST /api/delete`（**永久删除**一条，不可恢复）/ `POST /api/quit`。
     """
     from http.server import BaseHTTPRequestHandler
@@ -1921,9 +2804,48 @@ def _make_handler(doc):
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_image(self, path):
+            """吐一张本地图片。
+
+            🔴 路径必须来自 `media.resolve_path()` —— 它做**目录包含校验**，
+               光在 url 里过滤 `..` 不够（符号链接 / 8.3 短名都能绕）。
+            🔴 `Content-Type` 按**文件头**判，不看扩展名 —— 扩展名是我们自己起的
+               （QQ 报的 `content_type` 经常是错的），文件内容才是真的。
+            🔴 图片是不可变的（名字就是内容哈希）→ 长缓存；页面每次刷新都要重下一遍
+               几十张图的话，抽屉会明显变卡。
+            """
+            mon, _, name = path.rpartition("/")
+            mon = mon.rpartition("/")[2]
+            fp = media.resolve_path(mon, name)
+            if not fp:
+                return self._send(404, {"ok": False, "error": "not found"})
+            try:
+                with open(fp, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                return self._send(404, {"ok": False, "error": "not found"})
+            self.send_response(200)
+            self.send_header("Content-Type", media.content_type_of(blob))
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            self.wfile.write(blob)
+
         def do_GET(self):
             if self.path.startswith("/api/ping"):
                 return self._send(200, {"ok": True, "mode": "serve"})
+            if self.path.startswith("/img/"):
+                # 收图：`<img src="/img/202610/ab12.jpg">` 走这里
+                return self._send_image(urlparse(self.path).path[5:])
+            if self.path.startswith("/api/images/usage"):
+                # 配置中心「⑤ 脑内抽屉」显示的那一行「已存 N 张／共 X MB」
+                try:
+                    u = media.usage()
+                    u["alert_gb"] = settings.get("image_alert_gb")
+                    return self._send(200, {"ok": True, "usage": u,
+                                            "human": media.human(u["bytes"])})
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if self.path.startswith("/api/export"):
                 q = parse_qs(urlparse(self.path).query)
                 fmt = (q.get("format") or ["md"])[0]
@@ -1937,6 +2859,12 @@ def _make_handler(doc):
                 return self._send(200, {"ok": True, "items": collect()})
             if self.path.startswith("/api/settings"):
                 return self._send(200, {"ok": True, "keys": settings.describe()})
+            if self.path.startswith("/api/tags"):
+                # 🏷 标签字典 + 每个标签挂了几条。页面的筛选条 / 下拉提示都吃这个。
+                try:
+                    return self._send(200, {"ok": True, "tags": store.tags_all()})
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             if self.path in ("/", "/index.html"):
                 return self._send(200, doc, "text/html; charset=utf-8")
             return self._send(404, {"ok": False, "error": "not found"})
@@ -2022,6 +2950,52 @@ def _make_handler(doc):
                     return self._send(404, {"ok": False, "error": "没找到这条（可能已被删）"})
                 print(f"  [编辑] {iid[:8]}  {text[:40]}", flush=True)
                 return self._send(200, {"ok": True, "changed": changed, "content": text})
+            if self.path.startswith("/api/item/tags"):
+                # 🏷 覆盖某条记录的标签。页面上打标签 / 去掉标签都走这里。
+                # 🔴 标签名规则（trim 后非空、≤20 字、不重名）在 store 层统一兜，
+                #    这里只做「id 必须给」这一层；非法名**静默丢弃**不报错。
+                try:
+                    payload = self._read_json()
+                except (ValueError, OSError) as e:
+                    return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
+                iid = (payload.get("id") or "").strip()
+                names = payload.get("tags")
+                if not iid or not isinstance(names, list):
+                    return self._send(400, {"ok": False, "error": "id 或 tags 不合法"})
+                try:
+                    changed = store.set_item_tags(iid, names)
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                if not changed:
+                    return self._send(404, {"ok": False, "error": "没找到这条（可能已被删）"})
+                print(f"  [标签] {iid[:8]}  {names}", flush=True)
+                return self._send(200, {"ok": True, "changed": changed, "tags": store.tags_all()})
+            if self.path.startswith("/api/tags/"):
+                # 🏷 标签字典的三个写操作：rename / delete / color。
+                # 🔴 全部只在抽屉页触发 —— 标签是**数据不是设置**，配置中心零改动。
+                try:
+                    payload = self._read_json()
+                except (ValueError, OSError) as e:
+                    return self._send(400, {"ok": False, "error": f"请求体解析失败：{e}"})
+                try:
+                    if self.path.startswith("/api/tags/rename"):
+                        n, err = store.tags_rename(payload.get("from"), payload.get("to"))
+                        if err:
+                            return self._send(400, {"ok": False, "error": err})
+                        print(f"  [标签改名] {payload.get('from')} → {payload.get('to')}（{n} 条）", flush=True)
+                        return self._send(200, {"ok": True, "changed": n, "tags": store.tags_all()})
+                    if self.path.startswith("/api/tags/delete"):
+                        n = store.tags_delete(payload.get("name"))
+                        print(f"  [标签删除] {payload.get('name')}（{n} 条）", flush=True)
+                        return self._send(200, {"ok": True, "changed": n, "tags": store.tags_all()})
+                    if self.path.startswith("/api/tags/color"):
+                        n = store.tags_set_color(payload.get("name"), payload.get("color"))
+                        if not n:
+                            return self._send(400, {"ok": False, "error": "没这个标签，或配色不是 #rgb / #rrggbb"})
+                        return self._send(200, {"ok": True, "changed": n, "tags": store.tags_all()})
+                except Exception as e:  # noqa: BLE001 —— 回给页面，别让服务挂掉
+                    return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                return self._send(404, {"ok": False, "error": "not found"})
             if not self.path.startswith("/api/status"):
                 return self._send(404, {"ok": False, "error": "not found"})
             try:
@@ -2045,23 +3019,39 @@ def _make_handler(doc):
     return Handler
 
 
-def serve(doc, port=8765, open_browser=True, tries=12):
-    """起本地服务：页面上的处理按钮**直接写入** memos.db。"""
+def serve(doc, port=8765, open_browser=True, tries=12, strict=False):
+    """起本地服务：页面上的处理按钮**直接写入** memos.db。
+
+    strict=True（管家传了确切端口时）：**只绑这一个端口**，占不到就报错退出。
+    🔴 为什么要这个开关：`ThreadingHTTPServer` 默认 `allow_reuse_address = 1`，
+       Windows 上这个标志允许 bind**别人正在 LISTENING** 的端口（Linux 只管 TIME_WAIT）。
+       于是「绑上了但收不到请求」—— 页面打不开，日志里却一切正常。
+       管家已经先探明端口，这里就不该再顺延（顺延会让管家记的端口和实际不符）。
+    """
     from http.server import ThreadingHTTPServer
 
+    # 🔴 严格模式：关掉 allow_reuse_address —— 否则占用检测是假的（见 docstring）
+    class _StrictServer(ThreadingHTTPServer):
+        allow_reuse_address = False
+
+    srv = _StrictServer if strict else ThreadingHTTPServer
     handler = _make_handler(doc)
     httpd = None
     last_err = None
-    for p in range(port, port + tries):
+    for p in (range(port, port + tries) if not strict else [port]):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", p), handler)
+            httpd = srv(("127.0.0.1", p), handler)
             port = p
             break
         except OSError as e:      # 🔴 别静默吞掉：只报「没空端口」会误导（可能是别的错）
             last_err = e
             continue
     if httpd is None:
-        print(f"（{port}~{port + tries - 1} 都起不来：{type(last_err).__name__}: {last_err}）")
+        if strict:
+            print(f"（端口 {port} 被占用，起不来：{type(last_err).__name__}: {last_err}）",
+                  flush=True)
+        else:
+            print(f"（{port}~{port + tries - 1} 都起不来：{type(last_err).__name__}: {last_err}）")
         return 1
 
     url = f"http://127.0.0.1:{port}/"
@@ -2092,6 +3082,8 @@ def main():
     ap.add_argument("--serve", action="store_true", help="起本地服务，页面可直接处理备忘 / 灵感")
     ap.add_argument("--port", type=int, default=8765, help="--serve 的起始端口")
     ap.add_argument("--no-browser", action="store_true", help="--serve 时不自动打开浏览器")
+    ap.add_argument("--strict-port", action="store_true",
+                    help="--serve 且只用 --port 指定的那一个端口，占了就报错（管家用）")
     ap.add_argument("--apply", metavar="JSON", help="应用离线模式导出的操作文件")
     ap.add_argument("--open-only", action="store_true", help="只放「没完成的备忘 + 待处理灵感」")
     ap.add_argument("--no-memo", action="store_true", help="不带备忘，只看灵感")
@@ -2116,7 +3108,7 @@ def main():
 
     if args.serve:
         print(brief)
-        sys.exit(serve(doc, args.port, not args.no_browser))
+        sys.exit(serve(doc, args.port, not args.no_browser, strict=args.strict_port))
 
     out = os.path.abspath(args.out)
     with open(out, "w", encoding="utf-8") as f:

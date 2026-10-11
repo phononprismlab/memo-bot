@@ -38,13 +38,6 @@ KEYS = {
         "env": "QQ_STARTUP_MSG",
         "help": "bot 上线时在群里说的话；留空 = 不播报",
     },
-    "offwork_msg": {
-        "label": "关机通知文案",
-        "kind": "text",
-        "default": "现在开始，我要下班了！",
-        "env": "OFFWORK_MSG",
-        "help": "关机时自动发到群里的话；留空 = 不发",
-    },
     "intro_msg": {
         "label": "功能介绍（首次上线 / 发「你好」）",
         "kind": "area",
@@ -111,6 +104,42 @@ KEYS = {
         "choice_labels": {"memo": "备忘", "open": "待处理灵感", "done": "已处理灵感",
                           "decided": "已决议灵感", "dropped": "已丢弃灵感"},
         "help": "发「回旋镖」时，从哪几类旧记录里挑一条推回来",
+    },
+    # 🔴 收图：**一个 multi 键顶三个开关**。
+    #    空数组 = 关闭 ／ ["c2c"] = 仅私聊 ／ ["group"] = 仅群聊 ／ 两个都有 = 全部。
+    #    所以「两个子开关都关掉 → 主开关自动关」是**天然成立**的，不需要跨键联动规则。
+    #    配置中心那个「主开关 + 两个子开关」的区块是**自绘**的（不通用表单渲染器），
+    #    主开关 = `bool(value)`，只是同一份数据的另一种画法。
+    "image_collect": {
+        "label": "收集图片",
+        "kind": "multi",
+        "default": [],
+        "allow_empty": True,          # 🔴 别的 multi 不许空（「至少要选一个」），这个必须许
+        "empty_label": "不收集",       # 空值的展示文案（默认会显示成空串）
+        "choices": ["c2c", "group"],
+        "choice_labels": {"c2c": "私聊", "group": "群聊"},
+        "help": "把消息里的图片存到本地（脑内抽屉里显示、导出的 zip 里带上）。"
+                "默认**关**。图片是带时效的远程链接，收到不存就再也拿不到了 —— "
+                "所以这是「收到即落盘」，之后一直留着，不会自动清理。",
+    },
+    "ui_font_scale": {
+        "label": "界面字号（%）",
+        "kind": "int",
+        "default": 115,
+        "min": 80,
+        "max": 200,
+        "help": "整个桌面应用的界面字号缩放，默认 115%（比原来大一档）。"
+                "100 = 原始大小，往上调字更大。改完保存，切回脑内抽屉立刻生效。",
+    },
+    "image_alert_gb": {
+        "label": "图片占用报警阈值",
+        "kind": "int",
+        "default": 5,
+        "min": 0,
+        "max": 1024,
+        # 🔴 0 = 不报警（不是「0GB 就报警」）—— 关掉报警必须有个明确的写法
+        "help": "图片占用超过这个 GB 数时，往播报目标发一条提醒（默认 5）；填 0 = 不报警。"
+                "占用回落到阈值以下的**下一次**超标才会再提醒一次，不会刷屏。",
     },
 }
 
@@ -209,7 +238,7 @@ def normalize(key, raw):
             return None, f"认不出「{p}」（可选：{opts}）"
         if code not in out:
             out.append(code)
-    if not out:
+    if not out and not cfg.get("allow_empty"):
         opts = " / ".join(cfg["choice_labels"][c] for c in cfg["choices"])
         return None, f"至少要选一个（可选：{opts}）"
     return out, None
@@ -312,6 +341,9 @@ def display(key):
     cfg = KEYS[key]
     val = get(key)
     if cfg["kind"] == "multi":
+        if not val:
+            # 🔴 空值本来是空串（「收集图片 = 」），太像个 bug。允许为空的键自己带文案。
+            return cfg.get("empty_label") or "（空）"
         return "、".join(cfg["choice_labels"].get(c, c) for c in val)
     if cfg["kind"] == "int":
         return str(val)
@@ -329,8 +361,12 @@ def describe():
             "help": cfg.get("help", ""),
             "choices": cfg.get("choices", []),
             "choice_labels": cfg.get("choice_labels", {}),
+            "allow_empty": bool(cfg.get("allow_empty")),
             "value": get(key),
             "default": cfg["default"],
+            # 整数项的上下限透给界面（桌面版拿它定 Spinbox 范围，网页版定 input 的 min/max）
+            "min": cfg.get("min"),
+            "max": cfg.get("max"),
         })
     return out
 

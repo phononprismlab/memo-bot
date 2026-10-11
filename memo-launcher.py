@@ -16,10 +16,9 @@
 
 用法（`--xxx` 之后的参数原样透传给对应脚本）：
 
-    memo-launcher.py                     起配置中心（默认）
-    memo-launcher.py --config            同上
+    memo-launcher.py --gui               起桌面应用（配置中心 + 脑内抽屉，一个窗口）
+    memo-launcher.py --hub               起管家（桌面窗口 + 机器人；webui 已退役）
     memo-launcher.py --bot --log X       跑机器人
-    memo-launcher.py --drawer --serve    起脑内抽屉
     memo-launcher.py --send --file X     发文件
     memo-launcher.py --ideas --export    导出灵感池
 """
@@ -54,6 +53,8 @@ if PACKAGED and not os.environ.get("MEMO_NODE"):
 
 # ── 4. 按第一个参数分派 ───────────────────────────────────────
 SCRIPTS = {
+    "--hub": "hub.py",
+    "--gui": "memo_gui.py",
     "--config": "config-web.py",
     "--bot": "bot.py",
     "--drawer": "brain-drawer.py",
@@ -67,7 +68,7 @@ _argv = sys.argv[1:]
 if _argv and _argv[0] in SCRIPTS:
     mode, rest = _argv[0], _argv[1:]
 else:
-    mode, rest = "--config", _argv          # 什么都不带 = 起配置中心（双击快捷方式走这条）
+    mode, rest = "--gui", _argv          # 什么都不带 = 起桌面应用（双击快捷方式走这条）
 
 target = os.path.join(HERE, SCRIPTS[mode])
 sys.argv = [target] + rest

@@ -302,11 +302,6 @@ def draw(n=1, cats=None):
     return picked
 
 
-def parse_cats(word):
-    """群里敲的分类词 → 分类元组；不认识返回 None（调用方当条数或报错处理）。"""
-    return CAT_ALIASES.get((word or "").strip())
-
-
 def format_moyu(items):
     """抽到的条目 → 群消息文本。"""
     if not items:

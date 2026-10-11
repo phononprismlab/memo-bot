@@ -18,6 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from botctl import _no_window_flags
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHOT_JS = os.path.join(HERE, "md2png.mjs")
 
@@ -181,6 +183,9 @@ def render(src_path, out_dir=None, width=IMG_WIDTH, slice_h=SLICE_H):
         text=True,
         encoding="utf-8",
         timeout=300,
+        # 🔴 node 是控制台程序：机器人跑在 pythonw 下没有控制台，不带这个标志
+        #    它就会自己新建一个黑窗口 —— 每次「发文件 + 渲染成图片」都闪一下。
+        creationflags=_no_window_flags(),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"截图失败：{proc.stderr.strip() or proc.stdout.strip()}")

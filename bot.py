@@ -70,6 +70,12 @@ import ignore as _ignore
 import settings as _settings
 import export as _export
 import push as _push
+import media as _media
+
+# 🔴 进程存活判断**复用 botctl 的那一份**，本文件不再自带：早先 bot.py / botctl.py 各存
+#    一份，两边的「显式 encoding + ValueError 兜底」得手工同步，改一处忘一处就会在
+#    重启流程里崩（bot_stop 成功 → bot_start 崩 → 机器人被停掉却起不来）。
+from botctl import _pid_alive  # noqa: E402
 
 from paths import data_path
 
@@ -77,32 +83,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 🔴 这两个是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
 LAST_MSG_FILE = data_path("last_group_msg.json")
 PID_FILE = data_path("bot.pid")
-
-
-def _pid_alive(pid):
-    """进程 pid 是否还活着。"""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            # 🔴 和 config-web.py::_pid_alive 同款兜底，缺一个都会崩：
-            #    1) 显式 encoding —— 中文 Windows 的 tasklist 输出是 GBK，
-            #       设了 PYTHONUTF8=1 的环境会拿 UTF-8 去解码 → UnicodeDecodeError。
-            #    2) stdout 兜底成 "" —— 受限环境里可能是 None，`in None` 抛 TypeError。
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True, text=True, timeout=10,
-                encoding="utf-8", errors="replace",
-            ).stdout or ""
-            return str(pid) in out
-        except (OSError, subprocess.SubprocessError, ValueError):
-            # ValueError 不是凑数：UnicodeDecodeError 继承自 ValueError，不是 OSError。
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 def acquire_pid_lock():
@@ -188,6 +168,116 @@ def handle_event(group_id, group_name, sender_id, sender_name, message):
     return add_memo(group_id, group_name, sender_id, sender_name, content)
 
 
+# ── 收图：把消息里的图片落盘 ──────────────────────────────────────
+# 🔴 **只在「这条消息确实会入库」时才下载** —— 被忽略表拦掉的、被指令吃掉的、
+#    纯图片但收图开关关着的，一律不下载。否则光是别人在群里发图，硬盘就悄悄满了。
+#
+# 开关 = `settings.image_collect`（一个 multi 键顶三个开关，见 settings.py）：
+#   []              关闭
+#   ["c2c"]         只收私聊
+#   ["group"]       只收群聊
+#   ["c2c","group"] 都收
+
+# 纯图片消息（没配文字）的占位正文 —— 抽屉里得有个看得见的东西。
+# 🔴 不要用 emoji 当占位：QQ 消息里发的图可能一张都没有，而 Windows 上有的
+#    emoji 编不出来（🫧 U+1FAE7 那次教训）。用纯文本方括号，任何字体都有。
+_IMAGE_ONLY_TEXT = "[图片]"
+
+
+def _att(a, name):
+    """附件字段取值 —— botpy 给的是 `_Attachments` **对象**，别的地方可能是 dict。
+
+    🔴 这里踩过一个大坑：原实现是「附件不是 dict 就跳过」，而
+       `botpy.message.BaseMessage.__init__` 把 attachments 解析成
+       `[self._Attachments(items) for items in data.get("attachments", {})]`
+       —— **全是对象、一个 dict 都没有**，于是每个附件都被那一步跳掉，
+       `image_urls()` 恒返回空数组。表现就是：收图开关开了、图也确实发到了，
+       但抽屉里永远没有图（用户报「我向摸鱼bot发送了图片，但始终无法出现在抽屉里」）。
+       所以取值必须对象 / dict 两种都认。
+    """
+    if isinstance(a, dict):
+        return a.get(name)
+    return getattr(a, name, None)
+
+
+def image_urls(message):
+    """从消息里挑出图片 URL（只认 QQ 官方的 `attachments` 结构）。
+
+    🔴 图片走 `attachments`（不是 `message_type` / `msg_elements` —— 那两个在
+       botpy 1.2.1 全源码 0 命中）。每项是 `botpy.message.BaseMessage._Attachments`，
+       带 `content_type` / `filename` / `width` / `height` / `size` / `url` 属性。
+    🔴 只读 `content_type` 与 `url`，**不碰别的字段** —— 平台上还有别的附件形态，
+       多读一处就多一处将来会变的东西。
+    """
+    out = []
+    for a in getattr(message, "attachments", None) or []:
+        ct = str(_att(a, "content_type") or "").split(";")[0].strip().lower()
+        url = str(_att(a, "url") or "").strip()
+        if not url:
+            continue
+        # 🔴 content_type 认不出、或报成 `application/octet-stream` 时**也放行**
+        #    —— QQ 偶尔把 webp 报成 octet-stream（media.download 里也记着这条）。
+        #    真正的把关在 `media.download()`：它按**文件头**再判一次，
+        #    两个都认不出才丢，并且只留 ≤ 20MB 的。
+        if ct and not ct.startswith("image/") and ct != "application/octet-stream":
+            continue
+        out.append(url)
+    return out[: _media.MAX_PER_MSG]
+
+
+def collect_images(message, scope):
+    """按开关决定收不收图 → 相对路径数组（不收 / 失败都返回空数组）。
+
+    收图是**静默**行为：下载失败只进日志，不往群里说话。
+    """
+    want = _settings.get("image_collect") or []
+    if scope not in want:
+        return []
+    urls = image_urls(message)
+    if not urls:
+        # 有附件却一个 URL 都没解析出来 —— 多半是平台换了结构。留个痕，
+        # 免得又变成「什么都没发生」（收图静默失败过一次，查了很久）。
+        n_att = len(getattr(message, "attachments", None) or [])
+        if n_att:
+            print(f"[收图·跳过] 有 {n_att} 个附件，但没解析出图片 URL", flush=True)
+        return []
+    paths, errs = _media.collect(urls)
+    if errs:
+        print(f"[收图·部分失败] {len(errs)}/{len(urls)}: {'; '.join(errs[:3])}", flush=True)
+    if paths:
+        print(f"[收图] 存入 {len(paths)} 张：{', '.join(paths)}", flush=True)
+        # 🔴 落盘后立刻查一次占用 —— 报警要在「刚超过阈值」那一刻发出来，
+        #    不然要等到下次 bot 启动才提，用户早忘了自己开过收图。
+        check_image_alert()
+    return paths
+
+
+def check_image_alert():
+    """占用超阈值就往播报目标发提醒（防刷屏靠 push 里的回滞状态）。"""
+    try:
+        threshold = int(_settings.get("image_alert_gb") or 0)
+        if threshold <= 0:
+            return
+        targets = _push.targets()
+        if not targets:
+            return                       # 没配播报目标就没处发，静默跳过
+
+        def _send(text):
+            import send_file as sf
+
+            appid = os.getenv("QQ_BOT_APPID")
+            secret = os.getenv("QQ_BOT_SECRET") or os.getenv("QQ_BOT_TOKEN")
+            sandbox = (os.getenv("QQ_BOT_SANDBOX") or "").strip().lower() in ("1", "true", "yes")
+            for sc, oid in targets:
+                sf.send_text_message(text, oid, sandbox, appid, secret, None, 1, sc)
+
+        r = _push.check_image_alert(threshold, _media.usage(), _send)
+        if r.get("fired"):
+            print("[收图·报警] 已发出占用提醒", flush=True)
+    except Exception as e:               # noqa: BLE001  报警失败绝不能影响收图
+        print(f"[收图·报警失败] {type(e).__name__}: {e}", flush=True)
+
+
 # ── 群指令 ──────────────────────────────────────────────────────
 # 内置指令的菜单；扩展指令的帮助行由 help_text() 追加（见文件后半的扩展加载）。
 HELP_BASE = (
@@ -198,7 +288,8 @@ HELP_BASE = (
     "发文件 <关键词> —— 搜文件并渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
     "回旋镖 [天数] —— 把 N 天前（默认 3 天）记过的旧账翻一条回来\n"
-    "导出 [格式] —— 把全部备忘 + 灵感导成一个文件发给你（格式 md / txt / json）\n"
+    "导出 [格式] —— 把全部备忘 + 灵感导成一个文件发给你（格式 md / txt / json / zip）\n"
+    "            zip 连收进来的图片原图一起打包（太大发不出来时会告诉你去哪拿）\n"
     "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
     "设置 —— 看/改本机设置（网页「配置中心」改的是同一份）；\n"
@@ -371,7 +462,7 @@ def boomerang_text(days=None, now=None):
 
 # ── 导出：把全部备忘 + 灵感导成一个文件发回来 ─────────────────────
 def parse_export(text):
-    """`导出` / `导出 md` / `导出 json` → (True, 格式或 None)；不是指令 → (False, None)。"""
+    """`导出` / `导出 md` / `导出 json` / `导出 zip` → (True, 格式或 None)；不是指令 → (False, None)。"""
     t = (text or "").strip()
     for c in EXPORT_CMDS:
         if not t.startswith(c):
@@ -379,7 +470,7 @@ def parse_export(text):
         rest = t[len(c):].strip(" ：:　\t")
         if not rest:
             return True, None
-        if rest.lower().lstrip(".") in ("md", "markdown", "txt", "text", "json"):
+        if rest.lower().lstrip(".") in ("md", "markdown", "txt", "text", "json", "zip"):
             return True, rest
         return False, None
     return False, None
@@ -453,6 +544,25 @@ EXCLUDE_DIRS = {
     # 隐私保护：这些目录里的文件永远不会被「发文件」检索到
     ".workbuddy-ai", ".ssh", ".aws", ".config", ".npm", ".cargo",
 }
+
+# 🔴 Windows 保留设备名。误写 `>nul` 这类重定向时，磁盘上会真的多出一个叫 `nul`
+#    的文件（要 `\\?\` 前缀才建得出来）。这种名字在 Win32 路径层会被解析成**设备**
+#    （`nul` → `\\.\nul`），于是 `os.path.relpath` 认为它「在另一个盘上」直接拒绝，
+#    `os.stat` / `os.remove` 之类也全都拿它没办法 —— **一个这样的文件就能把整条
+#    搜索指令搞崩**。搜索时直接跳过，别让用户去处理这种系统级垃圾。
+_RESERVED_NAMES = ({"con", "prn", "aux", "nul"}
+                   | {f"com{i}" for i in range(1, 10)}
+                   | {f"lpt{i}" for i in range(1, 10)})
+
+
+def _is_reserved_name(fn):
+    """文件名是不是 Windows 保留设备名（`nul`、`NUL`、`nul.txt`、`com3.log` 都算）。
+
+    判据是「第一个点之前的部分」—— Win32 对 `nul.txt` 同样按设备解析。
+    """
+    return fn.split(".")[0].lower() in _RESERVED_NAMES
+
+
 SEARCH_LIMIT = 20
 
 # @ 场景：宽松（「发」「发送」等口语别名）
@@ -493,24 +603,38 @@ def search_files(query, limit=SEARCH_LIMIT):
         return []
     out = []
     seen = set()
+    # 🔴 前缀比较统一 `normcase` 再比：`_prune_roots` 已经把搜索根小写化，而
+    #    `WORKSPACE_ROOT` 的原始大小写取决于进程是怎么被拉起来的（pythonw 传的
+    #    路径大小写不固定）。不归一的话，「同目录加权」会时灵时不灵，更糟的是
+    #    —— 见下面那支没有兜底的 relpath —— 会直接把指令搞崩。
+    ws_prefix = os.path.normcase(WORKSPACE_ROOT + os.sep)
     for root in _prune_roots(SEARCH_ROOTS):
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
             for fn in filenames:
+                if _is_reserved_name(fn):
+                    continue
                 low = fn.lower()
                 full = os.path.join(dirpath, fn)
                 key = os.path.normcase(full)
                 if key in seen:              # 多个根有重叠时别重复收
                     continue
                 seen.add(key)
-                if full.startswith(WORKSPACE_ROOT + os.sep):
-                    rel = os.path.relpath(full, WORKSPACE_ROOT).replace("\\", "/")
-                    local = True
-                else:
-                    rel = os.path.relpath(full, root).replace("\\", "/")
-                    local = False
+                # 🔴 两支的 relpath 都要兜 `ValueError`。Windows 上出现保留设备名
+                #    文件（`nul` → `\\.\nul`）时 relpath 会认为它「在另一个盘上」
+                #    而直接拒绝；上面 `_is_reserved_name` 已经挡掉了常见情况，
+                #    这里是第二层保险 —— 任何一个文件都不该崩掉整条指令。
+                try:
+                    if os.path.normcase(full).startswith(ws_prefix):
+                        rel = os.path.relpath(full, WORKSPACE_ROOT).replace("\\", "/")
+                        local = True
+                    else:
+                        rel = os.path.relpath(full, root).replace("\\", "/")
+                        local = False
+                except ValueError:
+                    continue
                 if q in low:
                     score = 3.0
                 elif q in rel.lower():
@@ -732,16 +856,23 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     if mentioned:
         # 留原始内容便于排查 @ 占位符的真实编码
         print(f"[@消息] scope={scope} raw={raw!r} -> text={text!r}", flush=True)
-    if not text:
-        return
 
     # 0) 忽略表：先放行「忽略」指令本身（否则指令会被自己的规则吃掉），
-    #    再对普通消息做闸门 —— 命中即整条跳过（不收灵感、不响应）。
+    #    再对普通消息做闸门 —— 命中即整条跳过（不收灵感、不响应、**也不收图**）。
     #    同群有别的机器人时，靠这个避免互相收集 / 循环响应。
-    if _ignore.is_command(text):
+    #
+    # 🔴 忽略表必须在**收图之前**：收图是有副作用的（下载 + 写盘 + 可能触发报警），
+    #    要它先过闸门，不然「忽略」两个字就白写了。
+    # ⚠️ 但纯图片消息 `text` 是空的，而忽略表按文本匹配 —— 空文本匹配不到任何规则，
+    #    所以这里先判「有没有图」，有图就继续往下走（不能因为没文本就 return）。
+    urls = image_urls(message)
+    if not text and not urls:
+        return
+
+    if text and _ignore.is_command(text):
         await message.reply(content=_ignore.handle_command(text), msg_seq=1)
         return
-    hit = _ignore.match(text, t["sender_id"])
+    hit = _ignore.match(text, t["sender_id"]) if text else None
     if hit:
         print(f"[忽略] scope={scope} hit={hit!r} text={text!r}", flush=True)
         return
@@ -749,13 +880,13 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     # 0.6) 设置：改的是 `memo-bot/settings.json` —— 和网页「⚙ 设置」同一份。
     #      「设置」后面**必须有分隔符**，否则「设置好了」「配置一下」这种普通聊天
     #      会被当成指令（同忽略表的处理）。
-    if _settings.is_command(text):
+    if text and _settings.is_command(text):
         await message.reply(content=_settings.handle_command(text), msg_seq=1)
         return
 
     # 0.5) 有待选文件时，优先解析「选哪个」（序号 / 文件名片段）
     pend = PENDING.get(gid)
-    if pend and time.time() - pend["ts"] <= PENDING_TTL:
+    if pend and text and time.time() - pend["ts"] <= PENDING_TTL:
         choice = resolve_choice(text, pend["matches"])
         if choice:
             PENDING.pop(gid, None)
@@ -763,6 +894,11 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
                 message, scope, t["openid"], choice[1], choice[0], mid
             )
             return
+
+    # 🔴 从这里往下全是**看文本**的分支。纯图片消息（text 为空）要直接跳到兜底收图，
+    #    否则 `FILE_SEND_RE.match("")` 这类空串匹配会莫名其妙命中。
+    if not text:
+        return await _store_media(message, t, scope, urls, "", mentioned)
 
     # 1) 发文件：搜工作区 → 唯一直接发 / 多个列出来问
     bare_cmds = BARE_FILE_CMDS if mentioned else {"发文件", "找文件", "发送文件"}
@@ -834,6 +970,18 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     is_ex, ex_fmt = parse_export(text)
     if is_ex:
         fname, data = _export.render(ex_fmt)
+        # 🔴 平台发文件上限 ~10MB，zip 带原图很容易超（手机照片 2–5MB/张）。
+        #    超了不发半截包 —— 直接降级成「文本 + 文件在哪」，让用户自己去拿。
+        #    半截 zip 更糟：用户以为下载成功了，解压才发现是坏的。
+        if _export.too_big_for_qq(data):
+            size = _export.human_size(len(data))
+            await message.reply(
+                content=(f"📦 打包好了，但整包 {size} 超过了机器人发文件的上限（10MB），发不出来。\n"
+                         f"包已经放在本机：{_export.render_to_data(ex_fmt)[1]}\n"
+                         f"直接在电脑上打开这个文件夹拿就行。"),
+                msg_seq=1)
+            print(f"[导出] {gid} {fname} 太大（{len(data)} bytes）→ 降级为提示", flush=True)
+            return
         tmpdir = tempfile.mkdtemp(prefix="memo_export_")
         try:
             path = os.path.join(tmpdir, fname)
@@ -865,7 +1013,12 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     # 4) 记备忘（@ 或不 @ 都认「备忘」触发词）
     result = handle_event(t["store_id"], t["store_name"], t["sender_id"], "", raw)
     if result:
-        print(f"[备忘] {gid} -> {result['content']}", flush=True)
+        # 🔴 备忘是「明确要记」的 —— 这时才把图和它绑在一起
+        pics = collect_images(message, scope)
+        if pics:
+            _attach_images(result["id"], pics)
+        print(f"[备忘] {gid} -> {result['content']}"
+              f"{f'（+{len(pics)} 图）' if pics else ''}", flush=True)
         ack = (_settings.get("memo_ack") or "").strip()   # 留空 = 静默记下，不回执
         if ack:
             try:
@@ -879,14 +1032,16 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     #   @ 群消息：明确回一句，避免「@ 了却没反应」分不清是没识别还是挂了
     #   非 @ 群消息：静默落灵感，不把群聊变成机器人频道
     if scope == SCOPE_C2C:
-        idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                        text.strip(), kind=KIND_IDEA)
-        print(f"[灵感·私聊] {gid} -> {idea['content']}", flush=True)
-        idea_ack = (_settings.get("idea_ack") or "").strip()   # 留空 = 静默收下
-        if idea_ack:
-            await message.reply(content=idea_ack, msg_seq=1)
+        await _store_media(message, t, scope, urls, text.strip(), mentioned)
         return
     if mentioned:
+        # 🔴 @ 了但没认出指令 —— 但如果带了图，图还是要按开关收的
+        #    （用户发了图 + @ 机器人，意思就是「给我存着」）
+        pics = collect_images(message, scope)
+        if pics:
+            idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
+                            text.strip() or _IMAGE_ONLY_TEXT, kind=KIND_IDEA, images=pics)
+            print(f"[图·@] {gid} -> {idea['id']}（{len(pics)} 图）", flush=True)
         print(f"[未识别] @消息 text={text!r}", flush=True)
         await message.reply(
             content="（没认出来这条指令，发「帮助」看菜单）", msg_seq=1
@@ -894,10 +1049,42 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         return
 
     # 5) 非 @ 的普通文本 → 自动收作「灵感」（静默，不打扰群）
-    if text.strip():
-        idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                        text.strip(), kind=KIND_IDEA)
-        print(f"[灵感] {gid} -> {idea['content']}", flush=True)
+    await _store_media(message, t, scope, urls, text.strip(), mentioned)
+
+
+async def _store_media(message, t, scope, urls, text, mentioned):
+    """兜底入库：把这条消息（文本 + 图）收作灵感。
+
+    🔴 纯图片消息的 `content` 是空的 —— 但**不能丢**（用户发图就是想存），
+       给一个占位文本 `[图片]` / `[图片 ×3]`，否则抽屉里是一条空白卡片。
+    """
+    pics = collect_images(message, scope)
+    body = text
+    if not body:
+        if not pics:
+            return                                  # 没文本也没图 → 确实没东西可存
+        body = f"[图片 ×{len(pics)}]" if len(pics) > 1 else "[图片]"
+    if not text and not pics:
+        return
+    idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
+                    body, kind=KIND_IDEA, images=pics)
+    tag = "灵感·私聊" if scope == SCOPE_C2C else "灵感"
+    print(f"[{tag}] {t['key']} -> {idea['content']}"
+          f"{f'（+{len(pics)} 图）' if pics else ''}", flush=True)
+    if scope == SCOPE_C2C or mentioned:
+        idea_ack = (_settings.get("idea_ack") or "").strip()   # 留空 = 静默收下
+        if idea_ack:
+            await message.reply(content=idea_ack, msg_seq=1)
+
+
+def _attach_images(item_id, paths):
+    """把刚落库的条目补上图片路径（东西已经存了，只补一个列）。"""
+    try:
+        import store as _store
+
+        _store.set_item_images(item_id, paths)
+    except Exception as e:                # noqa: BLE001  补不上也不影响正文
+        print(f"[收图·挂到条目上失败] {type(e).__name__}: {e}", flush=True)
 
 
 
@@ -923,21 +1110,6 @@ def main():
         sys.exit(1)
 
     install_group_message_parser()
-
-    # 关机播报：常驻进程监听 Windows 关机通知。
-    # 计划任务那条路（事件 1074）实测会被关机流程掐掉 —— 任务启动了但脚本没跑起来
-    # （返回码 0xC000026B、无日志）。这里常驻监听 WM_QUERYENDSESSION 兜住。
-    try:
-        import offwork as _offwork
-        import shutdown_hook as _shutdown
-
-        _shutdown.install(
-            lambda: _offwork.send_offwork(log=_offwork.file_log, attempts=1),
-            on_error=lambda t: print("[关机监听] " + t, flush=True),
-        )
-        print("[关机播报] 已挂上关机监听（WM_QUERYENDSESSION）", flush=True)
-    except Exception as _e:                            # noqa: BLE001
-        print(f"[关机播报·监听未装上] {type(_e).__name__}: {_e}", flush=True)
 
     class MemoClient(Client):
         async def on_ready(self):

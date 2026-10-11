@@ -10,7 +10,9 @@
 
 生产替换：把这里换成 CloudBase PostgreSQL 的 bot_memos 表即可，接口不变。
 """
+import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -29,6 +31,13 @@ STATUS_OPEN = "open"          # 待处理 / 没完成
 STATUS_DONE = "done"          # 已处理 / 已完成
 STATUS_DECIDED = "decided"    # 已决议（有结论，但不产生行动）—— 只有灵感用
 STATUS_DROPPED = "dropped"    # 已丢弃（不成立 / 无效 / 不做了）
+
+# ── 标签 ──────────────────────────────────────────────────────
+# 卡片自己的分类。字典表 `tags` 存「有哪些标签 + 各是什么颜色」，
+# 每条记录的标签名数组存在 `memos.tags`（JSON 列）。
+# 🔴 不建关联表：单机 SQLite、量级小，沿用逐列 ALTER 的迁移风格就够。
+TAG_NAME_MAX = 20             # 标签名 trim 后最长几个字（1 是下限：空的不许打）
+DEFAULT_TAG_COLOR = "#4fd1c5"
 
 # ── 首次使用：塞几条示例，别让新用户打开抽屉看到一片空白 ──────────────
 # 三条灵感介绍页面能干什么，一条备忘介绍怎么用摸鱼bot。
@@ -81,6 +90,14 @@ def init():
             processed_at TEXT
         )"""
     )
+    # 标签字典：有哪些标签、各是什么颜色。条目侧的标签名数组在 memos.tags 里。
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS tags (
+            name       TEXT PRIMARY KEY,
+            color      TEXT,
+            created_at TEXT
+        )"""
+    )
     # 老库迁移：逐列补齐
     cols = [r[1] for r in con.execute("PRAGMA table_info(memos)").fetchall()]
     if "kind" not in cols:
@@ -96,6 +113,14 @@ def init():
     if "boomerang_at" not in cols:
         # 回旋镖推过这条没有（非空 = 推过）—— 避免同一个用户反复收到同一条旧记录
         con.execute("ALTER TABLE memos ADD COLUMN boomerang_at TEXT")
+    if "tags" not in cols:
+        # 标签名数组的 JSON。🔴 老行是 NULL —— 读的时候一律当空数组（见 _row_tags）
+        con.execute("ALTER TABLE memos ADD COLUMN tags TEXT")
+    if "images" not in cols:
+        # 本地图片相对路径数组的 JSON（`images/202610/<sha16>.jpg`）。
+        # 🔴 只存**路径**不存二进制 —— 库一直很轻，导出也干净。
+        #    老行是 NULL，读的时候一律当空数组（见 _row_images）。
+        con.execute("ALTER TABLE memos ADD COLUMN images TEXT")
     # 全新的库才塞示例（老库 fresh=False，一个字节都不动）
     if fresh and not os.environ.get("MEMO_NO_SEED"):
         _seed(con)
@@ -103,18 +128,283 @@ def init():
     con.close()
 
 
-def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_MEMO):
+def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_MEMO, tags=None,
+             images=None):
     memo_id = str(uuid4())
     created = datetime.now().isoformat(timespec="seconds")
+    names = _clean_tags(tags)
+    pics = _clean_images(images)
     con = sqlite3.connect(DB)
     con.execute(
-        "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,content,created_at,kind)"
-        " VALUES (?,?,?,?,?,?,?,?)",
-        (memo_id, group_id, group_name, sender_id, sender_name, content, created, kind),
+        "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,content,created_at,kind,tags,images)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            memo_id, group_id, group_name, sender_id, sender_name, content, created,
+            kind, json.dumps(names, ensure_ascii=False) if names else None,
+            json.dumps(pics, ensure_ascii=False) if pics else None,
+        ),
     )
     con.commit()
     con.close()
-    return {"id": memo_id, "content": content, "created_at": created, "kind": kind}
+    # 🔴 顺手把这些标签补进字典表 —— 否则打了一个新标签，配置页的标签条里却看不到
+    if names:
+        tags_ensure(names)
+    return {"id": memo_id, "content": content, "created_at": created, "kind": kind,
+            "tags": names, "images": pics}
+
+
+# ── 图片：只存相对路径 ───────────────────────────────────────────
+# 二进制在 `media.py` 落盘，这里只记「这条挂了哪几张」。
+# 🔴 路径写法固定成 `images/<yyyyMM>/<sha16>.<ext>` —— 认不出这个形状的一律丢弃，
+#    否则脏数据会顺着 `/img/` 路由去摸文件（穿越风险）。
+
+_IMG_RE = re.compile(r"^images/\d{6}/[0-9a-f]{16}\.(jpg|png|gif|webp)$")
+
+
+def _clean_images(images):
+    """过滤出合法形状的相对路径，保序去重。不合规的**静默丢弃**（同标签的处理）。"""
+    out, seen = [], set()
+    for p in images or []:
+        s = str(p or "").strip().replace("\\", "/")
+        if not s or s in seen or not _IMG_RE.match(s):
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _row_images(v):
+    """把 memos.images 列读成数组。🔴 NULL / 坏 JSON / 不是数组 → 一律当空数组。"""
+    if not v:
+        return []
+    try:
+        arr = json.loads(v)
+    except (ValueError, TypeError):
+        return []
+    return _clean_images(arr) if isinstance(arr, list) else []
+
+
+# ── 标签：字典 + 条目侧 ──────────────────────────────────────────
+
+def _clean_tags(tags):
+    """把乱七八糟的输入收成一份干净的标签名数组。顺序保留，重复去掉。
+
+    🔴 规则：trim 后非空、长度 ≤ TAG_NAME_MAX、同名只留一个。
+       不合规的**直接丢弃**（不报错）—— 条目侧的标签是「顺手打一下」，
+       为了一个打错的名字把整次操作失败掉太粗暴。
+    """
+    out, seen = [], set()
+    for t in tags or []:
+        name = str(t).strip()
+        if not name or len(name) > TAG_NAME_MAX or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _row_tags(v):
+    """把 memos.tags 列读成数组。🔴 NULL / 坏 JSON / 不是数组 → 一律当空数组。"""
+    if not v:
+        return []
+    try:
+        arr = json.loads(v)
+    except (ValueError, TypeError):
+        return []
+    return [str(x) for x in arr] if isinstance(arr, list) else []
+
+
+def _with_lists(row):
+    """给查出来的行补上解析好的 `tags` / `images` 数组（JSON 字符串 → list）。"""
+    row["tags"] = _row_tags(row.get("tags"))
+    row["images"] = _row_images(row.get("images"))
+    return row
+
+
+def tags_all():
+    """标签字典 + 每个标签挂了几条。按名字排，返回 [{name,color,count}]。
+
+    count 只数**还没被删的**行 —— 字典里的标签可能一条都没挂（用户刚建还没用），
+    这时 count=0，UI 上仍然要显示，方便他继续用。
+    """
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    dict_rows = con.execute("SELECT name, color, created_at FROM tags ORDER BY name").fetchall()
+    out = []
+    for r in dict_rows:
+        name = r["name"]
+        # 🔴 用 LIKE 粗筛再精筛：tags 是 JSON 数组，'%"名字"%' 可能有子串误命中
+        #    （"生活" vs "生活用品"），所以捞出来在 Python 侧按数组精确比对。
+        cand = con.execute(
+            "SELECT tags FROM memos WHERE tags LIKE ?", ('%"' + name + '"%',)
+        ).fetchall()
+        n = sum(1 for c in cand if name in _row_tags(c["tags"]))
+        out.append({"name": name, "color": r["color"] or DEFAULT_TAG_COLOR, "count": n})
+    con.close()
+    return out
+
+
+def tags_ensure(names):
+    """把还没进字典的标签名补进去（用默认色）。返回新增了几个。"""
+    names = _clean_tags(names)
+    if not names:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    con = sqlite3.connect(DB)
+    n = 0
+    for name in names:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO tags (name,color,created_at) VALUES (?,?,?)",
+            (name, DEFAULT_TAG_COLOR, now),
+        )
+        n += cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+def set_item_tags(item_id, names):
+    """**覆盖**某条记录的标签。页面上打标签 / 去掉标签都走这里。返回改动条数。
+
+    🔴 顺带把新标签补进字典表；但**不删**字典里已经没人用的标签
+       —— 用户可能是先把标签从条目上摘下来，待会儿还要打回去。
+       真要清字典走 tags_delete()。
+    """
+    if not item_id:
+        return 0
+    clean = _clean_tags(names)
+    con = sqlite3.connect(DB)
+    cur = con.execute(
+        "UPDATE memos SET tags=? WHERE id=?",
+        (json.dumps(clean, ensure_ascii=False) if clean else None, item_id),
+    )
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    if clean:
+        tags_ensure(clean)
+    return n
+
+
+def set_item_images(item_id, paths):
+    """**覆盖**某条记录的图片路径。返回改动条数。
+
+    为什么要「先入库再补」：正文和图片是两步（图要下载，慢），
+    但正文不能等下载完才落库 —— 万一下载卡住，用户那条备忘就丢了。
+    所以先写正文、拿到 id，再把图挂上去。
+    """
+    if not item_id:
+        return 0
+    clean = _clean_images(paths)
+    con = sqlite3.connect(DB)
+    cur = con.execute(
+        "UPDATE memos SET images=? WHERE id=?",
+        (json.dumps(clean, ensure_ascii=False) if clean else None, item_id),
+    )
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+def tags_rename(old, new):
+    """标签改名。返回 (改动条数, 错误消息)。错误消息为 None 表示成功。
+
+    🔴 「全表替换」在**数组维度**做 —— 逐行读出来、map 一遍、写回去。
+       不能直接 SQL 字符串替换：`["生活"]` 换成 `["日常"]` 时字符串替换也行，
+       但 `["生活","生活用品"]` 换 `生活` 就会把 `生活用品` 也改坏。
+    🔴 目标名已存在时**合并**：把 old 从数组里摘掉，new 本来就在的话不重复加。
+    """
+    old = str(old or "").strip()
+    new = str(new or "").strip()
+    if not old or not new:
+        return 0, "标签名不能为空"
+    if len(new) > TAG_NAME_MAX:
+        return 0, f"标签名最多 {TAG_NAME_MAX} 个字"
+    if old == new:
+        return 0, None
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    exists = con.execute("SELECT 1 FROM tags WHERE name=?", (old,)).fetchone()
+    if not exists:
+        con.close()
+        return 0, f"没有「{old}」这个标签"
+    n = 0
+    rows = con.execute("SELECT id, tags FROM memos WHERE tags LIKE ?", ('%"' + old + '"%',)).fetchall()
+    for r in rows:
+        cur_tags = _row_tags(r["tags"])
+        if old not in cur_tags:
+            continue
+        mapped = []
+        for t in cur_tags:
+            v = new if t == old else t
+            if v not in mapped:
+                mapped.append(v)
+        con.execute(
+            "UPDATE memos SET tags=? WHERE id=?",
+            (json.dumps(mapped, ensure_ascii=False) if mapped else None, r["id"]),
+        )
+        n += 1
+    # 字典：old 摘掉，new 补上（保留 old 原来的配色）
+    color = None
+    crow = con.execute("SELECT color FROM tags WHERE name=?", (old,)).fetchone()
+    if crow:
+        color = crow["color"]
+    con.execute("DELETE FROM tags WHERE name=?", (old,))
+    con.execute(
+        "INSERT OR IGNORE INTO tags (name,color,created_at) VALUES (?,?,?)",
+        (new, color or DEFAULT_TAG_COLOR, datetime.now().isoformat(timespec="seconds")),
+    )
+    con.commit()
+    con.close()
+    return n, None
+
+
+def tags_delete(name):
+    """删标签：字典里摘掉 + 所有记录上摘掉。返回摘了几条记录。"""
+    name = str(name or "").strip()
+    if not name:
+        return 0
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    n = 0
+    rows = con.execute("SELECT id, tags FROM memos WHERE tags LIKE ?", ('%"' + name + '"%',)).fetchall()
+    for r in rows:
+        cur_tags = _row_tags(r["tags"])
+        if name not in cur_tags:
+            continue
+        left = [t for t in cur_tags if t != name]
+        con.execute(
+            "UPDATE memos SET tags=? WHERE id=?",
+            (json.dumps(left, ensure_ascii=False) if left else None, r["id"]),
+        )
+        n += 1
+    con.execute("DELETE FROM tags WHERE name=?", (name,))
+    con.commit()
+    con.close()
+    return n
+
+
+def tags_set_color(name, color):
+    """改标签配色。返回改动条数（0 = 没这个标签）。"""
+    name = str(name or "").strip()
+    color = str(color or "").strip()
+    # 只收 #rgb / #rrggbb —— 这串颜色最后会塞进 style，不给任意字符串留口子
+    if not name or not _is_hex_color(color):
+        return 0
+    con = sqlite3.connect(DB)
+    cur = con.execute("UPDATE tags SET color=? WHERE name=?", (color, name))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return n
+
+
+def _is_hex_color(s):
+    """#abc / #aabbcc 才算合法颜色。"""
+    if not isinstance(s, str) or not s.startswith("#") or len(s) not in (4, 7):
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in s[1:])
 
 
 def list_memos(limit=50, kind=None):
@@ -130,7 +420,7 @@ def list_memos(limit=50, kind=None):
             "SELECT * FROM memos ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    return [_with_lists(dict(r)) for r in rows]
 
 
 def count_memos(kind=None):
@@ -164,7 +454,7 @@ def list_ideas(status=None, limit=500, newest_first=False):
             (KIND_IDEA, limit),
         ).fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    return [_with_lists(dict(r)) for r in rows]
 
 
 def idea_stats():
@@ -194,7 +484,7 @@ def find_idea(id_or_prefix):
         ).fetchall()
         row = rows[0] if len(rows) == 1 else None
     con.close()
-    return dict(row) if row else None
+    return _with_lists(dict(row)) if row else None
 
 
 def set_idea_status(ids, status, note=None):
@@ -348,7 +638,7 @@ def pick_boomerang(days, scope, now=None):
         f"SELECT * FROM memos WHERE {clause} ORDER BY RANDOM() LIMIT 1", args
     ).fetchone()
     con.close()
-    return dict(row) if row else None
+    return _with_lists(dict(row)) if row else None
 
 
 def count_boomerang(days, scope, now=None):

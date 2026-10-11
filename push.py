@@ -3,7 +3,7 @@
 这个文件是干嘛的：机器人收到的每条消息都来自某个「会话」—— 要么是群，要么是私聊。
 这里把见过的会话统一记下来，配置中心页面据此列出一张表：**每个会话一行**，
 带可编辑的备注名 + 最近说过什么 + 最后说话时间。用户据此自己决定
-「启动播报 / 关机播报要发到哪几个会话」，而不是被默认塞进群。
+「启动播报要发到哪几个会话」，而不是被默认塞进群。
 
 **为什么不分群 / 私聊两个列表**：页面上给用户看的是一串 openid，而
 `group_openid` 与 `user_openid` 长得几乎一样，分两个列表反而更难判断
@@ -18,10 +18,11 @@
   能自动给的线索只有「最近说过什么」—— 从本机 `memos.db` 里取。
 
 播报目标读 `.env` 的 `QQ_PUSH_TARGETS`，格式 `group:<openid>;c2c:<openid>`
-（分号或逗号分隔）。🔴 兼容旧键：`QQ_PUSH_TARGETS` 没配时回退到
-`QQ_GROUP_OPENID`（纯 openid，视作群）+ `QQ_C2C_OPENID`。
+（分号或逗号分隔）。🔴 兼容旧键：**从没配过** `QQ_PUSH_TARGETS` 时回退到
+`QQ_GROUP_OPENID`（纯 openid，视作群）+ `QQ_C2C_OPENID`；配过就以它为准，
+**空值不回退**（见 `targets()` 的说明）。
 
-谁调用它：`bot.py`（记录 + 启动播报）、`offwork.py`（关机播报）、`config-web.py`（页面）。
+谁调用它：`bot.py`（记录 + 启动播报）、`config-web.py`（页面）。
 """
 import json
 import os
@@ -97,21 +98,76 @@ def format_targets(targets):
     return ";".join(f"{sc}:{oid}" for sc, oid in targets)
 
 
+_ENV_FILE = {"t": -1.0, "v": {}}
+
+
+def _env_file():
+    """读同目录 `.env`（带 mtime 缓存）。
+
+    🔴 必须兜这一层：配置中心（网页版 / 桌面版）**不调 `load_dotenv()`**，
+    进程环境里根本没有这些键 —— 只认 `os.getenv` 的话，页面读到的永远是空的。
+    表现就是「勾了播报目标，一刷新又变回没勾」——写了 `.env` 但读不出来。
+    """
+    try:
+        path = data_path(".env")
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if mt == _ENV_FILE["t"]:
+        return _ENV_FILE["v"]
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    _ENV_FILE["t"], _ENV_FILE["v"] = mt, out
+    return out
+
+
 def _get(key_, env=None):
-    """取配置：进程环境优先，其次调用方给的 dict（计划任务入口不一定会 load_dotenv）。"""
+    """取配置：进程环境 → 调用方给的 dict → `.env` 文件。
+
+    🔴 `.env` 放在最后但**必须有** —— 机器人进程靠 `load_dotenv()` 把值灌进
+    进程环境，配置中心却不会，少了这一层两边读到的就不是同一份配置。
+    """
     v = os.getenv(key_)
     if (v is None or v == "") and env:
         v = env.get(key_)
+    if v is None or v == "":
+        v = _env_file().get(key_)
     return v or ""
+
+
+def _present(key_, env=None):
+    """这个键**存在**吗（哪怕是空值）？
+
+    🔴 用来区分「从来没配过」和「配成了空」—— 两者 `_get()` 都返回 ""，
+    但含义完全相反：前者该回退旧键，后者就是用户把目标全取消了。
+    """
+    if key_ in os.environ:
+        return True
+    if env and key_ in env:
+        return True
+    return key_ in _env_file()
 
 
 def targets(env=None):
     """播报目标 → `[(scope, openid), ...]`。
 
-    主键 `QQ_PUSH_TARGETS`；没配就回退旧的两键（老用户升级后不丢配置）。
+    主键 `QQ_PUSH_TARGETS`；**从没配过**这个键才回退旧的两键（老用户升级不丢配置）。
+
+    🔴 「配成空」不回退：`.env` 里旧键（`QQ_GROUP_OPENID`）和主键往往同时存在，
+       要是把空值也当「没配」，用户在页面上取消勾选最后一个目标就会立刻被旧键
+       复活 —— 表现是「怎么点都取消不掉」。
     """
     raw = _get("QQ_PUSH_TARGETS", env)
-    if raw.strip():
+    if raw.strip() or _present("QQ_PUSH_TARGETS", env):
         return parse_targets(raw)
     out = [(SCOPE_GROUP, o) for o in _split(_get("QQ_GROUP_OPENID", env))]
     out += [(SCOPE_C2C, o) for o in _split(_get("QQ_C2C_OPENID", env))]
@@ -354,3 +410,89 @@ def sessions(env=None):
     # 已勾选的排前面，其次按最近活跃（`last` 兜一层 int —— 文件被人手改过也不至于炸）
     out.sort(key=lambda r: (not r["target"], -int(r["last"] or 0)))
     return out
+
+
+# ── 图片占用报警 ────────────────────────────────────────────────
+# 照片是**收到即落盘、不自动清理**，所以占用只会涨。超过用户设的阈值就往播报目标
+# 发一条提醒。状态落 `image-alert.json`（本机状态，已 gitignore）。
+#
+# 🔴 防刷屏的关键是「**回滞**」：不能占用一直超阈值就每张图报一次。
+#    规则 = 只有「上次报警后占用曾**回落**到阈值以下」才允许再报一次。
+#    也就是说 `fired=True` 且占用仍超标 → 静默；占用降到阈值以下 → 把 `fired` 清掉，
+#    下次再超标才会报。用户想立刻再收一条提醒，把阈值调一下即可。
+_ALERT_FILE = data_path("image-alert.json")
+
+
+def alert_should_fire(gb, threshold_gb, fired):
+    """要不要发这条报警 → bool。纯函数，方便单测。"""
+    if not threshold_gb or threshold_gb <= 0:
+        return False                      # 阈值 0 = 关掉报警
+    if gb < threshold_gb:
+        return False
+    return not fired                      # 已经在「超标且报过」的状态里就不再报
+
+
+def alert_text(gb, threshold_gb, count=0):
+    """报警正文（人话，带上怎么办）。"""
+    head = f"图片已经存了 {gb} GB（超过你设的 {threshold_gb} GB）"
+    if count:
+        head += f"，共 {count} 张"
+    return (
+        f"{head}。\n"
+        "我不会自动删图 —— 图片是带时效的远程链接，删了就真没了。\n"
+        "想少占点地方，可以自己去这个目录里清：\n"
+        f"  {os.path.join(os.path.dirname(_ALERT_FILE), 'images')}\n"
+        "清完占用会自己降下来，下次再超过阈值时会再提醒你一次。\n"
+        "（不想收这类提醒：「设置 图片占用报警阈值 0」，或在配置中心填 0）"
+    )
+
+
+def _alert_load():
+    if not os.path.exists(_ALERT_FILE):
+        return {}
+    try:
+        with open(_ALERT_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _alert_save(state):
+    try:
+        tmp = _ALERT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, _ALERT_FILE)
+    except OSError:
+        pass
+
+
+def check_image_alert(threshold_gb, usage, send=None):
+    """占用超阈值就发一条提醒 → dict（给日志 / 测试看）。
+
+    `usage` = `media.usage()` 的返回值；`send` = `send(text)`，不传就**只更新状态不发**
+    （供配置中心那种只读场景调用）。
+    返回 `{"fired": bool, "state": {...}}`。
+    """
+    gb = float((usage or {}).get("gb") or 0)
+    count = int((usage or {}).get("count") or 0)
+    st = _alert_load()
+    fired = bool(st.get("fired"))
+    if gb < threshold_gb:
+        # 🔴 回落 = 撤销「已报警」，下次超标才会再报。这行是防刷屏的全部秘密。
+        if fired:
+            _alert_save({"fired": False, "gb": gb})
+        return {"fired": False, "state": {"fired": False, "gb": gb}}
+    if not alert_should_fire(gb, threshold_gb, fired):
+        return {"fired": False, "state": st}
+    text = alert_text(gb, threshold_gb, count)
+    if send is None:
+        _alert_save({"fired": True, "gb": gb})
+        return {"fired": False, "state": {"fired": True, "gb": gb}}
+    try:
+        send(text)
+        _alert_save({"fired": True, "gb": gb})
+        return {"fired": True, "state": {"fired": True, "gb": gb}}
+    except Exception as e:                # noqa: BLE001  发失败不算报过 —— 下次重试
+        return {"fired": False, "state": st, "error": f"{type(e).__name__}: {e}"}

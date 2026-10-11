@@ -4,32 +4,41 @@
 打包脚本都用它。**改了版本号要同步改同目录的 `VERSION` 文件** —— 远端检测读的就是那个文件，
 `_exe_poc/memo-bot.iss` 也是直接读它（所以安装包名字里的版本号不会跟代码脱节）。
 
-谁调用它：`config-web.py`（页面显示 + 「检查更新」按钮）。
+谁调用它：`memo_gui.py`（桌面版「运行方式」页的版本号 + 「检查更新」按钮）、
+         `config-web.py`（页面显示 + 「检查更新」按钮）。
 
 🔴 远端地址走 jsdelivr，不走 raw.githubusercontent.com —— 后者在国内基本连不上（实测 curl exit 35）。
 
-🔴 **检测更新要两个源一起看**（`latest()` 里有详述）：`cdn.jsdelivr.net/...@main/VERSION`
-是**分支引用**，jsdelivr 对它缓存 **12 小时**，发版后半天内老客户端查到的还是旧版本号；
-`data.jsdelivr.com` 的版本列表接口只缓存 5 分钟，但它按 **tag** 列 —— 所以发版必须打 tag。
+🔴 **检测更新要多个源一起看**（`latest()` 里有详述）：
+  · `api.github.com/repos/<repo>/releases/latest` —— **最实时**（`max-age=60`），
+    但它对空 `User-Agent` 返回 403、未认证配额 60 次/小时/IP，国内可达性也一般；
+  · `data.jsdelivr.com` 的版本列表 —— HTTP 缓存 5 分钟，但它从 GitHub 同步 **tag**
+    有自己的节奏（本仓库实测**索引延迟 ≈10 分钟**）；
+  · `cdn.jsdelivr.net/...@main/VERSION` —— 分支引用，边缘缓存 **12 小时**，只能兜底。
+  三个源都查、取**较大者**，任一挂了都不影响。
 
 关于**下载新版**（`download_url`）：
   · 默认拼 **GitHub Releases 直链** —— 仓库是公开的，零成本，且和源码同源：
       https://github.com/<repo>/releases/download/v<版本>/memo-bot-setup-v<版本>.exe
     所以发版时必须把安装包传成 Release 资产，**tag 用 `v<版本>`、文件名带版本号**（见 asset_name）。
-  · 想换成自己的服务器 / 对象存储：设 `MEMO_DOWNLOAD_BASE=https://你的域名/xxx`，
-    程序会把同样的文件名拼在后面。换服务器不用改代码。
+  · 🔴 `github.com` 的下载直链在国内经常打不开 —— 想换自己的服务器 / 对象存储，
+    设 `MEMO_DOWNLOAD_BASE=https://你的域名/xxx`，程序会把同样的文件名拼在后面。换服务器不用改代码。
 """
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 REPO = "phononprismlab/memo-bot"
 RAW_URL = "https://cdn.jsdelivr.net/gh/{repo}@main/VERSION"
-# jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，只缓存 5 分钟。
+# jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，HTTP 缓存 5 分钟，
+#    但「jsdelivr 什么时候知道新 tag」是另一回事（实测 ≈10 分钟）。
 VERSIONS_API = "https://data.jsdelivr.com/v1/packages/gh/{repo}"
+# GitHub Releases API —— 最实时的源（响应头 max-age=60）。
+RELEASES_API = "https://api.github.com/repos/{repo}/releases/latest"
 HOMEPAGE = "https://github.com/{repo}"
 
 # 安装包命名（**必须**和 `_exe_poc/memo-bot.iss` 的 OutputBaseFilename 一致，
@@ -62,15 +71,35 @@ def compare_version(a, b):
 
 
 def _get(url, timeout):
-    """取一个 URL 的文本。失败直接抛，由调用方汇总。"""
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    """取一个 URL 的文本。失败直接抛，由调用方汇总。
+
+    🔴 必须带 `User-Agent` —— GitHub API 对空 UA 直接返回 403。
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "memo-bot-update-check",
+        "Accept": "application/json, text/plain, */*",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 
-def _from_versions_api(timeout):
-    """从 jsdelivr 的版本列表接口取**最新 tag** —— 只缓存 5 分钟，发版后基本立刻可见。
+def _from_release_api(timeout):
+    """从 GitHub Releases API 取最新 Release 的 tag —— **最实时的源**（缓存只有 60 秒）。
 
-    返回的是 tag 归一化后的版本串（`v0.1.1` → `0.1.1`）；列表为空返回 None。
+    ⚠️ 未认证配额 60 次/小时/IP：用户手动点「检查更新」绰绰有余，但**别拿它轮询**。
+    """
+    data = json.loads(_get(RELEASES_API.format(repo=REPO), timeout))
+    tag = str(data.get("tag_name") or "")
+    m = re.search(r"\d+\.\d+(?:\.\d+)?", tag)
+    return m.group(0) if m else None
+
+
+def _from_versions_api(timeout):
+    """从 jsdelivr 的版本列表接口取**最新 tag**。
+
+    ⚠️ 它按 tag 列，而 jsdelivr 从 GitHub 同步 tag 有延迟（本仓库实测 ≈10 分钟），
+       所以发版后头十几分钟它可能还是旧值 —— 这也是要留第三个源的原因。
+    返回 tag 归一化后的版本串（`v0.1.1` → `0.1.1`）；列表为空返回 None。
     """
     data = json.loads(_get(VERSIONS_API.format(repo=REPO), timeout))
     vs = [str(v.get("version") or "") for v in (data.get("versions") or [])]
@@ -92,37 +121,91 @@ def _from_raw(timeout):
     return m.group(0) if m else None
 
 
-def latest(timeout=8):
+# 查版本的源，**按新鲜度排序**（先试最实时的）。
+SOURCES = (
+    ("GitHub Releases", _from_release_api),
+    ("jsdelivr 版本列表", _from_versions_api),
+    ("jsdelivr 文件", _from_raw),
+)
+
+# 每个源试几次。网络抖动（连接被重置之类）第一次失败、第二次往往就通了。
+ATTEMPTS = 2
+# 单次请求超时。三个源 × 两次 = 最多 6 次，别让用户对着「检查中…」干等。
+PER_TIMEOUT = 5
+# 总时长上限 —— 超了就不再往下试，宁可报错也别卡住页面。
+DEADLINE = 15
+
+# WinError / errno → 人话。用户看不懂 `[WinError 10054] 远程主机强迫关闭了一个现有的连接`，
+# 更不知道该干什么；给一句能照着做的提示。
+_NET_HINTS = {
+    10054: "连接被重置（网络环境可能有限制，或代理不稳定）",
+    10060: "连接超时",
+    10061: "连接被拒绝（如果开了代理，确认代理正在运行）",
+    11001: "域名解析失败（DNS 问题）",
+    104: "连接被重置",
+    110: "连接超时",
+    111: "连接被拒绝",
+}
+
+
+def _why(e):
+    """把底层网络异常翻译成一句人话。"""
+    r = getattr(e, "reason", e)
+    code = getattr(r, "winerror", None) or getattr(r, "errno", None)
+    if code in _NET_HINTS:
+        return _NET_HINTS[code]
+    txt = str(r)
+    if "timed out" in txt:
+        return "连接超时"
+    return f"{type(r).__name__}"
+
+
+def latest(timeout=PER_TIMEOUT, attempts=ATTEMPTS, deadline=DEADLINE):
     """取远端最新版本号 → (版本串 或 None, 错误说明 或 None)。
 
-    🔴 **为什么非要两个源**：`cdn.jsdelivr.net/...@main/VERSION` 是**分支引用**，
-       jsdelivr 给它的响应头是 `Cache-Control: public, max-age=604800, s-maxage=43200`
-       —— 边缘节点缓存 **12 小时**。实测发版 3 小时后去取，拿到的还是 `0.1.0`
-       （`Age: 11640`）。**加随机查询串也躲不掉**：`?nocache=<随机数>` 命中的是同一份
-       缓存，`Age` 一模一样 —— jsdelivr 的缓存键不含 query。
-       表现就是用户那句「用 0.1.0 的客户端点检查更新，说已是最新」。
+    🔴 **为什么要多个源**（2026-10-10 两次真机事故）：
+      1. 最早只查 `cdn.jsdelivr.net/...@main/VERSION`。它是**分支引用**，
+         jsdelivr 给它的响应头是 `Cache-Control: public, max-age=604800, s-maxage=43200`
+         —— 边缘缓存 **12 小时**。发版 3 小时后去取，拿到的还是 `0.1.0`（`Age: 11640`），
+         于是 0.1.0 的客户端点「检查更新」被判成「已是最新」。
+         🔴 **加随机查询串也躲不掉**：`?nocache=<随机数>` 命中同一份缓存，`Age` 一模一样
+         —— jsdelivr 的缓存键不含 query。别再想着用 cache-busting 绕。
+      2. 换成 jsdelivr 的版本列表后，又发现它**索引新 tag 有 ≈10 分钟延迟**
+         （`max-age=300` 说的是 HTTP 缓存，不是「jsdelivr 什么时候知道新 tag」）。
+      3. 还有一类事故跟缓存无关：**单个源 + 不重试**，网络抖一下（比如
+         `URLError: [WinError 10054] 连接被重置`）整个检查就挂了，而且原始异常
+         直接甩到页面上，用户看不懂。
 
-       而 `data.jsdelivr.com` 的版本列表接口是 `max-age=300`（**5 分钟**），
-       且它按 **tag** 列 —— 发版打了 tag 就能很快看到。
-
-    两个源都查、取**较大者**：
-      · 正常发版（先 tag 后 Release）→ 版本列表接口先到，立刻生效；
-      · 万一只改了 `VERSION` 没打 tag → 兜底源迟早也会跟上（只是慢 12 小时）。
-    两个都拿不到才返回错误。
+    所以：**多个源 + 每个源重试 + 取较大者 + 人话报错**，任一源挂了都不影响。
     """
+    t0 = time.monotonic()
     found, errs = [], []
-    for name, fn in (("版本列表", _from_versions_api), ("VERSION 文件", _from_raw)):
-        try:
-            v = fn(timeout)
-        except (urllib.error.URLError, OSError, ValueError, KeyError, AttributeError) as e:
-            errs.append(f"{name}: {type(e).__name__}: {e}")
-            continue
-        if v:
-            found.append(v)
+    for name, fn in SOURCES:
+        got, why = None, "超时跳过"
+        for _ in range(attempts):
+            if time.monotonic() - t0 > deadline:
+                break
+            try:
+                got = fn(timeout)
+            except (urllib.error.URLError, OSError, ValueError, KeyError,
+                    AttributeError) as e:
+                got, why = None, _why(e)
+            else:
+                why = None if got else "没解析出版本号"
+                if got:
+                    break
+        if got:
+            found.append(got)
         else:
-            errs.append(f"{name}: 没解析出版本号")
+            errs.append(f"{name}：{why}")
     if not found:
-        return None, "；".join(errs)
+        # 三个源报的原因通常一样（同一个网络问题），去重后再说，别糊用户一屏
+        reasons = []
+        for e in errs:
+            r = e.split("：", 1)[1] if "：" in e else e
+            if r not in reasons:
+                reasons.append(r)
+        return None, "连不上更新服务器：" + "、".join(reasons)
     best = found[0]
     for v in found[1:]:
         if compare_version(v, best) > 0:

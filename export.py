@@ -1,4 +1,4 @@
-"""把备忘 / 灵感导出成一个文件（Markdown / 纯文本 / JSON）。
+"""把备忘 / 灵感导出成一个文件（Markdown / 纯文本 / JSON / zip）。
 
 这个文件是干嘛的：给「导出」指令和脑内抽屉页的「⬇ 导出」按钮**共用**，
    排版与格式只有这一处定义 —— 两边调的是同一个 `render()`。
@@ -8,23 +8,34 @@
 导出内容 = **全部备忘**（kind=memo）+ **全部灵感**（kind=idea，含状态与结论），
 按时间**正序**（先记的在前），换行原样保留。
 
-对外只有三个函数：`render()` / `filename()` / `normalize_format()`。
+🔴 `zip` 格式会**连图片原图一起打包**（`导出.md` + `导出.json` + `images/`）。
+   机器人发文件有 ~10MB 上限，超了由调用方降级（见 `too_big_for_qq()`）；
+   抽屉页走本地 HTTP 下载，不受这个限制。
+
+对外只有四个函数：`render()` / `filename()` / `normalize_format()` / `too_big_for_qq()`。
 """
+import io
 import json
 import os
+import zipfile
 from datetime import datetime
 
+import media
 import store
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-FORMATS = ("md", "txt", "json")
 DEFAULT_FORMAT = "md"
 MIME = {
     "md": "text/markdown; charset=utf-8",
     "txt": "text/plain; charset=utf-8",
     "json": "application/json; charset=utf-8",
+    "zip": "application/zip",
 }
+
+# 🔴 机器人发文件上限约 10MB（平台侧限制，不是我们能调的）。
+#    手机照片 2–5MB/张，十几张就超 —— zip 里带原图很容易踩到。
+QQ_FILE_LIMIT = 10 * 1024 * 1024
 
 STATUS_LABEL = {
     store.STATUS_OPEN: "待处理",
@@ -37,7 +48,7 @@ STATUS_ORDER = (store.STATUS_OPEN, store.STATUS_DONE,
 
 
 def normalize_format(fmt):
-    """认 md / markdown / txt / text / json（大小写、前导点都无所谓），认不出回默认。"""
+    """认 md / markdown / txt / text / json / zip（大小写、前导点都无所谓），认不出回默认。"""
     f = (fmt or "").strip().lower().lstrip(".")
     if f in ("md", "markdown"):
         return "md"
@@ -45,7 +56,48 @@ def normalize_format(fmt):
         return "txt"
     if f == "json":
         return "json"
+    if f == "zip":
+        return "zip"
     return DEFAULT_FORMAT
+
+
+def too_big_for_qq(data):
+    """这段 bytes 是不是大到机器人发不出去（> 10MB）。
+
+    🔴 抽成函数是为了让调用方**能测**：降级分支不能只靠「真发一次看看」来验。
+    """
+    return len(data or b"") > QQ_FILE_LIMIT
+
+
+def human_size(nbytes):
+    """体积给人看（跟 media.human 一个口径，这里单独一份免得导出链上多挂一个依赖）。"""
+    n = float(nbytes or 0)
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.1f} GB"
+
+
+# 导出包落到本机的哪个目录（发不出去时把那句「文件在哪」告诉用户）。
+EXPORT_DIR_NAME = "exports"
+
+
+def render_to_data(fmt="md", now=None):
+    """渲染并**落盘**到数据目录 → (文件名, 绝对路径)。
+
+    给「太大了发不出去」那条降级路径用：包总得有个地方让用户自己去拿。
+    """
+    from paths import data_dir
+    fname, data = render(fmt, now)
+    out = os.path.join(data_dir(), EXPORT_DIR_NAME)
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, fname)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return fname, path
 
 
 def filename(fmt="md", now=None):
@@ -84,6 +136,24 @@ def _quote(text):
     return "\n".join("> " + ln if ln.strip() else ">" for ln in body.splitlines())
 
 
+def _pic_rels(row):
+    """条目挂的图片相对路径列表（`images/<yyyyMM>/<name>`）。
+
+    🔴 必须是**相对路径**，不能换成 URL —— zip 解压出来 Markdown 要能直接把图
+       显示出来，正文里的引用和包里的文件得指向同一个位置（见 `_render_zip`）。
+    """
+    out = []
+    for rel in (row.get("images") or []):
+        if isinstance(rel, str) and rel:
+            out.append(rel)
+    return out
+
+
+def _pic_name(rel):
+    """`images/202610/ab12.jpg` → `ab12.jpg`（Markdown 的 alt 文本用）。"""
+    return rel.rsplit("/", 1)[-1]
+
+
 # ── 三种格式的渲染 ──────────────────────────────────────────────
 def _render_md(memos, ideas, now):
     L = ["# 摸鱼bot 导出", "",
@@ -97,6 +167,9 @@ def _render_md(memos, ideas, now):
         L += [f"### {_when(m.get('created_at'))}", "", _quote(m.get("content"))]
         if m.get("note"):
             L += ["", f"> **结论**：{m['note']}"]
+        # 图片：写**相对路径**的 Markdown 引用 —— 导 zip 解压后能直接看到图
+        for rel in _pic_rels(m):
+            L += ["", f"![{_pic_name(rel)}]({rel})"]
         L.append("")
 
     L += [f"## 灵感（{len(ideas)} 条）", ""]
@@ -111,6 +184,8 @@ def _render_md(memos, ideas, now):
             L.append(f"- **{_when(i.get('created_at'))}** {_one_line(i.get('content'))}")
             if i.get("note"):
                 L.append(f"  - 结论：{_one_line(i['note'])}")
+            for rel in _pic_rels(i):
+                L.append(f"  - ![{_pic_name(rel)}]({rel})")
         L.append("")
     return "\n".join(L)
 
@@ -127,6 +202,8 @@ def _render_txt(memos, ideas, now):
         L += [f"[{_when(m.get('created_at'))}]", str(m.get("content") or "").strip()]
         if m.get("note"):
             L.append(f"（结论：{m['note']}）")
+        for rel in _pic_rels(m):
+            L.append(f"（图片：{rel}）")
         L.append("")
 
     L += [f"── 灵感（{len(ideas)} 条）" + "─" * 20, ""]
@@ -141,6 +218,8 @@ def _render_txt(memos, ideas, now):
             L.append(f"  [{_when(i.get('created_at'))}] {str(i.get('content') or '').strip()}")
             if i.get("note"):
                 L.append(f"     结论：{i['note']}")
+            for rel in _pic_rels(i):
+                L.append(f"     图片：{rel}")
             L.append("")
     return "\n".join(L)
 
@@ -153,6 +232,10 @@ def _render_json(memos, ideas, now):
             "content": row.get("content"),
             "status": row.get("status"),
             "note": row.get("note"),
+            "tags": row.get("tags") or [],
+            # 🔴 相对路径 `images/<yyyyMM>/<name>` —— 跟 zip 里的目录结构一一对应，
+            #    解压之后照着这个就能把正文和图片对起来。
+            "images": row.get("images") or [],
             "created_at": row.get("created_at"),
             "processed_at": row.get("processed_at"),
             "group_name": row.get("group_name"),
@@ -167,6 +250,46 @@ def _render_json(memos, ideas, now):
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+# ── zip：文本 + 原图一起打包 ─────────────────────────────────────
+# 🔴 图片放 `images/<yyyyMM>/<name>`（跟磁盘上一样），md / json 里记的也是这个
+#    相对路径 —— 解压出来 Markdown 里的引用能直接对上，不用改链接。
+def _render_zip(memos, ideas, now):
+    """→ bytes。标准库 `zipfile`，不引新依赖。
+
+    压缩用 `ZIP_DEFLATED`：图片（jpg/png）本身压不动多少，但 md/json 能压，
+    而且**不压缩的包会白白多占几 MB** —— 那几 MB 在 10MB 上限面前很要命。
+    """
+    md = _render_md(memos, ideas, now).encode("utf-8")
+    js = _render_json(memos, ideas, now).encode("utf-8")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("导出.md", md)
+        zf.writestr("导出.json", js)
+        # 收进来的原图。以**磁盘**为准（数据库里可能删了行但文件还在，
+        # 也可能库坏了但图还在 —— 导出要给用户的是「我到底有哪些图」）。
+        for item in media.list_files():
+            rel = item.get("rel") or ""
+            parts = rel.split("/")
+            if len(parts) != 3 or parts[0] != "images":
+                continue
+            mon, name = parts[1], parts[2]
+            fp = media.resolve_path(mon, name)
+            if not fp:
+                continue
+            try:
+                with open(fp, "rb") as fh:
+                    zf.write(fp, arcname=rel)
+            except OSError:
+                continue        # 单张读不到不该让整包导出失败
+        # 收图关着的用户没有 images/，给个说明文件免得解压出来一头雾水
+        if not media.list_files():
+            zf.writestr("images/说明.txt",
+                        "这次导出没有图片。\n"
+                        "在配置中心「⑤ 脑内抽屉」里打开「收集图片」，之后收到的图就会存进来。\n")
+    return buf.getvalue()
+
+
 # ── 对外入口 ────────────────────────────────────────────────────
 def render(fmt="md", now=None):
     """→ (文件名, bytes)。两种触发方式都走这里，格式只有这一份定义。"""
@@ -175,8 +298,13 @@ def render(fmt="md", now=None):
     memos, ideas = collect()
     if fmt == "json":
         text = _render_json(memos, ideas, now)
+        data = text.encode("utf-8")
     elif fmt == "txt":
         text = _render_txt(memos, ideas, now)
+        data = text.encode("utf-8")
+    elif fmt == "zip":
+        data = _render_zip(memos, ideas, now)
     else:
         text = _render_md(memos, ideas, now)
-    return filename(fmt, now), text.encode("utf-8")
+        data = text.encode("utf-8")
+    return filename(fmt, now), data

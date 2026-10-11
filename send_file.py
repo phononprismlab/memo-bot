@@ -59,7 +59,6 @@ TEXT_EXT = {
     ".sh", ".bat", ".cmd", ".ps1", ".xml", ".env", ".sql", ".java", ".c", ".cpp", ".go", ".rs",
 }
 TEXT_CHUNK = 1200        # 每段字符数（QQ 群文本消息保守上限）
-TEXT_MAX_CHUNKS = 8      # 超过则不拆，退回文件卡片
 # 被动回复的 msg_seq 起始值：bot 自己用 1~3，这里抬高避免撞车（40054005 去重）
 CLI_SEQ_BASE = 100
 
