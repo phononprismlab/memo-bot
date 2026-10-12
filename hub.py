@@ -199,6 +199,7 @@ except Exception:  # noqa: BLE001  打包环境里 pystray/PIL 都在；开发�
 
 _tray = None                                  # pystray.Icon 实例（在托盘线程里赋值）
 _exit_requested = threading.Event()           # 托盘「退出」点了 → 主循环跳出
+_exit_confirming = threading.Event()          # 确认框已弹出（防连点弹出好几个）
 _tray_state = {                               # 主循环写、托盘菜单读的共享状态
     "bot_running": False,
     "autostart": False,
@@ -274,9 +275,16 @@ def _act_toggle_autostart(icon, item):
 def _confirm_exit():
     """弹一个**原生**确认框 → True 表示用户确认退出。
 
-    🔴 用 Win32 的 `MessageBoxW`，不碰 Tk：托盘菜单的回调跑在 pystray 的
+    🔴 用 Win32 的 `MessageBox*`，不碰 Tk：托盘菜单的回调跑在 pystray 的
        独立线程里，在那里建 Tk 根窗口会和桌面窗口那个进程抢单例、也容易卡。
        原生框跨线程随便用，也不需要额外依赖。
+    🔴 **带超时**（用户 2026-10-12 报「点哪个都点不掉」）：到点自己关掉、
+       按「取消」处理 —— 宁可当用户放弃，也不能让人被一个点不动的模态框
+       永久困住。走 `MessageBoxTimeoutW`（user32 里一直有，只是没公开文档），
+       拿不到就退回普通 `MessageBoxW`。
+    🔴 **不传 `MB_TOPMOST`**：置顶框在前台锁定（本进程不是前台进程时
+       `SetForegroundWindow` 会被系统忽略）下容易变成「看得见、点不着」。
+       只留 `MB_SETFOREGROUND`，层级交给系统。
     🔴 默认按钮放在「否」上（`MB_DEFBUTTON2`）：敲回车不会误退出。
     """
     if os.name != "nt":
@@ -286,15 +294,23 @@ def _confirm_exit():
         MB_YESNO = 0x00000004
         MB_ICONWARNING = 0x00000030
         MB_DEFBUTTON2 = 0x00000100
-        MB_TOPMOST = 0x00040000
         MB_SETFOREGROUND = 0x00010000
         IDYES = 6
+        TIMEOUT_MS = 10000
         text = ("退出会一并关闭摸鱼bot：桌面窗口和后台机器人都会停掉，\n"
                 "退出后机器人不再收发消息（直到下次启动）。\n\n"
                 "确定要退出吗？")
-        r = ctypes.windll.user32.MessageBoxW(
-            0, text, "摸鱼bot",
-            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND)
+        flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND
+        u32 = ctypes.windll.user32
+        # 未公开入口：不存在时 getattr 抛 AttributeError，被外层兜住前先退回普通版
+        fn = getattr(u32, "MessageBoxTimeoutW", None)
+        if fn is None:
+            r = u32.MessageBoxW(None, text, "摸鱼bot", flags)
+        else:
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                           ctypes.c_uint, ctypes.c_ushort, ctypes.c_uint]
+            fn.restype = ctypes.c_int
+            r = fn(None, text, "摸鱼bot", flags, 0, TIMEOUT_MS)
         return r == IDYES
     except Exception:  # noqa: BLE001  弹不出来就别拦着用户退出
         return True
@@ -326,14 +342,37 @@ def _close_gui_window():
 
 
 def _act_exit(icon, item):
-    """托盘「退出」→ 先确认，再通知主循环收尾（关窗口 + 停机器人），最后摘图标。"""
-    if not _confirm_exit():
-        return                       # 用户点了「否」：什么都不做，图标继续挂着
-    _exit_requested.set()
+    """托盘「退出」→ 起一个**独立线程**走「确认 → 收尾」。
+
+    🔴 确认框**不能**在这个回调里直接弹：它是 pystray 在**自己的窗口过程**
+       （`DispatchMessage` → `_on_notify` → 菜单回调）里同步调用的，
+       在那儿嵌一个 Win32 模态对话框，模态循环会和托盘的消息泵共用同一条
+       消息队列 —— 真机表现就是「框弹出来了，点哪个都点不掉」（用户 2026-10-12）。
+       挪到独立线程后那个线程有自己的消息队列，模态循环互不干扰。
+    🔴 防重入：连点几次「退出」只留一个框（`_exit_confirming`）。
+    """
+    if _exit_confirming.is_set():
+        return
+    _exit_confirming.set()           # 先占位再起线程，免得连点弹出好几个框
+    threading.Thread(target=_exit_flow, args=(icon,), daemon=True).start()
+
+
+def _exit_flow(icon):
+    """确认 + 收尾（跑在独立线程里，见 `_act_exit`）。
+
+    `icon.stop()` 走的是 `PostMessage(WM_STOP)`，本来就能跨线程调；
+    `_exit_requested` 是 Event，用来叫醒主循环。
+    """
     try:
-        icon.stop()
-    except Exception:  # noqa: BLE001
-        pass
+        if not _confirm_exit():
+            return                   # 用户点了「否」（或框超时）：图标继续挂着
+        _exit_requested.set()
+        try:
+            icon.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _exit_confirming.clear()
 
 
 def _build_menu():

@@ -3040,6 +3040,28 @@ def test_review_hardening():
           and "SingleInstance(\"botstart\")" in open(
               os.path.join(ROOT, "botctl.py"), encoding="utf-8").read())
 
+    # ── 托盘「退出」的确认框（用户 2026-10-12 报「点哪个都点不掉」）──
+    # 🔴 必须在**独立线程**里弹：托盘回调跑在 pystray 的窗口过程
+    #    （`DispatchMessage` → `_on_notify`）里，在那儿嵌 Win32 模态循环会和
+    #    托盘的消息泵共用同一条消息队列。
+    # 🔴 必须**带超时**：再卡也会自己关掉，不把人永久困在一个点不动的框里。
+    _hsrc = open(os.path.join(ROOT, "hub.py"), encoding="utf-8").read()
+    _cx = _hsrc.split("def _confirm_exit", 1)[1].split("\ndef ", 1)[0]
+    _cx_body = _cx.split('"""', 2)[2]           # 跳过 docstring
+    check("🖥 退出确认框带超时（MessageBoxTimeoutW，10 秒）",
+          "MessageBoxTimeoutW" in _cx_body
+          and "TIMEOUT_MS = 10000" in _cx_body
+          and 'getattr(u32, "MessageBoxTimeoutW", None)' in _cx_body)
+    check("🖥 🔴 退出确认框不传 MB_TOPMOST（前台锁定下会「看得见点不着」）",
+          "MB_TOPMOST" not in _cx_body
+          and "MB_SETFOREGROUND" in _cx_body)
+    check("🖥 🔴 退出确认框在独立线程里弹（不在 pystray 回调里嵌模态循环）",
+          "threading.Thread(target=_exit_flow" in _hsrc
+          and "def _exit_flow(icon)" in _hsrc)
+    check("🖥 🔴 退出确认框防重入（连点只弹一个）",
+          "_exit_confirming = threading.Event()" in _hsrc
+          and "if _exit_confirming.is_set():" in _hsrc)
+
     if os.name == "nt":
         # 起 4 个进程同时抢同一把锁，统计「拿到」的数量 —— 必须正好 1 个
         tmp = tempfile.mkdtemp(prefix="lock_race_")
