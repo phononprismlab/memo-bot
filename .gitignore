@@ -7,7 +7,7 @@
 .env.bak
 # 含真实群 openid / msg_id
 last_group_msg.json
-# 个人数据（备忘 / 灵感库）
+# 个人数据（待办 / 灵感库）
 memos.db
 *.db
 *.db-journal
@@ -31,9 +31,9 @@ onboarded.json
 moyu-user.json
 # 收进来的图片本体（个人内容，体积大）
 images/
-# 导出的灵感池 / 备忘（正文全是个人内容，等同 memos.db）
+# 导出的灵感池 / 待办（正文全是个人内容，等同 memos.db）
 灵感池.md
-备忘.md
+待办.md
 # 🔴 Windows 保留设备名 —— 本机被误重定向建出来过一个 `nul`，
 #    它 `git add` 会往索引里塞一条坏条目（且文件本身删不掉，见 DETAIL-摸鱼bot.md §61）。
 #    这里挡掉，别让它跟着 `git add -A` 进仓库。

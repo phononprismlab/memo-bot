@@ -42,6 +42,13 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; 🔴 文件占用：我们自己在 [Code] 里先停任务、再杀进程（见 PrepareToInstall），
+;    这里让 Inno 也「直接关掉、别问」—— 双保险。用户报的「安装报错、下方窗口
+;    列出一堆 Python」就是 Inno 的「文件正在使用中」框（我们的预杀没赶干净时）。
+;    `force` = 不弹框直接关；`RestartApplications=no` = 关掉之后不要 Inno 自作主张
+;    重启（重启由我们自己的 RestartAppTask 统一负责，否则会多起一份）。
+CloseApplications=force
+RestartApplications=no
 ; 控制面板「应用和功能」里显示的名字 + 图标（用品牌标 installer.ico）
 UninstallDisplayName=摸鱼bot
 UninstallDisplayIcon={app}\icons\installer.ico
@@ -96,25 +103,52 @@ const
       源码版跑的是同一个 pythonw.exe、用的是同一个任务名 MoyuBot ——
       无脑杀 / 无脑删会把开发机上正在跑的实例一起干掉。 }
 
+{ 停掉指向本安装目录的「开机自启」计划任务（只有装 / 卸时用）。
+
+  🔴 这是「装的时候报错、下方列出一堆 Python」的**另一半原因**：
+     自启任务注册时带了 RestartCount=3 / RestartInterval=1min（任务失败后自动重启）。
+     我们刚把管家杀掉，任务计划程序过一会儿又把任务拉起来 —— 新起的 pythonw
+     立刻占住 app\py\pythonw.exe，[Files] 就替换不掉，Inno 于是弹出
+     「文件正在使用中」并列出那几个 Python 进程；用户只能重启机器绕过。
+     先停任务、再杀进程，才不会「边杀边生」。装完 RestartAppTask 会再拉起来。 }
+procedure StopAppTask(const DataDir: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+       '-NoProfile -ExecutionPolicy Bypass -Command ' +
+       '"$t = Get-ScheduledTask -TaskName ''' + TaskName + ''' -ErrorAction SilentlyContinue; ' +
+       'if ($t -and ($t.Actions | Where-Object { $_.Execute -like ''' + DataDir + '\*'' })) ' +
+       '{ Stop-ScheduledTask -TaskName ''' + TaskName + ''' -ErrorAction SilentlyContinue }"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 { 杀掉安装目录里跑着的 pythonw / python（机器人和脑内抽屉都是它们跑的）。
   装和卸都要用：不杀它们，它们占着 app\ 下的文件，文件替换不掉、也删不干净。
   快捷方式一律用 pythonw.exe；带上 python.exe 是防有人手动用控制台版跑过。
 
   🔴 杀完要等它们真的退干净再返回 —— Stop-Process 返回时文件句柄不一定已释放，
      紧接着就开始复制文件的话，照样会撞上「正在使用中」。
-     循环重查（最多 20 轮 × 250ms）：第一轮杀掉、第二轮查空就 break，
-     正常情况约 250ms 返回，杀不掉的顽固进程最多等 5 秒也不会卡死。 }
+     循环重查（最多 40 轮 × 250ms）：第一轮杀掉、第二轮查空就 break，
+     正常情况约 250ms 返回，杀不掉的顽固进程最多等 10 秒也不会卡死。
+  🔴 匹配条件**两条都算**：
+     ① 可执行文件路径在安装目录下（正常安装版跑的就是它）；
+     ② 命令行里带 `memo-launcher.py` —— 旧版 / 手动从别处拉起、或用户把
+        解释器换成别的 Python 时，① 匹配不到，② 能兜住。
+     两条都不误伤开发机上其它无关的 python 进程。 }
 procedure KillAppProcesses(const DataDir: String);
 var
   ResultCode: Integer;
   Ps: String;
 begin
   Ps := '$n = ''' + DataDir + '\*''; ' +
-        'for ($i = 0; $i -lt 20; $i++) { ' +
-        '$p = Get-Process pythonw,python -ErrorAction SilentlyContinue | ' +
-        'Where-Object { $_.Path -like $n }; ' +
+        'for ($i = 0; $i -lt 40; $i++) { ' +
+        '$p = Get-CimInstance Win32_Process -Filter "Name=''pythonw.exe'' or Name=''python.exe''" ' +
+        '-ErrorAction SilentlyContinue | ' +
+        'Where-Object { ($_.ExecutablePath -and $_.ExecutablePath -like $n) -or ' +
+        '($_.CommandLine -and $_.CommandLine -like ''*memo-launcher.py*'') }; ' +
         'if (-not $p) { break }; ' +
-        '$p | Stop-Process -Force -ErrorAction SilentlyContinue; ' +
+        '$p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; ' +
         'Start-Sleep -Milliseconds 250 }';
   Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -Command "' + Ps + '"',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -165,6 +199,8 @@ end;
   我们先把它杀掉，Inno 就没得可问了。 }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  { 🔴 顺序不能反：先停任务（断掉「失败自动重启」这条生路），再杀进程。 }
+  StopAppTask(ExpandConstant('{app}'));
   KillAppProcesses(ExpandConstant('{app}'));
   Result := '';
 end;
@@ -176,12 +212,22 @@ begin
     RestartAppTask(ExpandConstant('{app}'));
 end;
 
+{ 🔴 兜底：用户**中途取消**安装时，任务已经被我们停掉了 —— 不补这一下，
+   「开机自启」就平白失效了（任务还在，只是停着，下次登录也不会跑）。
+   DeinitializeSetup 在成功 / 取消 / 异常退出时都会走，是唯一稳的落点。
+   装成功时 RestartAppTask 已经拉过一次，这里再调是幂等的。 }
+procedure DeinitializeSetup();
+begin
+  RestartAppTask(ExpandConstant('{app}'));
+end;
+
 { 卸载前干两件事：
   ① 停掉安装目录里跑着的 pythonw（机器人 / 脑内抽屉）—— 否则它占着 app\ 下的文件，
      卸载删不掉，会留下一堆残骸；
   ② 删掉「开机自启」的计划任务 —— 但**只删指向本安装目录的那个**。 }
 function InitializeUninstall(): Boolean;
 begin
+  StopAppTask(ExpandConstant('{app}'));
   KillAppProcesses(ExpandConstant('{app}'));
   RemoveAppTask(ExpandConstant('{app}'));
   Result := True;
@@ -197,7 +243,7 @@ begin
   DataDir := ExpandConstant('{localappdata}\memo-bot');
   if DirExists(DataDir) then
     MsgBox('卸载完成。' + #13#10 + #13#10 +
-           '你的数据（备忘 / 灵感 / 配置）还留在这个文件夹里：' + #13#10 +
+           '你的数据（待办 / 灵感 / 配置）还留在这个文件夹里：' + #13#10 +
            DataDir + #13#10 + #13#10 +
            '想彻底清干净，手动删掉它就行。', mbInformation, MB_OK);
 end;

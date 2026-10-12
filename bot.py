@@ -3,7 +3,7 @@
 这个文件是干嘛的：
   - 常驻跑着（由计划任务 `MoyuBot` 托管），用 QQ 官方机器人 WebSocket 长连接收消息；
   - 群消息与私聊消息都进 `route_message()`，依次过：
-    忽略表 → 「设置」指令 → 扩展指令 → 内置指令（备忘 / 查备忘 / 查灵感 / 你好 /
+    忽略表 → 「设置」指令 → 扩展指令 → 内置指令（待办 / 查待办 / 查灵感 / 你好 /
     发文件 / 摸鱼 / 回旋镖 / 导出 / 帮助）→ 都没命中就兜底**静默收作灵感**；
   - 数据落 `store.py`（SQLite）；发文件走 `send_file.py`（纯 HTTP，不占长连接）；
   - 配置读两处：`settings.py`（本机设置，可网页改）+ `.env`（凭据 / 路径）。
@@ -18,7 +18,7 @@
 
 三种运行方式：
   python bot.py --self-test   本地模拟群消息，验证识别+落库逻辑（无需 QQ 凭据）
-  python bot.py --list        打印最近记录的备忘（本地读取用）
+  python bot.py --list        打印最近记录的待办（本地读取用）
   python bot.py              真实启动 bot（需配置 .env 里的 QQ 凭据）
 
 三条入口（群与私聊共用同一套指令与识别逻辑）：
@@ -64,7 +64,6 @@ from store import (
     STATUS_DECIDED,
     pick_boomerang,
     count_boomerang,
-    mark_boomerang,
 )
 import moyu
 import extensions as _ext
@@ -163,11 +162,11 @@ try:
 except Exception:
     pass
 
-TRIGGER = os.getenv("MEMO_TRIGGER", "备忘").strip()
+TRIGGER = os.getenv("MEMO_TRIGGER", "待办").strip()
 
 
 def extract_memo(text):
-    """从一条群消息里抽取备忘内容。支持前缀触发词，且前面可带 @机器人。"""
+    """从一条群消息里抽取待办内容。支持前缀触发词，且前面可带 @机器人。"""
     if not text:
         return None
     t = strip_at(text)
@@ -373,14 +372,14 @@ def check_image_alert():
 # 内置指令的菜单；扩展指令的帮助行由 help_text() 追加（见文件后半的扩展加载）。
 HELP_BASE = (
     "🐟 摸鱼bot 指令：\n"
-    "备忘 <内容> —— 记一条备忘\n"
-    "查备忘 —— 看最近 10 条备忘\n"
+    "待办 <内容> —— 记一条待办\n"
+    "查待办 —— 看最近 10 条待办\n"
     "查灵感 —— 看还没处理的灵感\n"
     "搜索灵感 <关键词> —— 在灵感里搜（正文 / 标签 / 结论都算）\n"
     "发文件 <关键词> —— 在配置中心「④ 发文件」设的目录里搜文件、渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
     "回旋镖 [天数] —— 把 N 天前（默认 3 天）记过的旧账翻一条回来\n"
-    "导出 [格式] —— 把全部备忘 + 灵感导成一个文件发给你（格式 md / txt / json / zip）\n"
+    "导出 [格式] —— 把全部待办 + 灵感导成一个文件发给你（格式 md / txt / json / zip）\n"
     "            zip 连收进来的图片原图一起打包（太大发不出来时会告诉你去哪拿）\n"
     "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
@@ -391,7 +390,7 @@ HELP_BASE = (
     "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰\n"
     "写灵感带 # 号：# 后面的内容自动存成标签（空格 / 标点分隔多个）"
 )
-MEMO_LIST_CMDS = {"查备忘", "查看备忘", "备忘列表", "列备忘"}
+MEMO_LIST_CMDS = {"查待办", "查看待办", "待办列表", "列待办"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
 HELP_CMDS = {"帮助", "菜单", "指令", "help"}
 # 「你好」= 自我介绍。回复内容 = 设置里的「功能介绍」（首次上线发的也是它），
@@ -400,7 +399,7 @@ HELLO_CMDS = {"你好", "您好", "hi", "hello", "嗨"}
 # 设置里「功能介绍」被清空时的兜底 —— 保证「你好」永远有话说。
 HELLO_FALLBACK = (
     "你好，我是摸鱼bot 🐟\n"
-    "我只会记事和搬文件：记备忘、收灵感、搜索灵感、发文件、摸鱼、回旋镖、导出。\n"
+    "我只会记事和搬文件：记待办、收灵感、搜索灵感、发文件、摸鱼、回旋镖、导出。\n"
     "写灵感时加 #标签，之后可以按标签找回来。\n"
     "我没有语言生成能力，不会聊天、也不会回答问题。\n"
     "发「帮助」看完整指令。"
@@ -441,7 +440,7 @@ def mark_onboarded():
 # ── 回旋镖：把 N 天以前的旧记录翻一条推回给用户 ───────────────────
 # 指令词只认完整写法，不用「镖」「回旋」这种短词 —— 否则「飞镖」「回旋踢」会被误判。
 BOOMERANG_CMDS = ("回旋镖", "回旋标")
-# ── 导出：把全部备忘 + 灵感导成一个文件发回来 ─────────────────────
+# ── 导出：把全部待办 + 灵感导成一个文件发回来 ─────────────────────
 EXPORT_CMDS = ("导出",)
 # ── 「摸鱼」：随机抽一条放松/摸鱼/冷知识 ───────────────────────────
 # 指令识别在 moyu.parse() 里（归一化 + 前缀匹配），这里不重复写正则。
@@ -518,7 +517,10 @@ def boomerang_text(days=None, now=None):
     """回旋镖的回复文案：从「N 天以前」的旧记录里随机挑一条。
 
     🔴 **哪发的指令就推回哪** —— 这里只生成文本，具体发到群还是私聊由
-    route_message 用当前这条 message 决定。挑过的会打上 boomerang_at，不再重复推。
+    route_message 用当前这条 message 决定。
+
+    🔴 **抽出来的卡片放回池子**（用户 2026-10-12）：挑中的那条不打标记、池子不变，
+    同一条可以被反复抽到（连着两次抽到同一张也算数）。
     """
     now = now or datetime.now()
     if days is None:
@@ -527,22 +529,20 @@ def boomerang_text(days=None, now=None):
 
     item = pick_boomerang(days, scope, now)
     if not item:
-        # 区分「还没攒够天数」和「都推完了」—— 否则用户分不清是没记录还是推过一轮了
-        # 🔴 days=0 时不会有「还没满 0 天」这种话：那时候池子只要非空就一定能挑到，
-        #    挑不到只能是「都推完了」，所以自动落到下面那条。
+        # 只有两种「挑不到」：① 范围内有记录、但都还没满天数；② 范围内压根没记录。
+        # 🔴 不会再有「都推过一遍了」—— 池子不再减少（同一条能反复抽到）。
         if count_boomerang(0, scope, now):
             return (f"🪃 还没有满 {days} 天的旧记录，再等等。\n"
                     f"（可推范围在「配置中心 → 回旋镖」里改；回溯天数填 0 就能翻今天记的）")
-        return ("🪃 旧记录都推过一遍了。\n"
-                "（同一条不会推第二次；新记的满天数后会再进池子）")
+        return ("🪃 这个范围里还没有记录可翻。\n"
+                "（先去记两条；也可以到「配置中心 → 回旋镖」把推送范围放宽）")
 
-    mark_boomerang(item["id"])
     created = item.get("created_at") or ""
     try:
         ago = (now - datetime.fromisoformat(created)).days
     except ValueError:
         ago = days
-    verb = "记过一条备忘" if item.get("kind") == KIND_MEMO else "冒出过一个想法"
+    verb = "记过一条待办" if item.get("kind") == KIND_MEMO else "冒出过一个想法"
     note = (item.get("note") or "").strip()
     tail = f"\n\n【当时的结论】{note}" if note else ""
     # 回溯天数可以是 0（今天记的也翻得到）—— 那时候别写「0 天前」，说「今天」
@@ -554,7 +554,7 @@ def boomerang_text(days=None, now=None):
             f"…还有后续吗？")
 
 
-# ── 导出：把全部备忘 + 灵感导成一个文件发回来 ─────────────────────
+# ── 导出：把全部待办 + 灵感导成一个文件发回来 ─────────────────────
 def parse_export(text):
     """`导出` / `导出 md` / `导出 json` / `导出 zip` → (True, 格式或 None)；不是指令 → (False, None)。"""
     t = (text or "").strip()
@@ -574,7 +574,7 @@ def memo_list_text(limit=10, kind=KIND_MEMO):
     is_memo = kind == KIND_MEMO
     if is_memo:
         rows = list_memos(limit, kind)
-        label, icon = "备忘", "📝"
+        label, icon = "待办", "📝"
         head = f"{icon} 最近 {len(rows)} 条{label}："
     else:
         # 灵感只看「待处理」——处理过的在电脑上用脑内抽屉看
@@ -598,7 +598,7 @@ def memo_list_text(limit=10, kind=KIND_MEMO):
 
 # ── 「搜索灵感 <关键词>」：在灵感里按正文 / 标签 / 结论搜 ────────────
 # 🔴 @ 与非 @ 都认：非 @ 群消息也认，不然「搜索灵感 设计」会被当成普通
-#    发言收成灵感，越收越乱（和查备忘 / 查灵感 同一处理）。
+#    发言收成灵感，越收越乱（和查待办 / 查灵感 同一处理）。
 # 🔴 「已处理 / 已决议」对外一律报「已整理」（用户 2026-10-12 简化）；
 #    库里的 status 不动，decided 照常算进已整理。
 IDEA_SEARCH_RE = re.compile(r"^(?:搜索灵感|搜灵感|灵感搜索|搜索)\s*(.+)$", re.S)
@@ -885,7 +885,7 @@ class _FakeEv:
 def self_test():
     """本地模拟群消息，验证识别 + 落库逻辑。
 
-    🔴 落盘走**临时库**，不碰真实 `memos.db`（否则每跑一次就污染真实备忘）。
+    🔴 落盘走**临时库**，不碰真实 `memos.db`（否则每跑一次就污染真实待办）。
     """
     import store as _store
 
@@ -895,15 +895,15 @@ def self_test():
     try:
         init()
         samples = [
-            _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘 明天确认云托管最小实例数"),
-            _FakeEv("123", "示例开发群", "dominik", "dominik", "@机器人 备忘 备案变更还差营业执照"),
-            _FakeEv("123", "示例开发群", "dominik", "dominik", "这只是普通聊天不是备忘"),
-            _FakeEv("123", "示例开发群", "dominik", "dominik", "备忘：把事件系统文档补完"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "待办 明天确认云托管最小实例数"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "@机器人 待办 备案变更还差营业执照"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "这只是普通聊天不是待办"),
+            _FakeEv("123", "示例开发群", "dominik", "dominik", "待办：把事件系统文档补完"),
         ]
         print("=== 模拟群消息识别 ===")
         for s in samples:
             r = handle_event(s.group_id, s.group_name, s.sender_id, s.sender_name, s.message)
-            print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非备忘）'}")
+            print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非待办）'}")
         print("\n=== 「#」标签切分（split_tags）===")
         for s in ("参考这个配色 #设计 UI",
                   "参考配色#设计",
@@ -926,10 +926,10 @@ def list_mode():
     init()
     rows = list_memos()
     if not rows:
-        print("（暂无备忘 / 灵感）")
+        print("（暂无待办 / 灵感）")
         return
     for m in rows:
-        tag = "备忘" if m.get("kind") == KIND_MEMO else "灵感"
+        tag = "待办" if m.get("kind") == KIND_MEMO else "灵感"
         print(f"[{m['created_at']}] ({tag}) {m['group_name']}/{m['sender_name']}: {m['content']}")
 
 
@@ -1134,7 +1134,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         await message.reply(content=reply, msg_seq=1)
         return
 
-    # 1.9) 导出：把全部备忘 + 灵感导成一个文件发回来（群 / 私聊都可用）
+    # 1.9) 导出：把全部待办 + 灵感导成一个文件发回来（群 / 私聊都可用）
     is_ex, ex_fmt = parse_export(text)
     if is_ex:
         fname, data = _export.render(ex_fmt)
@@ -1164,7 +1164,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
-    # 2) 查备忘 / 查灵感 / 你好 / 帮助
+    # 2) 查待办 / 查灵感 / 你好 / 帮助
     if text in MEMO_LIST_CMDS:
         await message.reply(content=memo_list_text(10, KIND_MEMO), msg_seq=1)
         return
@@ -1190,14 +1190,14 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         await message.reply(content=help_text(), msg_seq=1)
         return
 
-    # 4) 记备忘（@ 或不 @ 都认「备忘」触发词）
+    # 4) 记待办（@ 或不 @ 都认「待办」触发词）
     result = handle_event(t["store_id"], t["store_name"], t["sender_id"], "", raw)
     if result:
-        # 🔴 备忘是「明确要记」的 —— 这时才把图和它绑在一起
+        # 🔴 待办是「明确要记」的 —— 这时才把图和它绑在一起
         pics = await collect_images_async(message, scope)
         if pics:
             _attach_images(result["id"], pics)
-        print(f"[备忘] {gid} -> {result['content']}"
+        print(f"[待办] {gid} -> {result['content']}"
               f"{f'（+{len(pics)} 图）' if pics else ''}", flush=True)
         ack = (_settings.get("memo_ack") or "").strip()   # 留空 = 静默记下，不回执
         if ack:
@@ -1209,25 +1209,24 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
 
     # 4.5) 兜底
     #   私聊：一切非指令文本都收作灵感（私聊没有「打扰群」的顾虑）
-    #   @ 群消息：明确回一句，避免「@ 了却没反应」分不清是没识别还是挂了
+    #   @ 群消息：也收作灵感 —— @ 就是在**直接跟机器人说话**，按「灵感回执」回一句；
+    #             没配回执就回「没认出来」，免得「@ 了却没反应」分不清是没识别还是挂了
     #   非 @ 群消息：静默落灵感，不把群聊变成机器人频道
     if scope == SCOPE_C2C:
         await _store_media(message, t, scope, urls, text.strip(), mentioned)
         return
     if mentioned:
-        # 🔴 @ 了但没认出指令 —— 但如果带了图，图还是要按开关收的
-        #    （用户发了图 + @ 机器人，意思就是「给我存着」）
-        pics = await collect_images_async(message, scope)
-        if pics:
-            _txt, _tags = split_tags(text.strip())
-            idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                            _txt or _IMAGE_ONLY_TEXT, kind=KIND_IDEA,
-                            images=pics, tags=_tags or None)
-            print(f"[图·@] {gid} -> {idea['id']}（{len(pics)} 图）", flush=True)
-        print(f"[未识别] @消息 text={text!r}", flush=True)
-        await message.reply(
-            content="（没认出来这条指令，发「帮助」看菜单）", msg_seq=1
-        )
+        # 🔴 以前这里**只收图、正文直接丢**，回一句「没认出来」—— 于是「灵感回执」
+        #    在群里**永远不生效**（用户 2026-10-12 报的「配了灵感回执也不生效」：
+        #    私聊那条路会回执，群里这条路根本不走 idea_ack）。
+        #    现在统一走 `_store_media`（正文 + 图一起收，并按需回执），
+        #    没配回执时再补一句「没认出来」，行为与以前一致、但不再丢正文。
+        await _store_media(message, t, scope, urls, text.strip(), mentioned)
+        if not (_settings.get("idea_ack") or "").strip():
+            print(f"[未识别] @消息 text={text!r}", flush=True)
+            await message.reply(
+                content="（没认出来这条指令，发「帮助」看菜单）", msg_seq=1
+            )
         return
 
     # 5) 非 @ 的普通文本 → 自动收作「灵感」（静默，不打扰群）

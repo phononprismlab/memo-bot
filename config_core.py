@@ -267,7 +267,7 @@ def browse_dirs(path):
 from botctl import (  # noqa: E402,F401
     bot_running, bot_pid, _pid_alive,
     bot_start, bot_stop, bot_restart,
-    task_state, autostart_set, _pythonw, _powershell,
+    task_state, autostart_set, autostart_state, _pythonw, _powershell,
 )
 
 
@@ -386,8 +386,8 @@ ENV_SPEC = {
         "check": lambda v: None,
     },
     "MEMO_TRIGGER": {
-        "label": "备忘触发词", "group": "behavior", "default": "备忘",
-        "help": "群消息以它开头就记为一条备忘",
+        "label": "待办触发词", "group": "behavior", "default": "待办",
+        "help": "消息以它开头就记为一条待办（私聊、群聊都认）",
         "check": lambda v: None if (v and " " not in v) else "不能为空、不能含空格",
     },
     "MEMO_SEARCH_ROOT": {
@@ -411,13 +411,18 @@ ENV_SPEC = {
 #    所以「播报文案」与「回执文案」分开 —— 三段长文案塞一块必然超屏。
 GROUPS = [
     ("bot", "① 连接 QQ", "在 https://q.qq.com 创建机器人后，把凭据填进来。必填。"),
-    ("behavior", "② 群内行为", "备忘触发词、记下备忘 / 收到灵感后回的那句话，以及"
-                              "忽略表（别把同群其他机器人的话当内容收）。"),
+    # 🔴 标题不叫「群内行为」—— 这一块的设置在**私聊和群聊都生效**（触发词、
+    #    回执、忽略表对两种会话一视同仁），叫「群内」会让人以为私聊不管用。
+    ("behavior", "② 消息行为", "待办触发词、记下待办 / 收到灵感后回的那句话，以及"
+                              "忽略表（别把同群其他机器人的话当内容收）。"
+                              "这些设置私聊和群聊都生效。"),
     ("msg", "③ 播报", "机器人上线时说什么、第一次连上时怎么介绍自己，"
                   "以及播报发到哪些会话。"),
     ("files", "④ 发文件", "「发文件」功能的检索范围。"),
-    ("bubbles", "⑤ 脑内抽屉", "轮播页里放哪几类（备忘 / 灵感）。"),
-    ("boomerang", "⑥ 回旋镖", "发一条「回旋镖」，把记过的旧账翻一条推回来给你看。下面两项是它的细节设置。"),
+    ("bubbles", "⑤ 脑内抽屉", "轮播页里放哪几类（待办 / 灵感）。"),
+    ("boomerang", "⑥ 回旋镖", "发一条「回旋镖」，把记过的旧账翻一条推回来给你看。"
+                             "下面两项是它的细节设置；推送范围跟「⑤ 脑内抽屉」的"
+                             "展示范围是同一套分类。"),
     ("runtime", "⑦ 运行方式", "开机自启、机器人进程、依赖自检。"),
     ("moyu", "⑧ 摸鱼库", "「摸鱼」随机抽的那些内容，一行一条。改完保存立刻生效，不用重启。"),
     ("ext", "⑨ 自定义指令", "导入别人做好的指令包（.py / .zip），或把你自己的指令导出分享。"
@@ -504,7 +509,11 @@ def full_state():
         "ok": True,
         "fields": state_fields(),
         "groups": [{"key": k, "title": t, "desc": d} for k, t, d in GROUPS],
-        "bot": {"running": bool(pid), "pid": pid, "task": st, "task_name": TASK_NAME},
+        # 🔴 `autostart` 是「开机自启开关」的**唯一判据**（= 计划任务存在且可用）。
+        #    以前界面拿 `task == "running"` 判断 —— 自启任务注册后状态是 **ready**
+        #    而不是 running，于是「明明开了却显示关闭」（用户 2026-10-12 报的）。
+        "bot": {"running": bool(pid), "pid": pid, "task": st, "task_name": TASK_NAME,
+                "autostart": autostart_state()},
         "deps": dep_report(),
         "ignore": {"env": _ignore.env_rules(), "file": _ignore.file_rules()},
         "moyu": {

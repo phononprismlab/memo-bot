@@ -270,8 +270,65 @@ def _act_toggle_autostart(icon, item):
         print(f"[管家] 开机自启切换失败：{msg}", flush=True)
 
 
+# ── 托盘「退出」：先确认，再联动关窗口 ────────────────────────────
+def _confirm_exit():
+    """弹一个**原生**确认框 → True 表示用户确认退出。
+
+    🔴 用 Win32 的 `MessageBoxW`，不碰 Tk：托盘菜单的回调跑在 pystray 的
+       独立线程里，在那里建 Tk 根窗口会和桌面窗口那个进程抢单例、也容易卡。
+       原生框跨线程随便用，也不需要额外依赖。
+    🔴 默认按钮放在「否」上（`MB_DEFBUTTON2`）：敲回车不会误退出。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        MB_YESNO = 0x00000004
+        MB_ICONWARNING = 0x00000030
+        MB_DEFBUTTON2 = 0x00000100
+        MB_TOPMOST = 0x00040000
+        MB_SETFOREGROUND = 0x00010000
+        IDYES = 6
+        text = ("退出会一并关闭摸鱼bot：桌面窗口和后台机器人都会停掉，\n"
+                "退出后机器人不再收发消息（直到下次启动）。\n\n"
+                "确定要退出吗？")
+        r = ctypes.windll.user32.MessageBoxW(
+            0, text, "摸鱼bot",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND)
+        return r == IDYES
+    except Exception:  # noqa: BLE001  弹不出来就别拦着用户退出
+        return True
+
+
+def _close_gui_window():
+    """把已经开着的桌面窗口关掉（发 `WM_CLOSE`，等价于点窗口右上角的 ×）。
+
+    🔴 桌面窗口是**独立进程**（`--gui`），托盘退出不会自动带走它 ——
+       用户点了托盘「退出」却发现窗口还杵在桌面上（用户 2026-10-12 报的
+       「托盘退出后窗口没有自动关闭」）。
+    🔴 窗口可能是**托盘菜单后来拉起来的**（`_launch_gui`），那种不在 `children`
+       里、拿不到 Popen 句柄 —— 所以按窗口标题找主窗口发消息，这是唯一
+       对「谁开的」都管用的办法。找不到窗口（本来就没开）就静默跳过。
+    🔴 `FindWindowW.restype` 必须显式设成 `c_void_p`：默认 `c_int` 会把
+       64 位窗口句柄截断，`PostMessageW` 于是发给了不存在的窗口。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p
+        hwnd = u.FindWindowW(None, "摸鱼bot")
+        if hwnd:
+            u.PostMessageW(ctypes.c_void_p(hwnd), 0x0010, 0, 0)     # WM_CLOSE
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _act_exit(icon, item):
-    """托盘「退出」→ 通知主循环收尾（停子服务 + 机器人），再摘掉图标。"""
+    """托盘「退出」→ 先确认，再通知主循环收尾（关窗口 + 停机器人），最后摘图标。"""
+    if not _confirm_exit():
+        return                       # 用户点了「否」：什么都不做，图标继续挂着
     _exit_requested.set()
     try:
         icon.stop()
@@ -393,6 +450,9 @@ def main():
     except KeyboardInterrupt:
         print("\n[管家] 收到 Ctrl+C，正在收尾…", flush=True)
     finally:
+        # 🔴 先关桌面窗口：它是独立进程，不主动关就会留在桌面上
+        #    （托盘菜单后来拉起来的那个不在 `children` 里，所以统一按窗口标题关）。
+        _close_gui_window()
         if bot_wanted:
             botctl.bot_stop()
         for c in children:

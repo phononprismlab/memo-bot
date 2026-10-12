@@ -1,11 +1,11 @@
-"""本地存储层：群备忘 / 灵感落 SQLite（单文件，本机任何程序可直接读）。
+"""本地存储层：群待办 / 灵感落 SQLite（单文件，本机任何程序可直接读）。
 
 两条流：
-  kind='memo' —— 明确标记的备忘（@bot 发「备忘 xxx」，或「备忘」前缀）
+  kind='memo' —— 明确标记的待办（@bot 发「待办 xxx」，或「待办」前缀）
   kind='idea' —— 群里非 @ 的普通文本，自动收集为灵感
 
 🔴 库**第一次建出来**时会塞几条示例（`SEED_ITEMS`）—— 三条灵感介绍页面能干什么、
-   一条备忘介绍怎么用摸鱼bot，免得新用户打开脑内抽屉看到一片空白。
+   一条待办介绍怎么用摸鱼bot，免得新用户打开脑内抽屉看到一片空白。
    老库不塞；`MEMO_NO_SEED=1` 可关。
 
 生产替换：把这里换成 CloudBase PostgreSQL 的 bot_memos 表即可，接口不变。
@@ -53,8 +53,8 @@ DB = data_path("memos.db")
 KIND_MEMO = "memo"
 KIND_IDEA = "idea"
 
-# 记录状态。灵感（kind='idea'）四态都用；备忘（kind='memo'）只用 open / done / dropped
-# （没有「已决议」—— 备忘是「我要做」，要么做完，要么不做了）。
+# 记录状态。灵感（kind='idea'）四态都用；待办（kind='memo'）只用 open / done / dropped
+# （没有「已决议」—— 待办是「我要做」，要么做完，要么不做了）。
 STATUS_OPEN = "open"          # 待处理 / 没完成
 STATUS_DONE = "done"          # 已处理 / 已完成
 STATUS_DECIDED = "decided"    # 已决议（有结论，但不产生行动）—— 只有灵感用
@@ -68,7 +68,7 @@ TAG_NAME_MAX = 20             # 标签名 trim 后最长几个字（1 是下限�
 DEFAULT_TAG_COLOR = "#4fd1c5"
 
 # ── 首次使用：塞几条示例，别让新用户打开抽屉看到一片空白 ──────────────
-# 三条灵感介绍页面能干什么，一条备忘介绍怎么用摸鱼bot。
+# 三条灵感介绍页面能干什么，一条待办介绍怎么用摸鱼bot。
 # 🔴 **只在 `memos` 表第一次建出来的时候塞**（判据是建表前它还不存在）——
 #    老库绝不塞：用户可能已经把示例处理掉了，不能又给他塞回来。
 # 🔴 设 `MEMO_NO_SEED=1` 可以关掉（测试、以及想要空库的人）。
@@ -346,7 +346,7 @@ def set_item_images(item_id, paths):
     """**覆盖**某条记录的图片路径。返回改动条数。
 
     为什么要「先入库再补」：正文和图片是两步（图要下载，慢），
-    但正文不能等下载完才落库 —— 万一下载卡住，用户那条备忘就丢了。
+    但正文不能等下载完才落库 —— 万一下载卡住，用户那条待办就丢了。
     所以先写正文、拿到 id，再把图挂上去。
     """
     if not item_id:
@@ -514,7 +514,7 @@ def list_ideas(status=None, limit=500, newest_first=False):
 
 
 def query_items(kinds=None, statuses=None, text=None, limit=300, offset=0):
-    """按条件从库里**取一页**条目（备忘 + 灵感混排，时间倒序）。
+    """按条件从库里**取一页**条目（待办 + 灵感混排，时间倒序）。
 
     为什么要它：抽屉的列表 / 搜索以前是「先 `list_memos(500)` + `list_ideas(500)`
     把固定窗口全捞进内存，再在界面上过滤」—— 记录一旦超过 500 条，更早的数据
@@ -627,8 +627,8 @@ def set_idea_status(ids, status, note=None):
     return n
 
 
-# ── 备忘：没完成 / 已完成 / 已丢弃 三态 ──────────────────────────
-# 备忘 = 我要做（kind='memo'），复用 status 列：
+# ── 待办：没完成 / 已完成 / 已丢弃 三态 ──────────────────────────
+# 待办 = 我要做（kind='memo'），复用 status 列：
 #   open = 没完成，done = 已完成，dropped = 已丢弃（不做了 / 作废）。
 # 🔴 「已完成」和「已丢弃」都**不是删除**：行还在表里，随时能取消 / 恢复。
 #    真要抹掉得走 delete_items()（页面上「已丢弃」列表里的「永久删除」）。
@@ -638,7 +638,7 @@ MEMO_STATUSES = (STATUS_OPEN, STATUS_DONE, STATUS_DROPPED)
 
 
 def set_memo_status(ids, status):
-    """批量改备忘状态（open / done / dropped）。返回实际改动条数。
+    """批量改待办状态（open / done / dropped）。返回实际改动条数。
 
     🔴 `kind='memo'` 过滤在 SQL 里 —— 传进来灵感 id 也不会被误改。
     """
@@ -659,7 +659,7 @@ def set_memo_status(ids, status):
 
 
 def set_memo_done(ids, done=True):
-    """批量完成 / 取消完成备忘。返回实际改动条数。
+    """批量完成 / 取消完成待办。返回实际改动条数。
 
     保留这个签名是因为老调用方（离线操作文件 `抽屉操作.json` 里的 `{"done": true}`、
     老测试）还在用 —— 内部就是 `set_memo_status`。
@@ -668,7 +668,7 @@ def set_memo_done(ids, done=True):
 
 
 def delete_items(ids):
-    """**永久删除**这些记录（真删行，不可恢复）。备忘和灵感都能删。返回删除条数。
+    """**永久删除**这些记录（真删行，不可恢复）。待办和灵感都能删。返回删除条数。
 
     🔴 只给「已丢弃」列表的「永久删除」用。页面侧必须先弹确认框 ——
        这一层不做任何状态检查，调用方负责确认。
@@ -692,7 +692,7 @@ def delete_items(ids):
 def update_content(item_id, content):
     """**只改正文**，不碰创建时间。页面上「✏️ 编辑」走这里。
 
-    🔴 备忘和灵感都能改（不按 kind 过滤）。返回实际改动条数（id 不存在 → 0）。
+    🔴 待办和灵感都能改（不按 kind 过滤）。返回实际改动条数（id 不存在 → 0）。
     🔴 SQL 里**没有 created_at** —— 这是这个函数存在的全部意义。
     """
     if not item_id or content is None:
@@ -706,16 +706,15 @@ def update_content(item_id, content):
 
 
 # ── 回旋镖：把「N 天以前」的旧记录翻出来推回给用户 ────────────────
-# 一次只推一条，推过的记上时间戳（boomerang_at），下次不再推同一条。
-# 可推范围由 settings 的 `boomerang_scope` 决定（备忘 + 灵感各状态），
+# 可推范围由 settings 的 `boomerang_scope` 决定 —— 分类与「脑内抽屉展示范围」
+# **完全一致**（memo / memo_done / open / done / dropped）。
 # 这里是纯数据层：只认 code，不读设置。
-
-_SCOPE_TO_STATUS = {
-    "open": STATUS_OPEN,
-    "done": STATUS_DONE,
-    "decided": STATUS_DECIDED,
-    "dropped": STATUS_DROPPED,
-}
+#
+# 🔴 **抽出来的卡片会放回池子**（用户 2026-10-12）：回旋镖不再把抽中的那条
+#    标成「推过了」—— 池子始终不变，同一条可以被反复抽到（连着两次抽到同一张
+#    也算数）。所以下面的 WHERE 里**没有** `boomerang_at IS NULL` 这道闸。
+#    `memos.boomerang_at` 这一列与 `mark_boomerang()` 保留（历史数据 / 旧接口
+#    还在），但已经不再参与筛选。
 
 
 def _boomerang_where(days, scope, now=None):
@@ -724,31 +723,51 @@ def _boomerang_where(days, scope, now=None):
     🔴 `days=0` 是合法的：cutoff 就是 now，**今天刚记的也进池子** ——
        刚试用的用户发一句「回旋镖」立刻能看到效果，不该被「还没满 N 天」挡在门外。
     """
-    want_memo = "memo" in (scope or [])
-    statuses = [_SCOPE_TO_STATUS[s] for s in (scope or []) if s in _SCOPE_TO_STATUS]
+    want = {"done" if s == "decided" else s for s in (scope or [])}
+    branches = []
+    args = []
+
+    # 待办：memo = 未完成，memo_done = 已完成（同一 kind，两个状态）
+    memo_statuses = []
+    if "memo" in want:
+        memo_statuses.append(STATUS_OPEN)
+    if "memo_done" in want:
+        memo_statuses.append(STATUS_DONE)
+    if memo_statuses:
+        marks = ",".join("?" * len(memo_statuses))
+        branches.append(f"(kind = ? AND status IN ({marks}))")
+        args.extend([KIND_MEMO, *memo_statuses])
+
+    # 思绪：open = 未整理，done = 已整理
     # 🔴 「已整理」同时收纳 done / decided（展示层两种分法已合并，用户 2026-10-12）——
     #    范围里选了 done 就该把 decided 也带上，不然旧「已决议」条目凭空不再被翻。
-    if "done" in (scope or []) and STATUS_DECIDED not in statuses:
-        statuses.append(STATUS_DECIDED)
-    if not want_memo and not statuses:
+    idea_statuses = []
+    if "open" in want:
+        idea_statuses.append(STATUS_OPEN)
+    if "done" in want:
+        idea_statuses.extend([STATUS_DONE, STATUS_DECIDED])
+    if idea_statuses:
+        marks = ",".join("?" * len(idea_statuses))
+        branches.append(f"(kind = ? AND status IN ({marks}))")
+        args.extend([KIND_IDEA, *idea_statuses])
+
+    # 已丢弃：待办 / 思绪都可能被丢，不分 kind
+    if "dropped" in want:
+        branches.append("status = ?")
+        args.append(STATUS_DROPPED)
+
+    if not branches:
         return None, []
     cutoff = ((now or datetime.now()) - timedelta(days=int(days))).isoformat(timespec="seconds")
-    where = ["created_at <= ?", "boomerang_at IS NULL"]
-    args = [cutoff]
-    branches = []
-    if want_memo:
-        branches.append("kind = ?")
-        args.append(KIND_MEMO)
-    if statuses:
-        marks = ",".join("?" * len(statuses))
-        branches.append(f"(kind = ? AND status IN ({marks}))")
-        args.extend([KIND_IDEA, *statuses])
-    where.append("(" + " OR ".join(branches) + ")")
-    return " AND ".join(where), args
+    where = "created_at <= ? AND (" + " OR ".join(branches) + ")"
+    return where, [cutoff, *args]
 
 
 def pick_boomerang(days, scope, now=None):
-    """随机挑一条「days 天以前、且还没推过」的记录；没有候选返回 None。"""
+    """随机挑一条「days 天以前」的记录；没有候选返回 None。
+
+    🔴 抽出来的**不拿走** —— 池子恒定，同一条能被反复抽到（用户 2026-10-12）。
+    """
     clause, args = _boomerang_where(days, scope, now)
     if clause is None:
         return None
@@ -773,7 +792,11 @@ def count_boomerang(days, scope, now=None):
 
 
 def mark_boomerang(memo_id):
-    """记下「这条已经回旋镖过了」，下次不再推它。"""
+    """记下「这条已经回旋镖过了」。
+
+    🔴 **已不再被调用**（用户 2026-10-12：抽出来的卡片要放回池子，不减少池子）。
+       保留是为了历史数据 / 旧接口不炸；新代码请勿再调它。
+    """
     now = datetime.now().isoformat(timespec="seconds")
     con = sqlite3.connect(DB)
     con.execute("UPDATE memos SET boomerang_at=? WHERE id=?", (now, memo_id))

@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 REPO = "phononprismlab/memo-bot"
 RAW_URL = "https://cdn.jsdelivr.net/gh/{repo}@main/VERSION"
 # jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，HTTP 缓存 5 分钟，
@@ -70,6 +70,12 @@ def compare_version(a, b):
     return (pa > pb) - (pa < pb)
 
 
+# 🔴 绕开系统 / 环境变量里的代理（和 send_file.py、media.py 同一处理）：
+#    机器上留个「指向本机但已关掉」的代理时，`urlopen` 会一路吃
+#    `[WinError 10061] 积极拒绝`，检查更新就永远失败。更新源本来就直连。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _get(url, timeout):
     """取一个 URL 的文本。失败直接抛，由调用方汇总。
 
@@ -79,7 +85,7 @@ def _get(url, timeout):
         "User-Agent": "memo-bot-update-check",
         "Accept": "application/json, text/plain, */*",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 

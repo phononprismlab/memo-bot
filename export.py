@@ -1,11 +1,11 @@
-"""把备忘 / 灵感导出成一个文件（Markdown / 纯文本 / JSON / zip）。
+"""把待办 / 灵感导出成一个文件（Markdown / 纯文本 / JSON / zip）。
 
 这个文件是干嘛的：给「导出」指令和脑内抽屉的「导出」按钮**共用**，
    排版与格式只有这一处定义 —— 两边调的是同一个 `render()`。
   - `bot.py` 的「导出」指令：`render()` 落临时文件 → `send_file` 发回群里 / 私聊
   - `memo_gui.py`（脑内抽屉底部「导出」按钮）：`render()` 落盘后打开文件 / 所在目录
 
-导出内容 = **全部备忘**（kind=memo）+ **全部灵感**（kind=idea，含状态与结论），
+导出内容 = **全部待办**（kind=memo）+ **全部灵感**（kind=idea，含状态与结论），
 按时间**正序**（先记的在前），换行原样保留。
 
 🔴 `zip` 格式会**连图片原图一起打包**（`导出.md` + `导出.json` + `images/`）。
@@ -111,7 +111,7 @@ def filename(fmt="md", now=None):
 
 
 def collect():
-    """取全部备忘 + 灵感，各自按时间**正序**（老的在前）。
+    """取全部待办 + 灵感，各自按时间**正序**（老的在前）。
 
     `list_memos` 是倒序、`list_ideas` 是正序 —— 导出统一成正序，读起来才顺。
     """
@@ -163,11 +163,11 @@ def _pic_name(rel):
 def _render_md(memos, ideas, now):
     L = ["# 摸鱼bot 导出", "",
          f"- 导出时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
-         f"- 备忘 {len(memos)} 条 · 灵感 {len(ideas)} 条", ""]
+         f"- 待办 {len(memos)} 条 · 灵感 {len(ideas)} 条", ""]
 
-    L += [f"## 备忘（{len(memos)} 条）", ""]
+    L += [f"## 待办（{len(memos)} 条）", ""]
     if not memos:
-        L += ["_（还没有备忘）_", ""]
+        L += ["_（还没有待办）_", ""]
     for m in memos:
         L += [f"### {_when(m.get('created_at'))}", "", _quote(m.get("content"))]
         if m.get("note"):
@@ -199,11 +199,11 @@ def _render_md(memos, ideas, now):
 def _render_txt(memos, ideas, now):
     L = ["摸鱼bot 导出", "=" * 40,
          f"导出时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
-         f"备忘 {len(memos)} 条 · 灵感 {len(ideas)} 条", ""]
+         f"待办 {len(memos)} 条 · 灵感 {len(ideas)} 条", ""]
 
-    L += [f"── 备忘（{len(memos)} 条）" + "─" * 20, ""]
+    L += [f"── 待办（{len(memos)} 条）" + "─" * 20, ""]
     if not memos:
-        L += ["（还没有备忘）", ""]
+        L += ["（还没有待办）", ""]
     for m in memos:
         L += [f"[{_when(m.get('created_at'))}]", str(m.get("content") or "").strip()]
         if m.get("note"):

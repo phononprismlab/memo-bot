@@ -6,7 +6,7 @@
 实现说明：
 - 直接用 QQ 官方 REST API（stdlib urllib，零第三方依赖），不依赖 botpy。
   原因：本地文件上传方法 post_group_base64file 只在未合并的 PR 里，官方发布版没有。
-- 只用 HTTP，不启动 WebSocket 网关 → 可与常驻的收备忘 bot（bot.py）同时运行。
+- 只用 HTTP，不启动 WebSocket 网关 → 可与常驻的收待办 bot（bot.py）同时运行。
 - 群与单聊只有路径段不同（挂在 `/v2/` 下）：群 = `groups/{openid}`，单聊 = `users/{openid}`
   （scope 参数切换；默认群，向后兼容）。
 
@@ -166,16 +166,32 @@ def split_text(text, size=TEXT_CHUNK):
     return [c for c in chunks if c.strip()]
 
 
+# ── 网络出口：**绕开系统 / 环境变量里的代理** ─────────────────────
+# 🔴 踩过（2026-10-11/12 真机日志）：`urllib.request.urlopen` 默认吃
+#    `HTTP_PROXY` / `HTTPS_PROXY` 环境变量和 Windows 的 Internet 选项代理。
+#    一旦机器上留了个**指向本机、但已经关掉的**代理（Clash / 抓包工具 / 各种
+#    IDE 的调试代理都这么干），QQ 接口就全变成
+#    `URLError: [WinError 10061] 由于目标计算机积极拒绝` —— 表现为「启动播报
+#    发不出去」「下班播报全失败」。QQ 的开放接口本来就直连，走代理只有坏处。
+#    和 `media.py` 同一个处理：显式空 ProxyHandler。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # ── 瞬时错误重试 ────────────────────────────────────────────────
 # 305013 = QQ 内容安全审核服务超时；850027 = 发送数据超时；40093001 = 文件上传失败请重试
 RETRY_TIMES = 2
 RETRY_WAIT = 1.5
 RETRY_CODES = ("305013", "850027", "40093001")
+# 🔴 连不上 / 被拒绝 / 超时也当瞬时错误重试：机器刚开机时网络栈可能还没就绪，
+#    第一次请求吃一个 10061 / 10060 很正常，等 1.5 秒再试一次通常就过了。
+RETRY_NET = ("URLError", "10061", "10060", "10054", "Connection refused",
+             "Connection reset", "timed out")
 
 
 def _is_transient(err_text):
-    """这个错误是否值得重试（5xx / 已知的「请稍后重试」错误码）。"""
-    return "HTTP 5" in err_text or any(c in err_text for c in RETRY_CODES)
+    """这个错误是否值得重试（5xx / 已知的「请稍后重试」错误码 / 连接层抖动）。"""
+    return ("HTTP 5" in err_text
+            or any(c in err_text for c in RETRY_CODES)
+            or any(c in err_text for c in RETRY_NET))
 
 
 def _post_json(url, payload, headers=None, timeout=60, retries=RETRY_TIMES):
@@ -194,7 +210,7 @@ def _post_json(url, payload, headers=None, timeout=60, retries=RETRY_TIMES):
                 url, data=body, method="POST",
                 headers={"Content-Type": "application/json", **(headers or {})},
             )
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _OPENER.open(req, timeout=timeout) as r:
                 raw = r.read()
             return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:

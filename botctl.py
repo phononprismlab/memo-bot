@@ -302,22 +302,29 @@ def autostart_set(on):
     _TASK_CACHE["t"] = 0.0
     if rc != 0 or "OK" not in out:
         return False, out or "删除计划任务失败"
-        return True, "已关闭开机自启 —— 下次登录不再自动启动（正在跑的机器人不受影响）"
+    # 🔴 这行以前被缩进在 if 里面（永远执行不到）→ 成功关闭时函数**返回 None**，
+    #    调用方 `ok, msg = autostart_set(False)` 直接 `TypeError` 崩掉 ——
+    #    表现就是「开机自启打开了还关不掉」（用户 2026-10-12 报的）。
+    return True, "已关闭开机自启 —— 下次登录不再自动启动（正在跑的机器人不受影响）"
 
 
 def autostart_state():
-    """开机自启是否已开 —— 计划任务存在即算开（含被手动禁用的）。非 Windows 恒 False。
+    """开机自启是否已开 —— 计划任务**存在且可用**（ready / running）才算开。
 
-    托盘菜单的「开机自启：开/关」就是读它来显示当前状态、再调 `autostart_set` 翻转。
+    托盘菜单的「开机自启：开/关」和配置中心「⑦ 运行方式」的自启勾选框
+    都读它来显示当前状态、再调 `autostart_set` 翻转。
 
     🔴 **不能 `force=True`** —— 那会同步起一次 PowerShell（1.2 秒），
        而它是在**右键点托盘那一刻**被调用的，用户会看到菜单卡住不弹。
        这里只吃缓存（顺便让后台去刷），拿不到就按「没开」显示 ——
        反正真点了菜单项会走到 `autostart_set()`，那里是同步查的，不会误操作。
+    🔴 「unknown」（还没查到）也算没开：查完后台会刷成准的
+       （配置中心靠 `_poll_bot_status` 重画那一栏）。
+       「disabled」不算开 —— 任务被手动禁用了，登录时并不会跑。
     """
     if os.name != "nt":
         return False
-    return task_state() != "none"
+    return task_state() in ("ready", "running")
 
 
 def bot_stop():

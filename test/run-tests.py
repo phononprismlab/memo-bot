@@ -21,7 +21,7 @@
  [13] boomerang      回旋镖取数范围 + 导出打包
  [15] launcher       启动器：源码直跑不许改数据目录
   [16] onboarding     新手引导：「你好」自我介绍（写明无语言生成能力）、首次上线发介绍、
-                     之后只发启动播报、备忘 / 灵感回执可配
+                     之后只发启动播报、待办 / 灵感回执可配
   [17] moyu.library   摸鱼库可配置：内置只读种子 + 数据目录用户库、保存 / 校验 / 恢复默认、
                      读坏回退内置、改库清空「抽过哪些」
 
@@ -121,7 +121,7 @@ def test_moyu_parse():
     check("parse('摸鱼真爽') == badarg", moyu.parse("摸鱼真爽") == "badarg")
     check("parse('摸鱼bot真棒') == badarg", moyu.parse("摸鱼bot真棒") == "badarg")
     check("parse('今天不想摸鱼了') is None", moyu.parse("今天不想摸鱼了") is None)
-    check("parse('备忘 摸鱼') is None", moyu.parse("备忘 摸鱼") is None)
+    check("parse('待办 摸鱼') is None", moyu.parse("待办 摸鱼") is None)
     check("parse('') is None", moyu.parse("") is None)
 
 
@@ -179,7 +179,7 @@ def test_store():
         store.DB = os.path.join(tmpdir, "t.db")
         store.init()
 
-        a = store.add_memo("g", "gn", "s", "sn", "备忘一", kind=store.KIND_MEMO)
+        a = store.add_memo("g", "gn", "s", "sn", "待办一", kind=store.KIND_MEMO)
         b = store.add_memo("g", "gn", "s", "sn", "灵感一", kind=store.KIND_IDEA)
         check("add_memo 带 kind", a["kind"] == "memo" and b["kind"] == "idea")
         check("list_memos(memo) 只 1 条",
@@ -231,7 +231,7 @@ def test_store():
             store.DB = os.path.join(tmpdir, "fresh.db")
             store.init()
             seeded = store.list_memos(50)
-            check("🔴 全新库会塞示例（3 条灵感 + 1 条备忘）",
+            check("🔴 全新库会塞示例（3 条灵感 + 1 条待办）",
                   len(seeded) == 4
                   and len([r for r in seeded if r["kind"] == "idea"]) == 3
                   and len([r for r in seeded if r["kind"] == "memo"]) == 1,
@@ -445,7 +445,7 @@ def test_bot():
     check("help_text 指向配置中心「④ 发文件」",
           "④ 发文件" in bot.help_text())
 
-    check("help_text 含内置指令", "备忘" in bot.help_text())
+    check("help_text 含内置指令", "待办" in bot.help_text())
     check("help_text 追加了扩展帮助行",
           all(h in bot.help_text() for h in bot.EXT.help_lines()))
 
@@ -491,7 +491,7 @@ def test_bot():
         _r = bot.idea_search_text("设计")
         check("搜索灵感命中打了 #设计 标签的灵感",
               "首页改成浅色" in _r and "命中 1 条" in _r, f"got={_r.splitlines()[0]}")
-        check("搜索灵感不搜备忘（kind 闸在）",
+        check("搜索灵感不搜待办（kind 闸在）",
               "周报模板" not in _r, f"got={_r.splitlines()[0]}")
         check("搜索灵感命中正文",
               "买猫粮" in bot.idea_search_text("猫粮"))
@@ -580,8 +580,8 @@ def test_bot():
         _store.init()
         ct = bot.chat_target(c2c, bot.SCOPE_C2C)
         r = bot.handle_event(ct["store_id"], ct["store_name"], ct["sender_id"], "",
-                             "备忘 私聊测试")
-        check("私聊「备忘」落库 kind=memo", bool(r) and r["kind"] == "memo", f"got={r}")
+                             "待办 私聊测试")
+        check("私聊「待办」落库 kind=memo", bool(r) and r["kind"] == "memo", f"got={r}")
         rows = _store.list_memos(10)
         check("私聊记录 group_id=c2c:<openid> / group_name=私聊",
               rows and rows[0]["group_id"] == "c2c:U1" and rows[0]["group_name"] == "私聊",
@@ -937,7 +937,7 @@ def test_ignore():
         check("is_command「忽略 空格」", ignore.is_command("忽略 测试机器人") is True)
         check("is_command「忽略：冒号」", ignore.is_command("忽略：xx") is True)
         check("is_command「忽略这个bug」不算", ignore.is_command("忽略这个bug") is False)
-        check("is_command 普通指令不算", ignore.is_command("备忘 xx") is False)
+        check("is_command 普通指令不算", ignore.is_command("待办 xx") is False)
 
         # 指令：列表 / 新增 / 删除 / 清空
         check("handle 裸「忽略」→ 列表", "忽略表" in ignore.handle_command("忽略"))
@@ -1055,13 +1055,13 @@ def test_route():
               len(ideas) == 1 and ideas[0]["kind"] == "idea", f"got={ideas}")
         check("非 @ 普通消息不回复", m.replies == [], f"got={m.replies}")
 
-        # 5) 「备忘」→ 落库 + 回执
-        m = Msg("备忘 明天确认最小实例数")
+        # 5) 「待办」→ 落库 + 回执
+        m = Msg("待办 明天确认最小实例数")
         run(m)
         memos = store.list_memos(10, store.KIND_MEMO)
-        check("「备忘」落库 kind=memo",
+        check("「待办」落库 kind=memo",
               bool(memos) and memos[0]["kind"] == "memo", f"got={memos[:1]}")
-        check("「备忘」有回执（文案来自设置项 memo_ack）",
+        check("「待办」有回执（文案来自设置项 memo_ack）",
               bool(m.replies) and m.replies[0] == bot._settings.get("memo_ack")
               and m.replies[0] == "已经放进脑内抽屉了", f"got={m.replies}")
 
@@ -1191,14 +1191,14 @@ def test_settings():
         check("展示范围排在文案之后",
               _order.index("bubbles_show") > _order.index("intro_msg"),
               f"got={_order}")
-        # 🔴 三键新增：功能介绍 / 备忘回执 / 灵感回执（都是「回复文案可配」的一部分）
+        # 🔴 三键新增：功能介绍 / 待办回执 / 灵感回执（都是「回复文案可配」的一部分）
         check("新增三键都在",
               {"intro_msg", "memo_ack", "idea_ack"} <= set(settings.KEYS))
         check("功能介绍是多行文本（kind=area）",
               settings.KEYS["intro_msg"]["kind"] == "area")
         check("功能介绍默认值写明「没有语言生成能力」",
               "没有语言生成能力" in settings.get("intro_msg"))
-        check("备忘回执默认「已经放进脑内抽屉了」",
+        check("待办回执默认「已经放进脑内抽屉了」",
               settings.get("memo_ack") == "已经放进脑内抽屉了")
         check("灵感回执默认留空（= 静默收下，保持原有行为）",
               settings.get("idea_ack") == "", f"got={settings.get('idea_ack')!r}")
@@ -1209,7 +1209,7 @@ def test_settings():
               _order.index("startup_msg") < _order.index("intro_msg")
               < _order.index("memo_ack") < _order.index("idea_ack")
               < _order.index("bubbles_show"), f"got={_order}")
-        check("默认展示范围是「备忘 + 待处理」", settings.get("bubbles_show") == ["memo", "open"])
+        check("默认展示范围是「待办 + 待处理」", settings.get("bubbles_show") == ["memo", "open"])
         check("展示范围标签：memo_done 叫「已完成的待办」",
               settings.KEYS["bubbles_show"]["choice_labels"]["memo_done"] == "已完成的待办")
         check("没写过文件时 is_set 为假", settings.is_set("startup_msg") is False)
@@ -1225,9 +1225,9 @@ def test_settings():
         check("area 保留内部换行、只去首尾空白",
               ok and info == "第一行\n第二行", f"got={info!r}")
         ok, info = settings.set_value("memo_ack", "  收好了  ")
-        check("备忘回执可改（去空白）", ok and info == "收好了", f"got={info!r}")
+        check("待办回执可改（去空白）", ok and info == "收好了", f"got={info!r}")
         ok, info = settings.set_value("memo_ack", "")
-        check("备忘回执可以清空（= 静默记下）", ok and info == "", f"got={info!r}")
+        check("待办回执可以清空（= 静默记下）", ok and info == "", f"got={info!r}")
 
         ok, info = settings.set_value("bubbles_show", "未整理的思绪, done")
         check("multi 认中文标签 + code", ok and info == ["open", "done"], f"got={info}")
@@ -1338,14 +1338,14 @@ def test_config_web():
         check("值里含双引号直接拒绝", _raises(cw._env_literal, 'a"b'))
 
         # 2) 按行改 .env：注释与顺序保留、已有键只换值、新键追加
-        SRC = ("# 我的注释\nQQ_BOT_APPID=123456\n\n# 备忘触发词\n"
-               "MEMO_TRIGGER=备忘\nMEMO_SEARCH_ROOT=\"C:/tmp\"\n")
+        SRC = ("# 我的注释\nQQ_BOT_APPID=123456\n\n# 待办触发词\n"
+               "MEMO_TRIGGER=待办\nMEMO_SEARCH_ROOT=\"C:/tmp\"\n")
         with open(cw.ENV_PATH, "w", encoding="utf-8", newline="\n") as f:
             f.write(SRC)
         keys, err = cw.write_env({"MEMO_TRIGGER": "记一下", "QQ_BOT_SANDBOX": "true"})
         after = open(cw.ENV_PATH, encoding="utf-8").read()
         check("写 .env 无错误", err is None, err)
-        check("注释原样保留", "# 我的注释" in after and "# 备忘触发词" in after)
+        check("注释原样保留", "# 我的注释" in after and "# 待办触发词" in after)
         check("已有键只换值", "MEMO_TRIGGER=记一下" in after)
         check("新键追加到末尾", after.rstrip().endswith("QQ_BOT_SANDBOX=true"))
         check("键顺序未乱",
@@ -1358,7 +1358,7 @@ def test_config_web():
               sorted(keys) == ["MEMO_TRIGGER", "QQ_BOT_SANDBOX"], keys)
 
         # 再写一次：替换而不是重复追加
-        cw.write_env({"MEMO_TRIGGER": "备忘"})
+        cw.write_env({"MEMO_TRIGGER": "待办"})
         again = open(cw.ENV_PATH, encoding="utf-8").read()
         check("重复写不追加新行", again.count("MEMO_TRIGGER=") == 1)
         check("第二次备份 = 第一次写入后的内容",
@@ -1520,7 +1520,7 @@ def test_config_web():
         # 9) sync_env：写完 .env 灌进 os.environ
         cw.sync_env()
         check("sync_env 把 .env 灌进 os.environ",
-              os.environ.get("MEMO_TRIGGER") == "备忘",
+              os.environ.get("MEMO_TRIGGER") == "待办",
               os.environ.get("MEMO_TRIGGER"))
 
         # 10) 文档同步：每个可配置键都要在 .env.example 里出现过
@@ -1704,7 +1704,7 @@ def test_gui_speed():
     check("🔒 bot_start 等 pid 时用 force（不吃 0.6s 缓存）",
           "bot_running(force=True)" in src)
     check("🔒 托盘读自启状态不 force（否则右键菜单卡 1.2 秒）",
-          "return task_state() != \"none\"" in src)
+          "return task_state() in (\"ready\", \"running\")" in src)
 
 
 def test_gui_update_check():
@@ -1780,9 +1780,9 @@ def test_gui_update_check():
 # ── [14] 回旋镖 + 导出 ──────────────────────────────────────────
 def test_boomerang_export():
     """回旋镖：把「N 天以前」的旧记录翻一条推回给用户，推过的不重复推。
-    导出：把全部备忘 + 灵感导成 md / txt / json，群指令和泡泡页按钮共用同一套排版。
+    导出：把全部待办 + 灵感导成 md / txt / json，群指令和泡泡页按钮共用同一套排版。
     """
-    print("\n[14] 回旋镖（翻旧账）+ 导出（备忘/灵感 → 文件）")
+    print("\n[14] 回旋镖（翻旧账）+ 导出（待办/灵感 → 文件）")
     import bot as _bot
     import export as _export
     import settings as _settings
@@ -1795,12 +1795,12 @@ def test_boomerang_export():
     os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
     store.init()
     try:
-        # 造数据：5 天前 1 备忘 + 1 灵感（带结论），今天 1 灵感
+        # 造数据：5 天前 1 待办 + 1 灵感（带结论），今天 1 灵感
         con = sqlite3.connect(store.DB)
         old = (datetime.now() - timedelta(days=5)).isoformat(timespec="seconds")
         today = datetime.now().isoformat(timespec="seconds")
         con.execute("INSERT INTO memos (id,group_id,content,created_at,kind,status)"
-                    " VALUES (?,?,?,?,?,?)", ("a" * 8, "g1", "五天前的备忘", old, "memo", "open"))
+                    " VALUES (?,?,?,?,?,?)", ("a" * 8, "g1", "五天前的待办", old, "memo", "open"))
         con.execute("INSERT INTO memos (id,group_id,content,created_at,kind,status,note)"
                     " VALUES (?,?,?,?,?,?,?)",
                     ("b" * 8, "g1", "五天前的灵感", old, "idea", "decided", "当时的结论"))
@@ -1828,41 +1828,42 @@ def test_boomerang_export():
         check("未满天数的记录不进池子", store.count_boomerang(3, scope) == 2)
         check("把回溯天数调到 0，今天那条才进池子", store.count_boomerang(0, scope) == 3)
 
-        # 3) 推一条 → 打标记 → 不重复推
-        #    先把范围锁死成一类，结果才是确定的（不然随机挑到备忘就没有「结论」了）
-        _settings.set_value("boomerang_scope", ["decided"])
+        # 3) 🔴 抽出来的卡片**放回池子**（用户 2026-10-12）：池子恒定不变，
+        #    同一条可以被反复抽到（连着两次抽到同一张也算数）。
+        #    先把范围锁死成一类，结果才是确定的（不然随机挑到待办就没有「结论」了）
+        _settings.set_value("boomerang_scope", ["done"])
         first = _bot.boomerang_text()
         check("回旋镖文案带头 🪃", "🪃" in first)
         check("回旋镖带上当时的结论", "当时的结论" in first)
-        check("推过一条后池子少一条", store.count_boomerang(3, ["decided"]) == 0)
+        check("🔴 推过一条后池子**不**减少（抽出来的放回去）",
+              store.count_boomerang(3, ["done"]) == 1)
+        check("🔴 连着两次抽到同一条也照样推", _bot.boomerang_text() == first)
         _settings.set_value("boomerang_scope", ["memo"])
         second = _bot.boomerang_text()
-        check("换一类还能再推一条", "五天前的备忘" in second)
+        check("换一类还能再推一条", "五天前的待办" in second)
         check("第二次推的不是同一条", second != first)
         _settings.set_value("boomerang_scope", scope)
         third = _bot.boomerang_text()
-        check("推完只剩没满天数的 → 提示再等等", "再等等" in third)
+        check("🔴 不会再说「都推过一遍了」（池子里还有就继续推）",
+              "🪃 回旋镖！" in third and "推过一遍" not in third)
 
-        # 4) 范围配置真的生效（先把上一步打的标记清掉再按范围数一遍）
-        con = sqlite3.connect(store.DB)
-        con.execute("UPDATE memos SET boomerang_at = NULL")
-        con.commit()
-        con.close()
+        # 4) 范围配置真的生效（池子恒定，不用再清 boomerang_at 标记了）
         saved = _settings.get("boomerang_scope")
         _settings.set_value("boomerang_scope", ["memo"])
-        check("范围只剩「备忘」→ 只数得到备忘",
+        check("范围只剩「待办」→ 只数得到待办",
               store.count_boomerang(3, ["memo"]) == 1
               and store.count_boomerang(3, ["decided"]) == 1)
+        # 🔴 「待办」不再把已完成的并进来（用户 2026-10-12：分类要和抽屉一致）
+        check("🔴 待办 / 已完成的待办 是两类，不再合并",
+              store.count_boomerang(3, ["memo"]) == 1
+              and store.count_boomerang(3, ["memo_done"]) == 0
+              and store.count_boomerang(3, ["memo", "memo_done"]) == 1)
         check("范围里没有「已丢弃」→ 那条灵感不算",
               store.count_boomerang(3, ["dropped"]) == 0)
         _settings.set_value("boomerang_scope", saved)
         check("范围恢复后两条都回来", store.count_boomerang(3, saved) == 2)
 
         # 4.5) 🔴 回溯天数 = 0：今天刚记的也能被翻出来（新用户第一发就有反应）
-        con = sqlite3.connect(store.DB)
-        con.execute("UPDATE memos SET boomerang_at = NULL")
-        con.commit()
-        con.close()
         _settings.set_value("boomerang_days", 0)
         check("🔴 天数 0 → 三条全进池子（含今天那条）", store.count_boomerang(0, saved) == 3)
         _settings.set_value("boomerang_scope", ["open"])   # 只留「今天刚记的」那条灵感
@@ -1870,11 +1871,7 @@ def test_boomerang_export():
         check("🔴 天数 0 真能翻到今天的记录", "今天刚记的" in got0, got0[:60])
         check("文案说「你今天」而不是「0 天前」",
               "你今天" in got0 and "0 天前" not in got0)
-        # 再重置一次：验「显式传 0」不会被 falsy 判断（`if not days`）吃掉
-        con = sqlite3.connect(store.DB)
-        con.execute("UPDATE memos SET boomerang_at = NULL")
-        con.commit()
-        con.close()
+        # 验「显式传 0」不会被 falsy 判断（`if not days`）吃掉
         check("🔴 显式传 days=0 不会被当成「没传」（falsy 陷阱）",
               "今天刚记的" in _bot.boomerang_text(0))
         _settings.set_value("boomerang_scope", saved)
@@ -1912,7 +1909,19 @@ def test_boomerang_export():
               _settings.KEYS["ui_font_scale"]["default"] == 115)
         val, err = _settings.normalize("boomerang_scope", "待办、未整理")
         check("推送范围认中文标签", val == ["memo", "open"] and err is None)
-        check("推送范围默认含备忘", "memo" in _settings.get("boomerang_scope"))
+        # 🔴 用户 2026-10-12：回旋镖推送范围要和「脑内抽屉展示范围」**同一套分类**
+        check("🔴 推送范围与抽屉展示范围同一套分类（5 类，含已完成的待办）",
+              _settings.KEYS["boomerang_scope"]["choices"]
+              == _settings.KEYS["bubbles_show"]["choices"]
+              == ["memo", "memo_done", "open", "done", "dropped"]
+              and _settings.KEYS["boomerang_scope"]["choice_labels"]
+              == _settings.KEYS["bubbles_show"]["choice_labels"])
+        check("🔴 旧短标签「已整理」还认得（改名前的指令不作废）",
+              _settings.normalize("boomerang_scope", "已整理")[0] == ["done"]
+              and _settings.normalize("boomerang_scope", "已完成")[0] == ["memo_done"])
+        check("推送范围默认含待办", "memo" in _settings.get("boomerang_scope"))
+        check("🔴 推送范围默认含「已完成的待办」（等价旧的待办不分状态）",
+              "memo_done" in _settings.KEYS["boomerang_scope"]["default"])
         check("回溯天数默认 3", _settings.get("boomerang_days") == 3)
 
         # 6) 导出：三种格式 + 格式名容错
@@ -1922,10 +1931,10 @@ def test_boomerang_export():
         fname, data = _export.render("md")
         text = data.decode("utf-8")
         check("导出文件名带时间戳", fname.startswith("摸鱼bot导出_") and fname.endswith(".md"))
-        check("md 导出有总标题与备忘段", "# 摸鱼bot 导出" in text and "## 备忘" in text)
+        check("md 导出有总标题与待办段", "# 摸鱼bot 导出" in text and "## 待办" in text)
         check("md 导出有灵感分组", "## 灵感" in text and "### 已整理" in text)
         check("md 导出带上结论", "当时的结论" in text)
-        check("md 导出把正文放进引用块（保留换行）", "> 五天前的备忘" in text)
+        check("md 导出把正文放进引用块（保留换行）", "> 五天前的待办" in text)
         # 🔴 图片必须写成**相对路径**的 Markdown 引用：导 zip 时图在 images/ 下，
         #    正文不引用的话解压出来就是「一堆图 + 不知道哪张配哪条」。
         check("md 导出带图片相对路径引用（导 zip 后能直接看图）",
@@ -1936,7 +1945,7 @@ def test_boomerang_export():
               set(payload) >= {"exported_at", "counts", "memos", "ideas"})
         check("json 导出计数正确", payload["counts"] == {"memo": 1, "idea": 2})
         _, tdata = _export.render("txt")
-        check("txt 导出有分组标题", "── 备忘" in tdata.decode("utf-8"))
+        check("txt 导出有分组标题", "── 待办" in tdata.decode("utf-8"))
 
         # 7) 导出指令解析
         check("parse_export 裸指令", _bot.parse_export("导出") == (True, None))
@@ -2010,10 +2019,10 @@ def test_onboarding():
     os.environ["MEMO_DATA_DIR"] = tmp          # onboarded.json 落到临时目录
     os.environ["MEMO_IGNORE"] = ""
     os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
-    os.environ["MEMO_TRIGGER"] = "备忘"
+    os.environ["MEMO_TRIGGER"] = "待办"
     store.DB = os.path.join(tmp, "t.db")
     bot.LAST_MSG_FILE = os.path.join(tmp, "last.json")
-    bot.TRIGGER = "备忘"
+    bot.TRIGGER = "待办"
     try:
         store.init()
         cli = Client()
@@ -2046,18 +2055,18 @@ def test_onboarding():
               m.replies == [bot.HELLO_FALLBACK], f"got={m.replies}")
         settings.reset("intro_msg")
 
-        # 3) 备忘回执可配
-        check("备忘回执默认值来自设置",
+        # 3) 待办回执可配
+        check("待办回执默认值来自设置",
               settings.get("memo_ack") == "已经放进脑内抽屉了")
-        m = Msg("备忘 买猫粮")
+        m = Msg("待办 买猫粮")
         run(m)
-        check("默认备忘回执", m.replies == ["已经放进脑内抽屉了"], f"got={m.replies}")
+        check("默认待办回执", m.replies == ["已经放进脑内抽屉了"], f"got={m.replies}")
         settings.set_value("memo_ack", "收好了")
-        m = Msg("备忘 买狗粮")
+        m = Msg("待办 买狗粮")
         run(m)
-        check("改设置后备忘回执跟着变", m.replies == ["收好了"], f"got={m.replies}")
+        check("改设置后待办回执跟着变", m.replies == ["收好了"], f"got={m.replies}")
         settings.set_value("memo_ack", "")
-        m = Msg("备忘 买鱼粮")
+        m = Msg("待办 买鱼粮")
         run(m)
         check("回执留空 = 静默记下（不回复）", m.replies == [], f"got={m.replies}")
         check("静默时仍然落库", len(store.list_memos(10, store.KIND_MEMO)) == 3,
@@ -2358,10 +2367,18 @@ def test_gui_source():
     check("🖥 气泡排布有随机感（泳道/起始高度/横向漂移）",
           "random.choice" in src and "random.shuffle" in src
           and "random.uniform" in src and "import random" in src)
-    # ⑤ 手动回旋镖：复用 store 的 pick/mark，不重新实现规则。
+    # ⑤ 手动回旋镖：复用 store 的 pick，不重新实现规则。
+    #    🔴 抽出来的卡片**放回池子**（用户 2026-10-12）⇒ 不许再调 mark_boomerang；
+    #    🔴 抽中后也不许弹底部提示（那条提示正好盖住「回旋镖」按钮，点不着）。
+    _mb = src.split("def _manual_boomerang", 1)[1].split("\n    def ", 1)[0]
+    _mb_body = _mb.split('"""', 2)[2]           # 跳过 docstring（它提到了 mark_boomerang）
     check("🖥 有手动回旋镖按钮且复用 store 规则",
-          "def _manual_boomerang" in src and "pick_boomerang" in src
-          and "mark_boomerang" in src)
+          "def _manual_boomerang" in src and "_store.pick_boomerang(" in _mb_body
+          and "_store.count_boomerang(" in _mb_body)
+    check("🖥 🔴 手动回旋镖不 mark（池子恒定，同一条能反复抽到）",
+          "mark_boomerang" not in _mb_body)
+    check("🖥 🔴 手动回旋镖抽中后不弹底部提示（曾盖住按钮）",
+          "toast(" not in _mb_body.split("created = _fmt_time", 1)[1])
     # ⑥ 外观三态顺序固定「跟随系统 / 浅色 / 深色」（用户 2026-10-12）
     check("🖥 外观三态顺序：跟随系统在最前",
           'for text, mode in (("跟随系统", "system"),\n                           ("浅色", "light"),\n                           ("深色", "dark")):' in src)
@@ -2376,6 +2393,40 @@ def test_gui_source():
     check("🖥 暂停机制（_toggle_pause / _running / _paused_at）已删除",
           "_toggle_pause" not in src and "self._running" not in src
           and "_paused_at" not in src)
+    # ⑨ 前台自动刷新（用户 2026-10-12：「发送灵感后不点刷新看不到」）。
+    #    机器人是**另一个进程**，它写完库这边收不到任何通知 ⇒ 窗口在前台时按
+    #    AUTO_REFRESH_MS 轮询「库文件变没变」，变了才重查。
+    _dm = src.split("def _db_mtime(self)", 1)[1].split("\n    def ", 1)[0]
+    _dm_body = _dm.split('"""', 2)[2]           # 跳过 docstring（里面提到了 -shm）
+    _at = src.split("def _auto_tick(self)", 1)[1].split("\n    def ", 1)[0]
+    _rf = src.split("def refresh(self, state)", 1)[1].split(
+        "\n    # 轮播舞台一次最多铺多少个", 1)[0]
+    check("🖥 有前台自动刷新（AUTO_REFRESH_MS=5000 + _auto_tick + _schedule_auto）",
+          "AUTO_REFRESH_MS = 5000" in src
+          and "def _auto_tick(self)" in src
+          and "def _schedule_auto(self)" in src
+          and "self._build()\n        self._tick()\n        self._db_stamp = self._db_mtime()" in src
+          and "self._schedule_auto()" in src)
+    _cd = src.split("def _check_db_changed(self)", 1)[1].split("\n    def ", 1)[0]
+    check("🖥 🔴 自动刷新用库 mtime 当闸门（变了才 refresh，不无条件抢写锁）",
+          "if self._db_mtime() != self._db_stamp:" in _cd
+          and "self.refresh(self.app.state)" in _cd
+          and "self._check_db_changed()" in _at)
+    check("🖥 🔴 自动刷新只看主库 + -wal，不看 -shm（否则自己触发自己）",
+          'for suf in ("", "-wal"):' in _dm_body and "-shm" not in _dm_body)
+    check("🖥 🔴 自动刷新只在窗口前台可见时跑（最小化 / 在后台不查）",
+          "def _front_and_visible(self)" in src
+          and 'root.state() == "iconic"' in src
+          and "self.winfo_ismapped()" in src)
+    check("🖥 🔴 自动刷新受 _alive 守卫（destroy 后停表，不碰已销毁控件）",
+          "if not self._alive:" in _at)
+    check("🖥 refresh 里对齐 _db_stamp（界面自己写完库不重复刷）",
+          "self._db_stamp = self._db_mtime()" in _rf)
+    check("🖥 切回前台立刻查一次（<FocusIn>，且只认窗口自身的焦点）",
+          'self.app.root.bind("<FocusIn>", self._on_focus_in, add="+")' in src
+          and "def _on_focus_in(self, event)" in src
+          and "event.widget is not self.app.root" in src
+          and "def _check_db_changed(self)" in src)
 
     # ── 底部按钮行：思维流 + 两分类（待办/思绪，点击开列表窗口）+ 回收站 ──
     # 已丢弃**不进轮播舞台**（_collect 里跳过），也不做分类 chip ——
@@ -2404,8 +2455,8 @@ def test_gui_source():
           and '"memo_done": _TERMINAL_GRAY' in src)
     check("🖥 已整理子筛同时收纳 done / decided 两种库里状态",
           '_SUB_MATCH = {"done": ("done", "decided")}' in src)
-    check("🖥 备忘卡片删「← 恢复」（不可点击、冗余）；「✓ 完成这条备忘」→「✓ 完成」",
-          '"← 恢复"' not in src and "✓ 完成这条备忘" not in src
+    check("🖥 待办卡片删「← 恢复」（不可点击、冗余）；「✓ 完成这条待办」→「✓ 完成」",
+          '"← 恢复"' not in src and "✓ 完成这条待办" not in src
           and '"✓ 完成"' in src)
     check("🖥 灵感卡片删「★ 已决议」（done/decided 展示层合并）",
           '"★ 已决议", "info", "decided"' not in src
@@ -2447,7 +2498,7 @@ def test_gui_source():
 
     # ── 结论 / 备注 + 导出（网页版有、桌面版一度漏掉的两个功能） ──
     # 备注：浮层里能写结论，点动作按钮时**一起提交**（不是「先改状态再补写」两步）。
-    # 🔴 备忘没有「结论」这个概念，整块不给它建 —— 所以要有 `if not memo` 这道闸。
+    # 🔴 待办没有「结论」这个概念，整块不给它建 —— 所以要有 `if not memo` 这道闸。
     check("🖥 浮层有结论/备注框，改状态时一起提交",
           "结论 / 备注" in src and 'note_box.get("1.0", "end")' in src
           and "def _set_status(self, ids, status, memo, note=None)" in src
@@ -2474,8 +2525,8 @@ def test_gui_source():
     check("🖥 气泡内缩 ≥ 半径的 29%（直角角落藏进圆弧）",
           "INSET_RATIO = 0.45" in src
           and "self.BUBBLE_R * self.INSET_RATIO" in src and 'b["inset"]' in src)
-    # ③ meta 行不许拼出「备忘 · 备忘」—— 备忘的桶名和类型名本来就是同一个词。
-    check("🖥 类型/状态文案去重（不再有「备忘 · 备忘」）",
+    # ③ meta 行不许拼出「待办 · 待办」—— 待办的桶名和类型名本来就是同一个词。
+    check("🖥 类型/状态文案去重（不再有「待办 · 待办」）",
           "def _meta_text" in src and "bucket_label.startswith(kind_label)" in src)
     # ④ 图标：`iconbitmap(default=…)` / `iconphoto(True, …)` 的 **-default 变体只设
     #    「以后新建窗口」的默认值，不改当前窗口** —— 只写 default 的话当前窗口
@@ -2751,9 +2802,9 @@ def test_gui_source():
           and "配置中心管不到它们" in _sw
           and "普通发言它收不到" in _sw
           and "上线播报发不出来" in _sw
-          and "备忘 测试" in _sw)
+          and "待办 测试" in _sw)
 
-    # ⑫ 列表滚动加固（用户 2026-10-12：备忘等列表「上滚空白、只显示一条」）：
+    # ⑫ 列表滚动加固（用户 2026-10-12：待办等列表「上滚空白、只显示一条」）：
     #    · **视口钳制** —— 内容比视口矮时滚动区钳成视口本身。以前 bbox 比视口
     #      高一截，滚轮能滚进一片啥都没有的空白，真内容被挤成「只显示一条」；
     #    · **滚轮双闸** —— 方向上已经没得滚了就 break 拦下，并消费事件不往

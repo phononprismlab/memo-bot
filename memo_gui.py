@@ -525,18 +525,27 @@ class App:
         """极简白基调的全局控件样式：无边框、弱化矩形感、留白呼吸。"""
         s = self.style
         c = s.colors
-        # 两个主入口 tab：加大字号、无边框、选中用品牌色。
+        # 两个主入口 tab（配置中心 / 脑内抽屉）：加大字号、选中要**一眼看得出来**。
         # 🔴 TNotebook 自己的背景必须也换成主题 bg —— 否则残留内置主题（flatly）的
         #    白色，在 tab 行和内容边缘露出一圈「白边」。
+        # 🔴 选中态以前几乎看不出来（用户 2026-10-12 报的「页签切换不够明显」）：
+        #    主题里 `active`（浅色 #eef4f3）跟 `bg`（#f7f9fa）差不到一个色阶，
+        #    选中 tab 只有字色从灰变品牌色 —— 扫一眼根本分不清在哪个页。
+        #    现在选中 = 品牌淡底 + 品牌色**粗体** + 品牌色描边，hover 才用 active。
+        sel_bg = lerp_color(c.primary, c.bg, 0.86)
         s.configure("TNotebook", border_width=0, tabmargins=(0, 0, 0, 0),
                     background=c.bg, bordercolor=c.bg,
                     lightcolor=c.bg, darkcolor=c.bg)
-        s.configure("TNotebook.Tab", padding=(22, 10),
-                    font=_font(12), borderwidth=0,
+        s.configure("TNotebook.Tab", padding=(24, 11),
+                    font=_font(12), borderwidth=1, focuscolor=c.bg,
                     background=c.bg, bordercolor=c.bg, lightcolor=c.bg, darkcolor=c.bg)
         s.map("TNotebook.Tab",
-              background=[("selected", c.bg), ("active", c.active)],
-              foreground=[("selected", c.primary)])
+              background=[("selected", sel_bg), ("active", c.active)],
+              foreground=[("selected", c.primary), ("active", c.fg)],
+              bordercolor=[("selected", c.primary)],
+              lightcolor=[("selected", c.primary)],
+              darkcolor=[("selected", c.primary)],
+              font=[("selected", _font(12, "bold"))])
         # 按钮一律去边框
         s.configure("TButton", borderwidth=0, focuscolor=c.bg)
         # 🔴 Frame / Label 也必须显式钉住背景色 —— ttk 这两类默认不跟随品牌主题，
@@ -760,6 +769,8 @@ class App:
             if _botctl.task_state_fresh():
                 task = _botctl.task_state()
                 self.state["bot"]["task"] = task
+                # 自启勾选框的判据也一起补上（首帧可能还是 unknown）
+                self.state["bot"]["autostart"] = task in ("ready", "running")
                 self._update_bot_status()
                 # 「运行方式」页上也有这个状态和自启勾选框 —— 正开着就重画一下
                 if self.config_center.current == "runtime":
@@ -955,7 +966,7 @@ class ConfigCenter(ttk.Frame):
                 lambda k=g["key"]: self.show_section(k),
                 kind="ghost", anchor="w", padx=12, pady=6, radius=10,
                 fg=self._c("secondary"), hover_fill=self._c("active"),
-                selected_fg=self._c("primary"), selected_fill=self._c("active"),
+                selected_fg=self._c("primary"), selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
                 parent_bg=self._c("bg"), fixed_width=174)
             b.pack(anchor="w", pady=2, fill="x")
             self._nav.append((b, g["key"]))
@@ -1003,7 +1014,7 @@ class ConfigCenter(ttk.Frame):
                               fg=self._c("secondary"),
                               hover_fill=self._c("active"),
                               selected_fg=self._c("primary"),
-                              selected_fill=self._c("active"),
+                              selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
                               parent_bg=self._c("bg"), fixed_width=174)
             b.pack(anchor="w", pady=2, fill="x")
             if mode == cur:
@@ -1299,7 +1310,7 @@ class ConfigCenter(ttk.Frame):
                       font=_font(10, "bold")).pack(anchor="w")
             ttk.Label(row, text=note, bootstyle="secondary",
                       font=_font(9)).pack(anchor="w")
-        _done = "开完在群里发一句「备忘 测试」，能收到回执就说明配好了。"
+        _done = "开完在群里发一句「待办 测试」，能收到回执就说明配好了。"
         ttk.Label(lf, text=_soft_wrap(_done, 720, 9),
                   bootstyle="secondary", wraplength=720,
                   font=_font(9)).pack(anchor="w", pady=(6, 0))
@@ -1380,10 +1391,16 @@ class ConfigCenter(ttk.Frame):
 
         lf2 = ttk.LabelFrame(self.scroll, text="开机自启（Windows 计划任务 MoyuBot）", padding=8)
         lf2.pack(fill="x", pady=6)
-        av = tk.BooleanVar(value=bot.get("task") == "running")
+        # 🔴 勾选态必须读 `autostart`（= 计划任务存在且可用），**不能**拿
+        #    `task == "running"` —— 自启任务注册后是 ready 不是 running，
+        #    老写法导致「明明开了却显示关闭」（用户 2026-10-12 报的）。
+        #    计划任务状态是后台查的（1.2 秒），查完 `_poll_bot_status` 会重画这一栏。
+        av = tk.BooleanVar(value=bool(bot.get("autostart")))
         ttk.Checkbutton(lf2, text="开机自动启动机器人", variable=av,
                         bootstyle="primary-round-toggle",
                         command=lambda v=av: self._autostart(v.get())).pack(anchor="w", pady=4)
+        ttk.Label(lf2, text="开启后，登录 Windows 会自动把管家跑起来（含机器人，后台无窗口）。",
+                  bootstyle="secondary", font=_font(8)).pack(anchor="w")
 
         lf3 = ttk.LabelFrame(self.scroll, text="依赖自检", padding=8)
         lf3.pack(fill="x", pady=6)
@@ -1940,7 +1957,7 @@ def _human_size(n):
 # ── 脑内抽屉标签页（Phase 2 原生渲染）────────────────────────────
 # 桶名 / 标签沿用原来的抽屉口径（待办 / 思绪两大类），配色用的是同一套状态色。
 # 🔴 分类大改版（用户 2026-10-12 定）：展示层只剩「待办」和「思绪」两大类 ——
-#    · 备忘 = 待办（未完成 / 已完成），灵感 = 思绪（未整理 / 已整理）；
+#    · 待办 = 待办（未完成 / 已完成），灵感 = 思绪（未整理 / 已整理）；
 #    · 「已处理 / 已决议」两种烧脑分法**合并**为「已整理」（库里 status 不动，
 #      存量 decided 照常读，只是不再单独展示）。
 _BUCKET_LABEL = {
@@ -1963,6 +1980,19 @@ _SUB_LABEL = {"memo": "未完成", "memo_done": "已完成",
               "open": "未整理", "done": "已整理", "decided": "已整理"}
 # 子筛选项的「码」用的是桶名；「已整理」同时收纳库里 done / decided 两种状态。
 _SUB_MATCH = {"done": ("done", "decided")}
+
+
+def _fmt_time(s):
+    """把库里的 `created_at`（ISO，形如 `2026-10-12T18:42:43`）显示成**完整时间**。
+
+    🔴 以前只截前 10 位（到「日」）—— 同一天记了好几条就分不清先后
+       （用户 2026-10-12：「卡片时间戳完全显示（目前只显示到日）」）。
+       这里原样显示到秒，只把 ISO 的 `T` 换成空格；解析不出来就原样返回。
+    """
+    t = str(s or "").strip()
+    if not t:
+        return ""
+    return t.replace("T", " ")[:19]
 
 
 def _meta_text(it, memo):
@@ -2166,6 +2196,10 @@ class BrainDrawerTab(ttk.Frame):
     BASE_DUR = 26.0        # 基准行程（1.26 倍舞台高）走完的秒数
     TRAVEL_VH = 1.26       # 基准行程 = 1.26 倍舞台高
     TICK_MS = 16           # 动画帧间隔（≈60fps；实测单帧只花 ~0.4ms，撑得住）
+    # 🔴 前台自动刷新间隔。用户 2026-10-12 报「发送灵感后不点刷新看不到」——
+    #    机器人是**另一个进程**，它往 memos.db 写完这边收不到任何通知，以前
+    #    只能手动点「刷新」。现在窗口在前台时按这个间隔看一眼库变没变。
+    AUTO_REFRESH_MS = 5000
     LANE_MIN_W = 256       # 每条泳道最小宽度（决定泳道条数：1060px → 4 条）
     # 🔴 每条泳道同时最多几个气泡。3 → 6（用户：「现在看起来还是太稀疏」）。
     #    提到 6 之后同泳道间距只剩几十像素，**必须**有真实的不重叠判据兜住 ——
@@ -2229,17 +2263,90 @@ class BrainDrawerTab(ttk.Frame):
         self._due = None         # 下一帧该跑的时刻（_tick 自校正用）
         self._rebuild_job = None
         self._L = dict(w=800, h=500, lanes=2, gap=24, lane_w=380, travel=630)
+        # 前台自动刷新：定时器 id + 「上次看到的库文件版本」（见 _auto_tick）
+        self._auto_job = None
+        self._db_stamp = None
         # 🔴 字号改了会整窗重建（App._rebuild_for_font），这个标签页会被 destroy。
         #    `after` 定时器不随控件一起消失，`_tick` 一旦在销毁后再跑就会
         #    对着已销毁的控件调 Tk → 被全局异常钩子弹成错误框。用这个旗子兜住。
         self._alive = True
         self._build()
         self._tick()
+        self._db_stamp = self._db_mtime()   # 基线 = 建窗这一刻的库版本
+        # 切回前台立刻查一次（不然要等满一拍 AUTO_REFRESH_MS 才看得到新条目）
+        self.app.root.bind("<FocusIn>", self._on_focus_in, add="+")
+        self._schedule_auto()
 
     def destroy(self):
-        """先熄灯再拆 —— 让还在路上的 `_tick` 自己停住（见 `_alive` 的说明）。"""
+        """先熄灯再拆 —— 让还在路上的 `_tick` / `_auto_tick` 自己停住（见 `_alive`）。"""
         self._alive = False
         super().destroy()
+
+    # ── 前台自动刷新 ─────────────────────────────────────────────
+    def _schedule_auto(self):
+        """排下一次自动刷新（`_alive` 是唯一开关，见 `destroy`）。"""
+        if self._alive:
+            self._auto_job = self.after(self.AUTO_REFRESH_MS, self._auto_tick)
+
+    def _db_mtime(self):
+        """memos.db（含 WAL 副档）的最新 mtime，单位 ns；变了 = 别的进程写过库。
+
+        🔴 **不看 `-shm`**：WAL 模式下它是共享内存索引，光是打开一个连接就会动，
+           拿它当判据会「自己触发自己」变成无限刷新。只看主库 + `-wal`。
+        """
+        best = 0
+        for suf in ("", "-wal"):
+            try:
+                best = max(best, os.stat(_store.DB + suf).st_mtime_ns)
+            except OSError:
+                pass
+        return best
+
+    def _front_and_visible(self):
+        """窗口此刻是不是「在前台看得见」—— 最小化 / 被藏起来 / 当前不是本页签都不算。
+
+        🔴 `winfo_ismapped()` 一个就够了：Tk 的 Notebook 会把**非当前页签**
+           unmap 掉，所以它同时覆盖了「当前页是脑内抽屉」和「窗口没被藏起来」。
+        """
+        try:
+            root = self.app.root
+            if root.state() == "iconic":        # 最小化到任务栏
+                return False
+            return bool(self.winfo_ismapped() and root.winfo_viewable())
+        except tk.TclError:
+            return False
+
+    def _auto_tick(self):
+        """前台自动刷新：机器人写进来的新条目，不点「刷新」也能自己冒出来。
+
+        🔴 **用库文件 mtime 当闸门，而不是无脑 `refresh()`**：`refresh()` 里有
+           `_store.init()`，它一上来就 `BEGIN IMMEDIATE` 抢写锁；要是正好撞上
+           bot 在写，就得等满 busy timeout（默认 5 秒）—— 界面直接卡住。
+           加了闸门就只有「真有新数据」时才碰库，频率低、也不会白抢锁。
+        🔴 窗口不在前台时不查（最小化 / 在后台），省掉无谓的 stat 和读库。
+        """
+        self._auto_job = None
+        if not self._alive:
+            return
+        if self._front_and_visible():
+            self._check_db_changed()
+        self._schedule_auto()
+
+    def _check_db_changed(self):
+        """库文件变了就重查一遍（闸门共用，`_auto_tick` 与切回前台都走它）。"""
+        if self._db_mtime() != self._db_stamp:
+            self.refresh(self.app.state)
+
+    def _on_focus_in(self, event):
+        """窗口刚被切回前台 → 立刻看一眼库，别让用户干等满一拍 AUTO_REFRESH_MS。
+
+        🔴 必须判 `event.widget is root`：Tk 的 bindtags 会把**窗口内所有控件**的
+           FocusIn 冒泡到这个 toplevel 的绑定上（点一下搜索框都会进来），
+           不判的话焦点每动一下就查一次库。
+        """
+        if event.widget is not self.app.root or not self._alive:
+            return
+        self._check_db_changed()
 
     # ── 基础 ─────────────────────────────────────────────────────
     def _c(self, key):
@@ -2394,7 +2501,7 @@ class BrainDrawerTab(ttk.Frame):
                              fg=self._c("secondary"),
                              hover_fill=self._c("active"),
                              selected_fg=self._c("primary"),
-                             selected_fill=self._c("active"),
+                             selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
                              parent_bg=self._c("bg"))
         view.pack(side="left", padx=(0, 3))
         view.set_selected(True)
@@ -2407,7 +2514,7 @@ class BrainDrawerTab(ttk.Frame):
                                  fg=self._c("secondary"),
                                  hover_fill=self._c("active"),
                                  selected_fg=self._c("primary"),
-                                 selected_fill=self._c("active"),
+                                 selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
                                  parent_bg=self._c("bg"))
             chip.pack(side="left", padx=(0, 3))
             self._chips[g] = chip
@@ -2619,6 +2726,9 @@ class BrainDrawerTab(ttk.Frame):
         #    `_prewarm()`）：用户点一下「已决议」，整屏气泡同时消失、再同时从
         #    下面冒出来 —— 就是那一「抽搐」（用户报的）。现在只摘掉真变了的那一个。
         self._sync(self._load_items())
+        # 🔴 记下「我看到的这一版」：界面自己刚写完库（改状态 / 手动回旋镖 / 标签）
+        #    时也让闸门对齐，免得下一拍 `_auto_tick` 又白刷一次。
+        self._db_stamp = self._db_mtime()
 
     # 轮播舞台一次最多铺多少个 —— 它不是「翻资料」的地方，够铺满屏幕就行。
     # 🔴 列表窗口 / 搜索**不走这个上限**（见 `_list_query`）：那里是用户真去找东西
@@ -2682,11 +2792,11 @@ class BrainDrawerTab(ttk.Frame):
                 "id": r["id"], "kind": r.get("kind") or _store.KIND_MEMO,
                 "status": r.get("status") or _store.STATUS_OPEN,
                 "bucket": b, "content": content,
-                "date": (r.get("created_at") or "")[:10],
+                "date": _fmt_time(r.get("created_at")),
                 "tags": [t["name"] if isinstance(t, dict) else str(t)
                          for t in (r.get("tags") or [])],
                 "images": r.get("images") or [],
-                # 结论 / 备注（只有灵感有；备忘在库层面就没有这个概念）
+                # 结论 / 备注（只有灵感有；待办在库层面就没有这个概念）
                 "note": r.get("note") or "",
             })
         out.sort(key=lambda x: x["date"], reverse=True)
@@ -2771,11 +2881,14 @@ class BrainDrawerTab(ttk.Frame):
         """按「配置中心 → 回旋镖」的规则翻一条旧记录出来，弹出它的全文。
 
         规则全在 settings 里：`boomerang_days`（翻多少天以前）+ `boomerang_scope`
-        （从哪几类里挑）。和机器人收到「回旋镖」指令走**同一套** `store.pick_*` ——
-        不重新实现一遍规则，免得两边行为不一致。
+        （从哪几类里挑，分类与「⑤ 脑内抽屉」的展示范围一致）。和机器人收到
+        「回旋镖」指令走**同一套** `store.pick_*` —— 不重新实现一遍规则。
 
-        🔴 挑中后会 `mark_boomerang()`：这就是「回旋镖」的语义 —— 翻出来给你看过了，
-        下次不该再翻。所以点几次池子就少几条，推完会明确告诉你（而不是默默没反应）。
+        🔴 **抽出来的卡片会放回池子**（用户 2026-10-12）：不再 `mark_boomerang()`，
+        池子恒定，同一条能被反复抽到（连着两次抽到同一张也算数）。
+        🔴 抽中后**不再弹底部提示** —— 那条提示正好盖在「回旋镖」按钮上，
+           用户点完想再点就点不着了（用户 2026-10-12 报的「通知遮盖了按钮」）。
+           浮层标题栏本来就写着「几天前翻出来的旧记录」，信息没丢。
         """
         from datetime import datetime
         days = int(_settings.get("boomerang_days") or 0)
@@ -2783,22 +2896,20 @@ class BrainDrawerTab(ttk.Frame):
         now = datetime.now()
         item = _store.pick_boomerang(days, scope, now)
         if not item:
+            # 没翻到才提示（此时没有卡片浮层，用户也需要知道为什么没反应）
             left_at_all = _store.count_boomerang(0, scope, now)
             if left_at_all:
                 self.app.toast(f"还没有满 {days} 天的旧记录（可推范围在"
                                f"「配置中心 → 回旋镖」里改）", False)
             else:
-                self.app.toast("旧记录都翻过一遍了 —— 同一条不会翻第二次", False)
+                self.app.toast("这个范围里还没有能翻的记录（可推范围在"
+                               "「配置中心 → 回旋镖」里改）", False)
             return
-        _store.mark_boomerang(item["id"])
-        created = (item.get("created_at") or "")[:10]
+        created = _fmt_time(item.get("created_at"))
         try:
             ago = (now - datetime.fromisoformat(item["created_at"])).days
         except (ValueError, TypeError):
             ago = days
-        rest = _store.count_boomerang(days, scope, now)
-        self.app.toast(f"回旋镖：{'今天' if ago <= 0 else f'{ago} 天前'}"
-                       f"（{created}）· 池子里还剩 {rest} 条", True)
         # 转成轮播用的条目结构，直接开浮层看全文
         tags = [t["name"] if isinstance(t, dict) else str(t)
                 for t in (item.get("tags") or [])]
@@ -2814,7 +2925,7 @@ class BrainDrawerTab(ttk.Frame):
 
     # ── 导出 ────────────────────────────────────────────────────
     def _export_all(self):
-        """把全部备忘 + 灵感导出成一个文件（网页版「⬇ 导出」的桌面版）。
+        """把全部待办 + 灵感导出成一个文件（网页版「⬇ 导出」的桌面版）。
 
         🔴 排版复用 `export.py` —— 和机器人「导出」指令、网页版导出是**同一份
            定义**，三处导出来的文件长得一模一样，不另写一套。
@@ -3431,7 +3542,7 @@ class BrainDrawerTab(ttk.Frame):
         # 照 web 版：打开时把当前结论预填进框，点下面的动作按钮时把框里的
         # 内容一起提交（改状态 = 顺手写结论，一步完成）。
         # 🔴 框里显示什么就提交什么 —— 清空框 = 抹掉结论，这是用户主动行为。
-        #    备忘没有「结论」这个概念，所以整块不给它建。
+        #    待办没有「结论」这个概念，所以整块不给它建。
         note_wrap, note_box, note_save = None, None, None
         if not memo:
             note_wrap = tk.Frame(card, bg=light)
@@ -3561,7 +3672,7 @@ class BrainDrawerTab(ttk.Frame):
             return b
 
         # 流程按钮：单按钮两态（完成 ⇄ 取消完成 / 整理 ⇄ 取消整理）+ 丢弃。
-        # 🔴 口径与列表窗口完全一致（同一份 `_flow_plan`）—— 待办（备忘）与
+        # 🔴 口径与列表窗口完全一致（同一份 `_flow_plan`）—— 待办（待办）与
         #    思绪（灵感）共用，避免两处规则漂移。
         plan = _flow_plan(memo, st)
 
@@ -3834,7 +3945,7 @@ class BrainDrawerTab(ttk.Frame):
 
     # ── 回收站（已丢弃）────────────────────────────────────────────
     def _dropped_items(self):
-        """所有**已丢弃**的条目（备忘 + 灵感），最新的在前。
+        """所有**已丢弃**的条目（待办 + 灵感），最新的在前。
 
         🔴 这里**不看 `bubbles_show`** —— 那个设置管的是「轮播舞台上展示哪几类」，
            回收站是清理入口，被展示范围挡住就没人清得掉垃圾了。
@@ -3853,7 +3964,7 @@ class BrainDrawerTab(ttk.Frame):
                 "status": r.get("status") or _store.STATUS_OPEN,
                 "bucket": "dropped",
                 "content": content,
-                "date": (r.get("created_at") or "")[:10],
+                "date": _fmt_time(r.get("created_at")),
                 "tags": [t["name"] if isinstance(t, dict) else str(t)
                          for t in (r.get("tags") or [])],
                 "images": r.get("images") or [],
@@ -4027,7 +4138,7 @@ class BrainDrawerTab(ttk.Frame):
                                    hover_outline=self._c("primary"),
                                    hover_fg=self._c("primary"),
                                    selected_fg=self._c("primary"),
-                                   selected_fill=self._c("active"),
+                                   selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
                                    parent_bg=self._c("bg"))
                 sb.pack(side="left", padx=(0, 4))
                 sb.set_selected(not code)
