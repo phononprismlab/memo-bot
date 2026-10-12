@@ -104,3 +104,7 @@ Thumbs.db
 run-gui.cmd
 # 产品文档（按版本号命名的交付文档，不进公开仓库）
 packaging/摸鱼bot-产品文档-*.md
+
+# ── 本机数据（源码直跑时数据目录 = 代码目录，这些是「本机状态」）──────
+# 界面主题偏好（light/dark/system）：跟着这台机器走，别进仓库。
+ui-theme.txt

@@ -1,8 +1,8 @@
 """扩展（自定义指令）管理 —— 把扩展包**装进 / 列出 / 移出** `extensions/local/`。
 
 谁调用它：
-  - `config-web.py`（配置中心网页版）：`/api/ext`、`/api/ext/import`、`/api/ext/remove`
-  - `memo_gui.py`（桌面版配置中心）：「⑨ 自定义指令」页签
+  - `memo_gui.py`（桌面配置中心）：「⑨ 自定义指令」页签
+  - `config_core.py`（配置后端）：把已装列表塞进 `full_state()`
   - 命令行自测：`python extmgr.py list`
 
 🔴 和 `extensions/__init__.py` 的分工（别搞混）：

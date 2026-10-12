@@ -4,7 +4,7 @@
 存的是**非敏感**的行为配置（播报文案、抽屉展示范围），落 `settings.json`。
 
 三个入口：
-  - 配置中心网页：`config-web.py` 起的那一页（推荐，能填能测能启停）
+  - 桌面配置中心：`memo_gui.py` 的「配置中心」页签（推荐，能填能测能启停）
   - 脑内抽屉页面：顶部「⚙ 设置」（只放跟页面相关的 `bubbles_show`）
   - 机器人：`设置` / `设置 <键> <值>` / `设置 重置 <键>`
 
@@ -27,6 +27,9 @@ FILE = data_path("settings.json")
 
 _LOCK = threading.Lock()
 
+# 图片收集在当前发布版本关闭。保留字段读取旧配置，但不在机器人设置指令中展示或修改。
+_CHAT_HIDDEN_KEYS = {"image_collect", "image_alert_gb"}
+
 # ── 可设置的键 ───────────────────────────────────────────────────
 # kind: text（一行文本，留空 = 关掉该功能）/ area（多行文本，换行有意义）/
 #       multi（多选，值是一组 code）/ int（整数）
@@ -47,6 +50,8 @@ KEYS = {
             "我在群里帮你干这些活：\n"
             "· 记备忘 —— 说「备忘 买猫粮」，我收进脑内抽屉\n"
             "· 收灵感 —— 不带指令的普通发言，我悄悄记下来\n"
+            "· 搜索灵感 —— 说「搜索灵感 设计」，按正文、标签或结论找回来\n"
+            "· 标签 —— 写灵感时加 #设计，之后可以按标签搜索\n"
             "· 发文件 —— 说「发文件 设计说明」，我把文件渲染成图片发出来\n"
             "· 摸鱼 —— 说「摸鱼」，随机来一条，歇一下\n"
             "· 回旋镖 —— 把几天前记的旧账翻一条回来\n"
@@ -79,11 +84,14 @@ KEYS = {
         "label": "脑内抽屉展示范围",
         "kind": "multi",
         "default": ["memo", "open"],
-        "choices": ["memo", "memo_done", "open", "done", "decided", "dropped"],
-        "choice_labels": {"memo": "备忘", "memo_done": "已完成",
-                          "open": "待处理", "done": "已处理",
-                          "decided": "已决议", "dropped": "已丢弃"},
-        "help": "打开脑内抽屉时，内容流里放哪几类（默认：备忘 + 待处理灵感）",
+        "choices": ["memo", "memo_done", "open", "done", "dropped"],
+        "choice_labels": {"memo": "待办", "memo_done": "已完成的待办",
+                          "open": "未整理的思绪", "done": "已整理的思绪",
+                          "dropped": "已丢弃"},
+        # 🔴 「已决议」并入「已整理」（用户 2026-10-12）—— 旧配置 / 旧指令里
+        #    的 decided 一律当 done 收，别让存量设置突然失效。
+        "aliases": {"decided": "done"},
+        "help": "打开脑内抽屉时，内容流里放哪几类（默认：待办 + 未整理的思绪）",
     },
     "boomerang_days": {
         "label": "回旋镖回溯天数",
@@ -99,10 +107,12 @@ KEYS = {
     "boomerang_scope": {
         "label": "回旋镖推送范围",
         "kind": "multi",
-        "default": ["memo", "open", "done", "decided"],
-        "choices": ["memo", "open", "done", "decided", "dropped"],
-        "choice_labels": {"memo": "备忘", "open": "待处理灵感", "done": "已处理灵感",
-                          "decided": "已决议灵感", "dropped": "已丢弃灵感"},
+        "default": ["memo", "open", "done"],
+        "choices": ["memo", "open", "done", "dropped"],
+        "choice_labels": {"memo": "待办", "open": "未整理", "done": "已整理",
+                          "dropped": "已丢弃"},
+        # 旧配置里的 decided 当 done 收（见 bubbles_show 的说明）
+        "aliases": {"decided": "done"},
         "help": "发「回旋镖」时，从哪几类旧记录里挑一条推回来",
     },
     # 🔴 收图：**一个 multi 键顶三个开关**。
@@ -119,7 +129,7 @@ KEYS = {
         "choices": ["c2c", "group"],
         "choice_labels": {"c2c": "私聊", "group": "群聊"},
         "help": "把消息里的图片存到本地（脑内抽屉里显示、导出的 zip 里带上）。"
-                "默认**关**。图片是带时效的远程链接，收到不存就再也拿不到了 —— "
+                "默认关。图片是带时效的远程链接，收到不存就再也拿不到了 —— "
                 "所以这是「收到即落盘」，之后一直留着，不会自动清理。",
     },
     "ui_font_scale": {
@@ -139,7 +149,7 @@ KEYS = {
         "max": 1024,
         # 🔴 0 = 不报警（不是「0GB 就报警」）—— 关掉报警必须有个明确的写法
         "help": "图片占用超过这个 GB 数时，往播报目标发一条提醒（默认 5）；填 0 = 不报警。"
-                "占用回落到阈值以下的**下一次**超标才会再提醒一次，不会刷屏。",
+                "占用回落到阈值以下的下一次超标才会再提醒一次，不会刷屏。",
     },
 }
 
@@ -193,7 +203,7 @@ def _save(values):
 
 # ── 归一化 / 校验 ────────────────────────────────────────────────
 def _to_code(key, token):
-    """把「待处理」/「open」统一成 code；认不出返回 None。"""
+    """把「已整理」/「open」统一成 code；认不出返回 None。"""
     cfg = KEYS[key]
     t = str(token).strip()
     if t in cfg["choices"]:
@@ -201,6 +211,10 @@ def _to_code(key, token):
     for code, label in cfg["choice_labels"].items():
         if t == label:
             return code
+    # 旧值别名（decided → done）：分类合并后老配置 / 老指令照常生效
+    alias = (cfg.get("aliases") or {}).get(t)
+    if alias:
+        return alias
     return None
 
 
@@ -373,17 +387,21 @@ def describe():
 
 def _find_key(name):
     n = (name or "").strip()
-    if n in KEYS:
+    if n in KEYS and n not in _CHAT_HIDDEN_KEYS:
         return n
     for k, cfg in KEYS.items():
+        if k in _CHAT_HIDDEN_KEYS:
+            continue
         if n == cfg["label"]:
             return k
     return None
 
 
 def list_text():
-    lines = ["⚙ 设置（网页「配置中心」改的是同一份）"]
+    lines = ["⚙ 设置（桌面「配置中心」改的是同一份）"]
     for k, cfg in KEYS.items():
+        if k in _CHAT_HIDDEN_KEYS:
+            continue
         lines.append(f"{cfg['label']} [{k}] = {display(k)}")
     lines.append("改法：设置 <键> <值> ｜ 设置 重置 <键>")
     return "\n".join(lines)

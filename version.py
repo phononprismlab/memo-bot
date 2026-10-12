@@ -2,10 +2,10 @@
 
 这个文件是干嘛的：版本号只写一份（`VERSION` 常量），配置中心页面显示、更新检测比较、
 打包脚本都用它。**改了版本号要同步改同目录的 `VERSION` 文件** —— 远端检测读的就是那个文件，
-`_exe_poc/memo-bot.iss` 也是直接读它（所以安装包名字里的版本号不会跟代码脱节）。
+    `packaging/memo-bot.iss` 也是直接读它（所以安装包名字里的版本号不会跟代码脱节）。
 
-谁调用它：`memo_gui.py`（桌面版「运行方式」页的版本号 + 「检查更新」按钮）、
-         `config-web.py`（页面显示 + 「检查更新」按钮）。
+谁调用它：`memo_gui.py`（桌面版「⑩ 版本」页的版本号 + 「检查更新」按钮）、
+         `config_core.py`（把版本号塞进 `full_state()`）。
 
 🔴 远端地址走 jsdelivr，不走 raw.githubusercontent.com —— 后者在国内基本连不上（实测 curl exit 35）。
 
@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = "phononprismlab/memo-bot"
 RAW_URL = "https://cdn.jsdelivr.net/gh/{repo}@main/VERSION"
 # jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，HTTP 缓存 5 分钟，
@@ -41,7 +41,7 @@ VERSIONS_API = "https://data.jsdelivr.com/v1/packages/gh/{repo}"
 RELEASES_API = "https://api.github.com/repos/{repo}/releases/latest"
 HOMEPAGE = "https://github.com/{repo}"
 
-# 安装包命名（**必须**和 `_exe_poc/memo-bot.iss` 的 OutputBaseFilename 一致，
+# 安装包命名（**必须**和 `packaging/memo-bot.iss` 的 OutputBaseFilename 一致，
 # 否则「检查更新 → 下载」会 404）。发版时 Release 资产的 tag 用 `v<版本>`。
 ASSET_TMPL = "memo-bot-setup-v{ver}.exe"
 TAG_TMPL = "v{ver}"

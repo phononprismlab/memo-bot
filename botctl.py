@@ -3,9 +3,9 @@
 这个文件是干嘛的：把机器人（bot.py）的**启 / 停 / 重启 / 开机自启**收一处，
     配置中心页面上的按钮、管家（hub.py）的编排，都调这里，不各写一遍。
 
-为什么独立成文件（而不是塞在 config-web.py 里）：
-    三合一打包后，管家也要管机器人。把这套逻辑放在 config-web 里，
-    管家就得 import 整个配置中心（一大坨网页代码），太重。
+为什么独立成文件（而不是塞在配置中心里）：
+    三合一打包后，管家也要管机器人。把这套逻辑放进配置后端，
+    管家就得 import 一整套配置逻辑（很长一坨），太重。
     抽出来，两边各 import 几个函数就行。
 
 🔴 关键约束（和单机版一致，但打包后更敏感）：
@@ -13,10 +13,10 @@
     · 开机自启 = 注册 Windows 计划任务 `MoyuBot`，但任务指向的是**管家**
       （`--hub --no-browser`），不是直接指向机器人。理由：机器人是管家的子服务，
       让管家在登录时统一拉起来，才不会「计划任务拉一个、管家又拉一个」打架。
-    · 配置中心页面上的「启动机器人」按钮，走的是**直接 Popen**（不是 Start-ScheduledTask），
+    · 桌面配置中心的「启动机器人」按钮，走的是**直接 Popen**（不是 Start-ScheduledTask），
       因为计划任务现在代表「启动管家」，按钮不该去启动管家本体。
 
-调用方：config-web.py（页面按钮 / 状态查询）、hub.py（管家编排）。
+调用方：config_core.py（桌面配置中心按钮 / 状态查询）、hub.py（管家编排）。
 """
 import os
 import subprocess
@@ -36,8 +36,15 @@ if HERE not in sys.path:
 
 from paths import data_path, data_dir  # noqa: E402
 
+import single_lock as _single_lock  # noqa: E402  （OS 级跨进程锁）
+
 LAUNCHER = os.path.join(HERE, "memo-launcher.py")   # 统一启动器（补 sys.path + 定数据目录）
 PID_FILE = data_path("bot.pid")
+
+# 启动动作的**跨进程**串行锁（见 bot_start 的说明）—— 只护住「检查 + Popen」
+# 那一小段，不是机器人运行期的锁（那个归 bot.py 自己的命名互斥体）。
+_START_LOCK = _single_lock.SingleInstance("botstart")
+_START_THREAD_LOCK = threading.Lock()
 BOT_LOG = data_path("bot.out.log")
 TASK_NAME = "MoyuBot"
 
@@ -54,21 +61,39 @@ def _pid_alive(pid, _fast=True):
     if pid <= 0:
         return False
     if _fast and os.name == "nt":
-        # OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) —— 拿得到句柄 = 进程在。
-        # 失败时看错误码：87 = ERROR_INVALID_PARAMETER = 压根没这个 PID，
-        # 可以直接判定「不在」，不用再去开 tasklist；其它错误码（多半是权限）
-        # 才落到下面的 tasklist 兜底，宁可慢也别误判。
+        # 🔴 **拿得到句柄 ≠ 进程在跑** —— 这是本函数踩过的最阴的坑（2026-10-12 实测）：
+        #    子进程退出后，只要**别人还持有它的句柄**（Popen 就持有子进程句柄，
+        #    管家 hub 因此一直握着 bot 的句柄），它就变成「僵尸」留在进程表里 ——
+        #    `OpenProcess` 照样**成功**，可进程早没了。
+        #    真机现象：bot.pid 记着 20016、`bot_running()` 报「在跑」，
+        #    但 tasklist 里根本没有 20016（GetExitCodeProcess 回来是 1 = 已退出）
+        #    ⇒ 桌面版「启动」按钮死活点不动（它以为已经在跑）。
+        #    修法：拿到句柄后**再问一次退出码**，只有 STILL_ACTIVE(259) 才算在跑。
+        verdict = None          # None = 快路径没定论 → 落到下面的 tasklist 兜底
         try:
             import ctypes
             k32 = ctypes.windll.kernel32
+            # 🔴 restype 必须显式设成 c_void_p：默认 c_int 会把 64 位句柄截断，
+            #    高位句柄可能被截成 0（假死）或截成别的非零值（假活）。
+            k32.OpenProcess.restype = ctypes.c_void_p
             h = k32.OpenProcess(0x1000, False, int(pid))
-            if h:
-                k32.CloseHandle(h)
-                return True
-            if k32.GetLastError() == 87:
-                return False
+            if not h:
+                # 87 = ERROR_INVALID_PARAMETER = 压根没这个 PID → 直接判「不在」，
+                # 不用再去开 tasklist；其它错误码（多半是权限）交给 tasklist 兜底。
+                if k32.GetLastError() == 87:
+                    verdict = False
+            else:
+                try:
+                    code = ctypes.c_ulong(0)
+                    if k32.GetExitCodeProcess(ctypes.c_void_p(h),
+                                              ctypes.byref(code)):
+                        verdict = (code.value == 259)     # STILL_ACTIVE
+                finally:
+                    k32.CloseHandle(ctypes.c_void_p(h))
         except Exception:                                            # noqa: BLE001
-            pass
+            verdict = None
+        if verdict is not None:
+            return verdict
     try:
         if os.name == "nt":
             # 🔴 两处都要兜底，否则**整个启停流程会被打断**
@@ -324,7 +349,31 @@ def bot_start():
        按钮去调它反而会启一个多余的管家。机器人是管家的子服务，
        但配置中心页面上「启动机器人」这个动作由管家统一负责也不是不行 ——
        这里保持「按钮 = 直接起机器人进程」，简单且和单机版语义一致。
+
+    🔴 「检查在不在跑 → Popen」两步**不是原子的**：两个启动请求同时到达时，
+       都能在对方写出 `bot.pid` 之前通过检查，于是各起一个进程
+       （审查报告点出的并发窗口）。所以整段拿一把**启动锁**串起来 ——
+       后到的那个进来时，前一个已经把机器人的 `bot.pid` 写好了，
+       `bot_running()` 立刻为真，直接返回「已经在跑了」。
+       ⚠️ 机器人的**运行期**唯一性由 `bot.py` 自己的 OS 级命名互斥体兜底
+       （`single_lock`）：就算这里真漏起了一个，第二个进程也会自己退出。
+        锁必须**在检查之前**拿、在拿到之后才检查，顺序不能反。
     """
+    if not _START_THREAD_LOCK.acquire(blocking=False):
+        return False, "另一个启动操作正在进行，请稍后再试"
+    try:
+        if not _START_LOCK.acquire():
+            return False, "另一个启动操作正在进行，请稍后再试"
+        try:
+            return _bot_start_locked()
+        finally:
+            _START_LOCK.release()
+    finally:
+        _START_THREAD_LOCK.release()
+
+
+def _bot_start_locked():
+    """`bot_start` 的临界区（已持启动锁）—— 见 `bot_start` 的说明。"""
     if bot_running():
         return True, "机器人已经在跑了"
     flags = 0
@@ -341,9 +390,9 @@ def bot_start():
             fh.close()
     except OSError as e:
         return False, f"起不来：{e}"
-    for _ in range(60):                           # 最多等 ~15 秒
+    for _ in range(60):                       # 最多等 ~15 秒
         time.sleep(0.25)
-        pid = bot_running(force=True)             # 🔴 force：别吃 0.6s 缓存，否则白等
+        pid = bot_running(force=True)         # 🔴 force：别吃 0.6s 缓存，否则白等
         if pid:
             return True, f"已启动（pid {pid}）"
     return False, "进程起了但没等到 bot.pid —— 打开 bot.out.log 看下报了什么错"

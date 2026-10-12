@@ -12,7 +12,7 @@
    （早先无条件设，源码版数据目录被改到 `%LOCALAPPDATA%/memo-bot`，读不到旧库。）
 3. **让随包的 node 能被找到**。安装版把 `node.exe` 放在 `node/` 子目录，不在 PATH 上，
    这里设 `MEMO_NODE` 指过去。（`playwright-core` 不用管 —— 它放在
-   `node_modules/` 下，`config-web.py` / `md2png.mjs` 本来就会去那儿找。）
+   `node_modules/` 下，`md2png.mjs` 本来就会去那儿找。）
 
 用法（`--xxx` 之后的参数原样透传给对应脚本）：
 
@@ -55,9 +55,7 @@ if PACKAGED and not os.environ.get("MEMO_NODE"):
 SCRIPTS = {
     "--hub": "hub.py",
     "--gui": "memo_gui.py",
-    "--config": "config-web.py",
     "--bot": "bot.py",
-    "--drawer": "brain-drawer.py",
     "--send": "send_file.py",
     "--ideas": "ideas.py",
     "--moyu": "moyu.py",

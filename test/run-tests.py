@@ -10,16 +10,15 @@
   [4] bot            文本清洗、搜索打分、动态帮助、日志轮转、PID 判活、群/私聊会话标识
   [5] send_file      文件类型识别、文本类判定、群/单聊目标路径、last_msg 兼容
   [6] md2img         依赖定位（node / 浏览器候选探测）
-  [7] brain-drawer  页面生成、--serve API、--apply、防重叠源码护栏
-  [8] extensions     扩展注册表、加载容错、example.py 模板不注册指令
-  [9] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
- [10] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
- [11] settings       本机设置：默认值/env 回退/校验归一化/批量回滚/中文标签/指令识别
-[12] config-web     配置中心：.env 按行写入（注释与顺序保留/备份）、白名单校验、
-                    secret 不回显、字段表分组、页签与未配置门禁、摸鱼库页签、
-                    页面护栏、文档同步
- [13] console        GBK 环境下不许把进程带崩（stdout 重定向 / 日志编码）
- [14] boomerang      回旋镖取数范围 + 导出打包
+  [7] extensions     扩展注册表、加载容错、example.py 模板不注册指令
+  [8] ignore         忽略表：env/file 规则、match 双语义、四种指令、来源保护
+  [9] route_message  真实路由：忽略闸门（群/私聊）、指令放行、指令分发、灵感兜底
+ [10] settings       本机设置：默认值/env 回退/校验归一化/批量回滚/中文标签/指令识别
+[11] config_core    配置后端：.env 按行写入（注释与顺序保留/备份）、白名单校验、
+                    secret 不回显、字段表分组、页签顺序、文档同步（网页 UI 已下线，
+                    后端独立成 config_core.py，桌面端复用）
+ [12] console        GBK 环境下不许把进程带崩（stdout 重定向 / 日志编码）
+ [13] boomerang      回旋镖取数范围 + 导出打包
  [15] launcher       启动器：源码直跑不许改数据目录
   [16] onboarding     新手引导：「你好」自我介绍（写明无语言生成能力）、首次上线发介绍、
                      之后只发启动播报、备忘 / 灵感回执可配
@@ -29,6 +28,7 @@
 🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json / .env**。
 """
 import ast
+import asyncio
 import importlib.util
 import json
 import os
@@ -65,7 +65,7 @@ sys.path.insert(0, ROOT)
 #    假 openid，曾真的落进仓库里的 groups.json / c2c.json（踩过两次）。
 #    这里把 `MEMO_DATA_DIR` 指到临时目录，所有走 `paths.data_path()` 的**模块级路径**
 #    （push.FILE / store.DB / settings / .env …）就都落在临时目录里了。
-#    ⚠️ 顺带切断了 push.py 的旧文件迁移 —— 它读 `data_path("groups.json")`，
+#    ⚠️ 顺带切断了 push.py 的旧文件迁移 —— 它读 `data_path("groups.json")`,
 #       不设的话测试会去读仓库里的真实 groups.json，把真实 openid 迁进断言。
 _TMP_DATA = tempfile.mkdtemp(prefix="memo_test_data_")
 os.environ["MEMO_DATA_DIR"] = _TMP_DATA
@@ -412,9 +412,107 @@ def test_bot():
     check("没有残留的同步 search_files 调用",
           "\n        matches = search_files(q)" not in _src)
 
+    # 🔴「发文件」多搜索目录（item16 2026-10-12）：没找到时回执要告诉用户搜了哪些目录
+    check("「没找到文件」回执附搜索范围（search_scope_text）",
+          "search_scope_text()" in _src)
+    _scope_roots = bot.SEARCH_ROOTS
+    try:
+        _xn = os.path.normcase(os.path.abspath(os.path.join(ROOT, "x")))
+        _yn = os.path.normcase(os.path.abspath(os.path.join(ROOT, "y")))
+        bot.SEARCH_ROOTS = [os.path.join(ROOT, "x"), os.path.join(ROOT, "y")]
+        _scope = bot.search_scope_text(limit=10 ** 9)   # 关掉默认 120 截断，专测拼接
+        check("search_scope_text 用顿号连多根",
+              _scope.count("、") == 1 and _xn in _scope and _yn in _scope,
+              f"got={_scope!r}")
+        bot.SEARCH_ROOTS = [os.path.join(ROOT, "a"), os.path.join(ROOT, "a", "sub")]
+        _expected = os.path.normcase(os.path.abspath(os.path.join(ROOT, "a")))
+        check("search_scope_text 剔除被包含的目录",
+              bot.search_scope_text(limit=10 ** 9) == _expected,
+              f"got={bot.search_scope_text(limit=10**9)!r} want={_expected!r}")
+    finally:
+        bot.SEARCH_ROOTS = _scope_roots
+
+    # 🔴 桌面配置中心「④ 发文件」的 paths 字段：多行目录框 + 浏览追加
+    _gui_src = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    check("桌面 paths 字段渲染多行目录框",
+          'kind == "paths"' in _gui_src
+          and "scrolledtext.ScrolledText" in _gui_src
+          and "_browse_into" in _gui_src)
+    check("桌面浏览把目录追加进框（不覆盖已填）",
+          "_browse_into(self, txt)" in _gui_src
+          and "txt.insert(\"end\"" in _gui_src)
+
+    check("help_text 指向配置中心「④ 发文件」",
+          "④ 发文件" in bot.help_text())
+
     check("help_text 含内置指令", "备忘" in bot.help_text())
     check("help_text 追加了扩展帮助行",
           all(h in bot.help_text() for h in bot.EXT.help_lines()))
+
+    # ── 「搜索灵感」指令 +「#」标签（用户 2026-10-12）──
+    # ① 「#」标签切分：词边界（空白 / 标点 / **汉字**）后的 # 开标签区，
+    #    区内按「标点 / 空格 / 换行」切多个名；字母数字后的 # 是词的一部分。
+    check("# 标签：空格 / 汉字后都能开切，区内可切多个名",
+          bot.split_tags("参考这个配色 #设计 UI") == ("参考这个配色", ["设计", "UI"])
+          and bot.split_tags("参考配色#设计") == ("参考配色", ["设计"]),
+          f"got={bot.split_tags('参考这个配色 #设计 UI')}")
+    check("# 标签：字母 / 数字后的 # 不当标签（C# / issue#42 不剪）",
+          bot.split_tags("C# 和 Python 都学") == ("C# 和 Python 都学", [])
+          and bot.split_tags("issue#42 已修") == ("issue#42 已修", []),
+          f"got={bot.split_tags('issue#42 已修')}")
+    check("# 标签：逗号 / 顿号 / 全角标点都算分隔",
+          bot.split_tags("三个词 #设计,UI,参考") == ("三个词", ["设计", "UI", "参考"]),
+          f"got={bot.split_tags('三个词 #设计,UI,参考')}")
+    check("# 标签：重名只留一个",
+          bot.split_tags("x #设计 设计 #设计") == ("x", ["设计"]),
+          f"got={bot.split_tags('x #设计 设计 #设计')}")
+    check("# 标签：一条最多 10 个（防 abusive 输入）",
+          bot.split_tags("x " + " ".join("#t%d" % i for i in range(15)))[1]
+          == ["t%d" % i for i in range(10)],
+          f"got={bot.split_tags('x ' + ' '.join('#t%d' % i for i in range(15)))[1]}")
+    check("# 标签：整条都是标签 → 原样返回（不留空正文卡片）",
+          bot.split_tags("#设计 #UI 参考") == ("#设计 #UI 参考", []))
+    check("# 标签：没有 # 的原文原样",
+          bot.split_tags("没有标签") == ("没有标签", []))
+
+    # ② 搜索灵感：按正文 / 标签 / 结论命中（隔离临时库，不碰别的测试的数据）
+    import store as _store
+
+    _db_orig = _store.DB
+    _tmp_db = tempfile.mkdtemp(prefix="idea_search_")
+    try:
+        _store.DB = os.path.join(_tmp_db, "t.db")
+        _store.init()
+        _store.add_memo("g", "", "s", "", "首页改成浅色", kind=_store.KIND_IDEA,
+                        tags=["设计"])
+        _store.add_memo("g", "", "s", "", "买猫粮", kind=_store.KIND_IDEA,
+                        tags=["生活"])
+        _store.add_memo("g", "", "s", "", "周报模板", kind=_store.KIND_MEMO)
+        _r = bot.idea_search_text("设计")
+        check("搜索灵感命中打了 #设计 标签的灵感",
+              "首页改成浅色" in _r and "命中 1 条" in _r, f"got={_r.splitlines()[0]}")
+        check("搜索灵感不搜备忘（kind 闸在）",
+              "周报模板" not in _r, f"got={_r.splitlines()[0]}")
+        check("搜索灵感命中正文",
+              "买猫粮" in bot.idea_search_text("猫粮"))
+        _r3 = bot.idea_search_text("不存在的词xyz")
+        check("搜索灵感没命中给提示（不静默开空窗）",
+              "没有含" in _r3 and "换个词" in _r3, f"got={_r3[:30]}")
+        check("搜索灵感空关键词给提示", bot.idea_search_text("  ") == bot.IDEA_SEARCH_HINT)
+    finally:
+        _store.DB = _db_orig
+        shutil.rmtree(_tmp_db, ignore_errors=True)
+
+    # ③ 源码护栏：指令接进了处理器、两条入库路径都切标签、帮助菜单写了它
+    _bsrc = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("搜索灵感接进消息处理器（@ 与非 @ 都认）",
+          "IDEA_SEARCH_RE.match(text)" in _bsrc
+          and "reply = idea_search_text(q)" in _bsrc
+          and "await message.reply(content=reply, msg_seq=1)" in _bsrc)
+    check("两条灵感入库路径都走 split_tags 切标签",
+          _bsrc.count("split_tags(") >= 3)     # def + _store_media + [图·@]
+    check("帮助菜单有「搜索灵感」和「# 标签」两行",
+          "搜索灵感 <关键词>" in _bsrc and "写灵感带 # 号" in _bsrc)
 
     tmpdir = tempfile.mkdtemp(prefix="bot_test_")
     try:
@@ -573,586 +671,6 @@ def test_md2img():
     check("md2img.py 不写死用户目录", not _HOME_RE.search(py_src2))
     check("md2png.mjs 支持 MEMO_CHROME", "MEMO_CHROME" in mjs_src)
     check("md2png.mjs 支持 MEMO_PLAYWRIGHT_CORE", "MEMO_PLAYWRIGHT_CORE" in mjs_src)
-
-
-# ── [7] brain-drawer ───────────────────────────────────────────
-def _load_bubbles():
-    spec = importlib.util.spec_from_file_location(
-        "ib", os.path.join(ROOT, "brain-drawer.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_ideas_bubbles():
-    print("\n[7] brain-drawer 页面生成与页内处理")
-    import settings
-    import store
-
-    orig_db = store.DB
-    _orig_set = os.environ.get("MEMO_SETTINGS_FILE")
-    tmpdir = tempfile.mkdtemp(prefix="ib_test_")
-    try:
-        store.DB = os.path.join(tmpdir, "t.db")
-        # 🔴 设置也要指到临时文件，否则会写真实的 memo-bot/settings.json
-        os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmpdir, "settings.json")
-        store.init()
-        store.add_memo("g", "", "s", "", "测试灵感一", kind=store.KIND_IDEA)
-        b = store.add_memo("g", "", "s", "", "测试灵感二", kind=store.KIND_IDEA)
-
-        ib = _load_bubbles()
-
-        items = ib.collect()
-        check("collect 每条都带 id", all(i.get("id") for i in items), f"got={items}")
-        check("collect 条数正确", len(items) == 2, f"got={len(items)}")
-        check("collect 按时间正序", items[0]["t"] == "测试灵感一", f"got={items[0]['t']}")
-
-        doc, stats = ib.build_html(items)
-        check("build_html 无占位符残留",
-              all(p not in doc for p in ("__DATA__", "__LABEL__", "__GEN__", "__PREVIEW__")))
-        check("build_html 数据已内嵌", "测试灵感一" in doc)
-        check("页面不截断正文（源码里无 PREVIEW 截断）", "PREVIEW" not in doc)
-        check("stats 统计正确", stats.get("open") == 2, f"got={stats}")
-        check("HTML 带 favicon 占位（避免 404 噪音）", 'rel="icon"' in doc)
-
-        # ── 布局防重叠的源码级护栏（这些是真机踩过的坑，回归必查）
-        T = ib.TEMPLATE
-        py_src = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
-        _store_src = open(os.path.join(ROOT, "store.py"), encoding="utf-8").read()
-        check("所有气泡同一下降速度（BASE_DUR，避免追尾）",
-              "const BASE_DUR" in T and "const dur = BASE_DUR" in T)
-        check("有最小间隔门 minGapMs（保证竖直等距）", "function minGapMs" in T)
-        check("挑长文本放回队首用 unshift（否则原地打转）",
-              "function unPick" in T and "queue.unshift(it)" in T)
-        check("长文本判据按估算高度、非固定字数阈值（已删 LONG_CHARS 常量）",
-              "function estHeight" in T
-              and not re.search(r"LONG_CHARS\s*=", T)
-              and not re.search(r"LONG_CHARS\s*=", py_src))
-        check("离线模式靠 file.protocol 前置判定（避免 CORS 红字）",
-              "location.protocol !== 'file:'" in T)
-        check("页脚渐隐底色（气泡从黑暗升起，不糊页脚字）",
-              "linear-gradient(0deg,var(--footbar-1)" in T)
-        check("预热等距（按实际条目数均分），无随机抖动",
-              "spawn((i + 1) / (cnt + 1))" in T and "const cnt = Math.min(cfg.maxB" in T)
-        # 🔴 回归护栏：预热进度**不能从 0 开始**（`i/cnt` 的老写法）。
-        #    warm=0 → animationDelay=0 → 气泡从 bottom:-10vh 往上爬，
-        #    而 floatUp 前 ~9% 全在视口外 → 实测 2.3s 才露头；
-        #    条目只有 1 条时就是「打开抽屉整屏空白 2.3 秒」。
-        check("🔴 预热进度不从 0 开始（否则首屏要等 2.3s 才看到气泡）",
-              "spawn(i / cnt)" not in T)
-
-        # --apply：离线导出的操作
-        ops_path = os.path.join(tmpdir, "ops.json")
-        with open(ops_path, "w", encoding="utf-8") as f:
-            json.dump({"ops": [
-                {"id": b["id"], "status": "decided", "note": "测试结论"},
-                {"id": "nonexistent", "status": "done"},
-            ]}, f, ensure_ascii=False)
-        check("apply_ops 正常返回 0", ib.apply_ops(ops_path) == 0)
-        got = store.find_idea(b["id"])
-        check("apply_ops 写入状态与结论",
-              got["status"] == "decided" and got["note"] == "测试结论",
-              f"got={got['status']}/{got['note']}")
-
-        bad = os.path.join(tmpdir, "bad.json")
-        with open(bad, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": b["id"], "status": "bogus"}]}, f)
-        ib.apply_ops(bad)
-        check("apply_ops 跳过非法 status，不污染数据",
-              store.find_idea(b["id"])["status"] == "decided")
-
-        # --serve 的 HTTP API
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), ib._make_handler(doc))
-        port = httpd.server_address[1]
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{port}"
-        try:
-            with urllib.request.urlopen(base + "/api/ping") as r:
-                check("GET /api/ping ok", json.load(r).get("ok") is True)
-            with urllib.request.urlopen(base + "/api/ideas") as r:
-                check("GET /api/ideas 条数", len(json.load(r)["items"]) == 2)
-            with urllib.request.urlopen(base + "/") as r:
-                check("GET / 返回页面", len(r.read()) > 1000)
-
-            req = urllib.request.Request(
-                base + "/api/status",
-                data=json.dumps({"id": b["id"], "status": "done", "note": "api"}).encode(),
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req) as r:
-                check("POST /api/status 写入 1 条", json.load(r).get("changed") == 1)
-            check("API 写入已落库", store.find_idea(b["id"])["status"] == "done")
-
-            for label, payload, want in [
-                ("不存在的 id", {"id": "deadbeef", "status": "done"}, 404),
-                ("非法 status", {"id": b["id"], "status": "bogus"}, 400),
-            ]:
-                try:
-                    urllib.request.urlopen(urllib.request.Request(
-                        base + "/api/status",
-                        data=json.dumps(payload).encode(),
-                        headers={"Content-Type": "application/json"}))
-                    check(f"{label} 应被拒绝", False)
-                except urllib.error.HTTPError as e:
-                    check(f"{label} → HTTP {want}", e.code == want, f"got={e.code}")
-
-            # 设置接口（网页「⚙ 设置」用；和机器人「设置」指令写同一份）
-            with urllib.request.urlopen(base + "/api/settings") as r:
-                sj = json.load(r)
-            check("GET /api/settings 返回全部键",
-                  sj.get("ok") is True and {k["key"] for k in sj["keys"]} == set(settings.KEYS),
-                  f"got={sj}")
-            sreq = urllib.request.Request(
-                base + "/api/settings",
-                data=json.dumps({"values": {"bubbles_show": ["open", "done"]}}).encode(),
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(sreq) as r:
-                check("POST /api/settings 返回 ok", json.load(r).get("ok") is True)
-            check("POST /api/settings 已落库",
-                  settings.get("bubbles_show") == ["open", "done"],
-                  f"got={settings.get('bubbles_show')}")
-            try:
-                urllib.request.urlopen(urllib.request.Request(
-                    base + "/api/settings",
-                    data=json.dumps({"values": {"bubbles_show": ["乱写"]}}).encode(),
-                    headers={"Content-Type": "application/json"}))
-                check("非法设置值应被拒绝", False)
-            except urllib.error.HTTPError as e:
-                check("非法设置值 → HTTP 400", e.code == 400, f"got={e.code}")
-
-            # 停止服务（页面顶部「⏻ 停止服务」用的就是这个）
-            q = urllib.request.Request(base + "/api/quit", data=b"{}",
-                                       headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(q) as r:
-                check("POST /api/quit 返回 ok", json.load(r).get("ok") is True)
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-        # ── 视图：内容流只放「待处理」，其余进归档列表 ──────────
-        d = store.add_memo("g", "", "s", "", "已丢弃的一条", kind=store.KIND_IDEA)
-        store.set_idea_status([d["id"]], "dropped", "验收")
-        items2 = ib.collect()
-        _, stats2 = ib.build_html(items2)
-        check("collect 带上了归档条目", len(items2) == 3, f"got={len(items2)}")
-        check("stats 统计含 dropped", stats2.get("dropped") == 1, f"got={stats2}")
-        only = ib.collect(open_only=True)
-        check("collect(open_only=True) 只返回待处理",
-              bool(only) and all(x["s"] == "open" for x in only), f"got={only}")
-
-        T2 = ib.TEMPLATE
-        check("内容流不再硬编码只取 open",
-              "x.s === 'open'" not in T2)
-        check("轮播队列只装待处理", "shuffle(streamItems().slice())" in T2)
-        check("归档四个桶（含已完成的备忘）",
-              "const ARCHIVE = ['memo_done', 'done', 'decided', 'dropped'];" in T2)
-        check("垃圾桶文案", "🗑 垃圾桶" in T2)
-        check("已处理 / 已决议 各有列表入口",
-              "✅ 已处理" in T2 and "📌 已决议" in T2)
-        check("列表浮层 DOM（#list / #lbody / #ltitle）",
-              'id="list"' in T2 and 'id="lbody"' in T2 and 'id="ltitle"' in T2)
-        check("列表行带恢复按钮", "← 恢复" in T2 and "'open'" in T2)
-        check("改状态不删记录（moveItem；dropIdea 已删除）",
-              "function moveItem" in T2 and "function dropIdea" not in T2)
-        check("serve 模式定时拉最新（bot 新收的灵感自动进流）",
-              "setInterval(refreshFromServer" in T2 and "async function refreshFromServer" in T2)
-        check("停止服务入口在页面上", "/api/quit" in T2 and "btn-quit" in T2)
-        check("浮层打开时不刷新（避免读的时候列表跳）",
-              "modal.classList.contains('on') || listEl.classList.contains('on')" in T2)
-        check("页脚区分待处理与归档", 'id="n-arch"' in T2)
-
-        # 🔴 空库护栏（2026-10-09 修）：--serve 不能因为「没有可放的内容」就退出，
-        #    否则库一空服务就静默起不来，页面都打不开（也就看不到归档）。
-        empty_doc, empty_stats = ib.build_html([])
-        check("空库也能生成页面", isinstance(empty_doc, str) and "streamItems" in empty_doc)
-        check("空库 stats 全 0", all(v == 0 for v in empty_stats.values()), f"got={empty_stats}")
-        check("--serve 下空库不硬退出", "if not items and not args.serve:" in py_src)
-        check("起服务失败时报真实错误（不吞 OSError）",
-              "last_err = e" in py_src and "都起不来：" in py_src)
-
-        # ── 设置：展示范围 + 网页设置入口（2026-10-09）────────────
-        check("思维源占位已删除", "思维源" not in T2 and 'class="source"' not in T2)
-        check(".source / pulse 相关 CSS 已删",
-              ".source{" not in T2 and "@keyframes pulse" not in T2)
-        check("顶部有「⚙ 设置」入口", 'id="btn-settings"' in T2 and "⚙ 设置" in T2)
-        check("设置浮层 DOM",
-              'id="settings"' in T2 and 'id="sbody"' in T2 and 'id="ssave"' in T2)
-        check("设置已内嵌进页面（占位符被替换）",
-              "__SETTINGS__" not in doc and "let SETTINGS = [{" in doc)
-        check("内容流按设置过滤", "IDEAS.filter(x => SHOW.includes(x.s))" in T2)
-        check("展示范围默认「备忘 + 待处理」",
-              "SHOW = settingValue('bubbles_show') || ['memo', 'open']" in T2)
-        check("页脚改为 显示 / 共", '显示 <b id="n">' in T2 and '共 <b id="n-arch">' in T2)
-        check("保存后重建内容流",
-              "function rebuildStream" in T2 and "rebuildStream();" in T2)
-        check("离线模式不允许存设置", "离线模式存不了" in T2)
-        check("Esc 也关设置浮层", "settingsEl.classList.remove('on')" in T2)
-        check("轮询避开设置浮层", "settingsEl.classList.contains('on')" in T2)
-        # 🔴 内嵌的 __SETTINGS__ 是「渲染那一刻」的快照，服务进程却是常驻的 ——
-        #    启动/刷新必须重新拉一次，否则别人（或「设置」指令）改过范围后刷新看不到变化
-        check("启动时从服务端拉设置", "async function refreshSettings" in T2)
-        check("serve 启动会等设置拉回来",
-              "await refreshSettings()" in T2 and "await detectMode()" in T2)
-        check("轮询里也同步设置", "await refreshSettings();" in T2)
-        # 🔴 首屏气泡**不等网络**：__DATA__ / __SETTINGS__ 本来就内嵌在页面里，
-        #    detectMode() 那两跳只是用来确认「是不是 serve 模式 / 设置有没有被改过」。
-        #    放在 await 后面的话，任何一跳慢或挂住 = 开屏一个气泡都不铺
-        #    （真机复现：把 /api/ping 延迟 3s → 整整 3 秒气泡总数为 0）。
-        _boot = T2.index("(async ()=>{")
-        _dm = T2.index("await detectMode()", _boot)
-        check("首屏气泡不等网络（先铺后连）",
-              T2.index("refill();", _boot) < _dm
-              and T2.index("prewarm();", _boot) < _dm)
-        check("设置真被改过才重建（没变就别白闪一下）",
-              "JSON.stringify(SHOW) !== showBefore" in T2[_dm:_dm + 400])
-        # 🔴 fetch 默认没有超时 → 服务卡住 = 无限期空白。只读 GET 统一走 apiGet 兜底
-        check("只读接口有超时兜底", "function apiGet" in T2 and "AbortSignal.timeout" in T2)
-        check("启动那两跳走 apiGet",
-              "apiGet('/api/ping')" in T2 and "apiGet('/api/settings')" in T2)
-        check("写操作不走 apiGet（中途 abort 说不清）",
-              "apiGet('/api/delete')" not in T2 and "apiGet('/api/edit')" not in T2)
-        # 🔴 同一条灵感不能同时出现两个气泡（用户截图：同一条 19:10 出现两次）——
-        #    条目数少于 maxB 时队列会被 refill 循环复用，必须排除「已经在屏幕上的」
-        check("取条目时排除在屏条目", "function onStageIds" in T2 and "on.has(it.id)" in T2)
-        check("全在屏时返回 null 而不是复用", "return null;" in T2)
-        check("spawn 拿到 null 就不补位", "if(!it) return;" in T2)
-        check("unPick 容忍 null", "function unPick(it){ if(it)" in T2)
-        check("预热按实际条目数均分（不按 maxB）",
-              "Math.min(cfg.maxB, streamItems().length)" in T2)
-        check("只有一处铺气泡入口（prewarm）",
-              T2.count("prewarm();") == 2 and "spawn(i / boot.maxB)" not in T2)
-        check("设置只提交改动过的键",
-              "JSON.stringify(v) !== JSON.stringify(s.value)" in T2)
-        check("没改动就不发请求", "没有改动" in T2)
-        # 🔴 有结论的条目要把结论一起显示（已处理/已决议/已丢弃 常带结论）；
-        #    没结论就不渲染那个节点 —— 与以前一致
-        check("气泡渲染结论节点", "nt.className = 'note'" in T2 and "'结论：' + it.note" in T2)
-        check("没结论就不渲染（条件判断）", "if(it.note){" in T2)
-        check("结论样式已定义", ".bubble .note{" in T2)
-        check("结论高度算进布局估算",
-              "function noteHeight" in T2 and "noteHeight(note, widthPx)" in T2)
-        check("长文本判据带上结论与图片",
-              "estHeight(truncate(it.t), laneW, it.note, it.pics)" in T2
-              and "estHeight(truncate(it.t), fullW, it.note, it.pics)" in T2)
-        check("保存设置发的是 {values:...} 契约",
-              "JSON.stringify({values: vals})" in T2)
-
-        # 🔴 换行必须保留（2026-10-09 用户发现：群里分几行写的记录，页面上全挤成一行）
-        check("clean 保留换行",
-              ib.clean("第一行\n第二行\n第三行") == "第一行\n第二行\n第三行",
-              repr(ib.clean("第一行\n第二行\n第三行")))
-        check("clean 只压空格 / 制表符，不压换行",
-              ib.clean("a  \t b") == "a b" and ib.clean("a\nb") == "a\nb",
-              repr(ib.clean("a  \t b")))
-        check("clean 统一 CRLF / CR 换行符",
-              ib.clean("a\r\nb\rc") == "a\nb\nc", repr(ib.clean("a\r\nb\rc")))
-        check("clean 去掉行首尾多余空格",
-              ib.clean("a   \n   b") == "a\nb", repr(ib.clean("a   \n   b")))
-        check("clean 连续空行压成一个",
-              ib.clean("a\n\n\n\nb") == "a\n\nb", repr(ib.clean("a\n\n\n\nb")))
-        check("clean 仍会剥掉 @ 占位符",
-              ib.clean("<C9> 你好") == "你好", repr(ib.clean("<C9> 你好")))
-        check("clean 不再用 \\s+ 压掉换行", 're.sub(r"\\s+", " ", t)' not in T2)
-        check("折行按显式换行分段算（wrappedLines）",
-              "function wrappedLines" in T2 and ".split('\\n')" in T2)
-        check("正文与结论都走 wrappedLines",
-              "wrappedLines(text, widthPx / fp)" in T2
-              and "wrappedLines(note, widthPx / NOTE_FONT)" in T2)
-
-        # ── 备忘也上这一页（2026-10-09）───────────────────────────
-        # 🔴 备忘 = 我要做，有「没完成 / 已完成 / 已丢弃」三态；灵感 = 我的想法，有四态。
-        #    两条流混排在同一条内容流里，靠「桶」分流；dropped 是两类共用的桶。
-        m1 = store.add_memo("g", "", "s", "", "买猫粮", kind=store.KIND_MEMO)
-        store.add_memo("g", "", "s", "", "换水", kind=store.KIND_MEMO)
-        memo_items = [x for x in ib.collect() if x["k"] == "memo"]
-        check("备忘进了同一条流", len(memo_items) == 2, f"got={len(memo_items)}")
-        check("没完成的备忘桶 = memo",
-              all(x["s"] == "memo" for x in memo_items), f"got={memo_items}")
-        check("备忘也会被 --open-only 带上",
-              any(x["k"] == "memo" for x in ib.collect(open_only=True)))
-        check("--no-memo 时流里没有备忘",
-              not any(x["k"] == "memo" for x in ib.collect(include_memo=False)))
-        check("bucket_of：备忘按 status 分桶、灵感按四态、乱值回落 open",
-              ib.bucket_of({"kind": "memo", "status": "open"}) == "memo"
-              and ib.bucket_of({"kind": "memo", "status": "done"}) == "memo_done"
-              and ib.bucket_of({"kind": "idea", "status": "decided"}) == "decided"
-              and ib.bucket_of({"kind": "idea", "status": "乱写"}) == "open")
-        check("🔴 已丢弃的备忘进 dropped 桶（与灵感共用）",
-              ib.bucket_of({"kind": "memo", "status": "dropped"}) == "dropped"
-              and ib.bucket_of({"kind": "idea", "status": "dropped"}) == "dropped"
-              and ib.memo_bucket("dropped") == "dropped")
-        check("BUCKET_ORDER / BUCKET_LABEL 覆盖六个桶",
-              set(ib.BUCKET_ORDER)
-              == {"memo", "memo_done", "open", "done", "decided", "dropped"}
-              and set(ib.BUCKET_LABEL) == set(ib.BUCKET_ORDER))
-        check("备忘「已完成」标签（不再叫「已勾掉」）",
-              ib.BUCKET_LABEL["memo_done"] == "备忘 · 已完成"
-              and "勾掉" not in "".join(ib.BUCKET_LABEL.values()))
-        check("备忘没有 decided 态（store.MEMO_STATUSES）",
-              store.MEMO_STATUSES == ("open", "done", "dropped"))
-
-        check("完成备忘 → 改动 1 条", store.set_memo_status([m1["id"]], "done") == 1)
-        check("完成后桶变 memo_done",
-              any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
-        check("取消完成 → 回到 memo 桶",
-              store.set_memo_status([m1["id"]], "open") == 1
-              and any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
-        check("丢弃备忘 → 进 dropped 桶",
-              store.set_memo_status([m1["id"]], "dropped") == 1
-              and any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
-        check("已丢弃的备忘默认不进内容流",
-              not any(x["id"] == m1["id"] for x in ib.collect(open_only=True)))
-        check("非法 status 返回 0 不炸", store.set_memo_status([m1["id"]], "decided") == 0)
-        check("改不存在的 id 返回 0 不炸", store.set_memo_status(["nope"], "done") == 0)
-        check("备忘改状态碰不到灵感（kind 过滤）",
-              store.set_memo_status([b["id"]], "done") == 0
-              and store.set_memo_status([b["id"]], "dropped") == 0)
-        check("老的 set_memo_done 仍然可用（薄包装）",
-              store.set_memo_done([m1["id"]], True) == 1
-              and store.find_idea(b["id"]) is not None
-              and store.set_memo_done([m1["id"]], False) == 1)
-
-        # 离线导出的操作文件：备忘条目走 kind='memo'（新写法 status，老写法 done 也认）
-        ops2 = os.path.join(tmpdir, "ops2.json")
-        with open(ops2, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "status": "dropped"},
-                               {"id": b["id"], "status": "open", "note": "回到待处理"}]}, f,
-                      ensure_ascii=False)
-        check("apply_ops 支持备忘新写法（status）", ib.apply_ops(ops2) == 0)
-        check("apply_ops 把备忘丢进了 dropped",
-              any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
-        check("apply_ops 同时处理灵感状态", store.find_idea(b["id"])["status"] == "open")
-        ops2b = os.path.join(tmpdir, "ops2b.json")
-        with open(ops2b, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "done": True}]}, f,
-                      ensure_ascii=False)
-        check("apply_ops 仍认老写法（done）", ib.apply_ops(ops2b) == 0
-              and any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
-        ops2c = os.path.join(tmpdir, "ops2c.json")
-        with open(ops2c, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": m1["id"], "kind": "memo", "status": "乱写"},
-                               {"id": m1["id"], "kind": "memo", "status": "decided"}]}, f,
-                      ensure_ascii=False)
-        check("apply_ops 拒绝备忘的非法 status", ib.apply_ops(ops2c) == 0)
-
-        # ✏️ 离线链路也能改正文（可逆，所以不像删除那样被排除在 --apply 之外）
-        _m3 = store.add_memo("g", "", "s", "", "离线编辑前", kind=store.KIND_MEMO)
-        ops3 = os.path.join(tmpdir, "ops3.json")
-        with open(ops3, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": _m3["id"], "content": "离线编辑后"}]}, f,
-                      ensure_ascii=False)
-        check("apply_ops 支持只改正文（不带动状态）", ib.apply_ops(ops3) == 0)
-        _r3 = next(x for x in ib.collect() if x["id"] == _m3["id"])
-        check("离线改正文生效、桶没变（还是没完成的备忘）",
-              _r3["t"] == "离线编辑后" and _r3["s"] == "memo")
-        # 🔴 纯编辑（只有 content、没有 done/status）**不能**顺手把已完成的备忘改回 open
-        _m4 = store.add_memo("g", "", "s", "", "已完成的备忘", kind=store.KIND_MEMO)
-        store.set_memo_status([_m4["id"]], "done")
-        ops3b = os.path.join(tmpdir, "ops3b.json")
-        with open(ops3b, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": _m4["id"], "kind": "memo", "content": "只改正文"}]}, f,
-                      ensure_ascii=False)
-        ib.apply_ops(ops3b)
-        check("🔴 纯编辑不会把已完成的备忘改回 open",
-              any(x["id"] == _m4["id"] and x["s"] == "memo_done" and x["t"] == "只改正文"
-                  for x in ib.collect()))
-        # 编辑 + 状态叠在一条 op 上：两个都要生效
-        ops3c = os.path.join(tmpdir, "ops3c.json")
-        with open(ops3c, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": _m3["id"], "kind": "memo", "content": "叠着改",
-                                "status": "dropped"}]}, f, ensure_ascii=False)
-        ib.apply_ops(ops3c)
-        check("编辑 + 改状态能叠在一条 op 上",
-              any(x["id"] == _m3["id"] and x["t"] == "叠着改" and x["s"] == "dropped"
-                  for x in ib.collect()))
-        ops3d = os.path.join(tmpdir, "ops3d.json")
-        with open(ops3d, "w", encoding="utf-8") as f:
-            json.dump({"ops": [{"id": _m3["id"], "content": "   "}]}, f, ensure_ascii=False)
-        check("apply_ops 空正文不炸（跳过）", ib.apply_ops(ops3d) == 0)
-
-        # /api/memo —— 页面上的勾选框 / 浮层走这条
-        httpd2 = ThreadingHTTPServer(("127.0.0.1", 0), ib._make_handler(doc))
-        port2 = httpd2.server_address[1]
-        threading.Thread(target=httpd2.serve_forever, daemon=True).start()
-        base2 = f"http://127.0.0.1:{port2}"
-
-        def _post(path, payload, want=200):
-            """打一发 POST，返回 (状态码, json)。"""
-            try:
-                with urllib.request.urlopen(urllib.request.Request(
-                        base2 + path, data=json.dumps(payload).encode(),
-                        headers={"Content-Type": "application/json"})) as r:
-                    return r.status, json.load(r)
-            except urllib.error.HTTPError as e:
-                return e.code, json.loads(e.read() or b"{}")
-
-        try:
-            with urllib.request.urlopen(base2 + "/api/items") as r:
-                check("GET /api/items 与旧 /api/ideas 同源",
-                      len(json.load(r)["items"]) == len(ib.collect()))
-
-            code, j = _post("/api/memo", {"id": m1["id"], "status": "open"})
-            check("POST /api/memo 取消完成（status）", code == 200 and j.get("changed") == 1)
-            check("取消完成已落库",
-                  any(x["id"] == m1["id"] and x["s"] == "memo" for x in ib.collect()))
-
-            code, j = _post("/api/memo", {"id": m1["id"], "done": True})
-            check("POST /api/memo 仍认老的 done 写法",
-                  code == 200 and j.get("changed") == 1
-                  and any(x["id"] == m1["id"] and x["s"] == "memo_done" for x in ib.collect()))
-
-            code, j = _post("/api/memo", {"id": m1["id"], "status": "dropped"})
-            check("POST /api/memo 丢弃 → dropped 桶",
-                  code == 200 and j.get("changed") == 1
-                  and any(x["id"] == m1["id"] and x["s"] == "dropped" for x in ib.collect()))
-
-            code, _ = _post("/api/memo", {"id": b["id"], "status": "dropped"})
-            check("/api/memo 碰不到灵感（kind 过滤）", code == 404)
-
-            for label, payload, want in [
-                ("不存在的 id", {"id": "deadbeef", "done": True}, 404),
-                ("空 id", {"id": "", "done": True}, 400),
-                ("非法 status", {"id": m1["id"], "status": "decided"}, 400),
-            ]:
-                code, _ = _post("/api/memo", payload)
-                check(f"/api/memo {label} → HTTP {want}", code == want, f"got={code}")
-
-            # ── ✏️ 再次编辑（走 /api/edit）─────────────────────────
-            medit2 = store.add_memo("g", "", "s", "", "HTTP 编辑前", kind=store.KIND_MEMO)
-            d_before = next(x["d"] for x in ib.collect() if x["id"] == medit2["id"])
-            code, j = _post("/api/edit", {"id": medit2["id"], "content": "HTTP 编辑后"})
-            check("POST /api/edit 改正文", code == 200 and j.get("changed") == 1)
-            _row = next(x for x in ib.collect() if x["id"] == medit2["id"])
-            check("🔴 改完正文变了、创建时间（显示的时间）没变",
-                  _row["t"] == "HTTP 编辑后" and _row["d"] == d_before)
-            for label, payload, want in [
-                ("空 id", {"id": "", "content": "x"}, 400),
-                ("空正文", {"id": medit2["id"], "content": "   "}, 400),
-                ("不存在的 id", {"id": "deadbeef", "content": "x"}, 404),
-            ]:
-                code, _ = _post("/api/edit", payload)
-                check(f"/api/edit {label} → HTTP {want}", code == want, f"got={code}")
-
-            # ── 永久删除（2026-10-10）──────────────────────────────
-            mdel = store.add_memo("g", "", "s", "", "这条要被永久删掉",
-                                  kind=store.KIND_MEMO)
-            store.set_memo_status([mdel["id"]], "dropped")
-            code, _ = _post("/api/delete", {"id": "deadbeef"})
-            check("/api/delete 不存在的 id → 404", code == 404, f"got={code}")
-            code, _ = _post("/api/delete", {"id": ""})
-            check("/api/delete 空 id → 400", code == 400, f"got={code}")
-            code, j = _post("/api/delete", {"id": mdel["id"]})
-            check("/api/delete 真删成功", code == 200 and j.get("deleted") == 1)
-            check("🔴 删完真的从库里没了",
-                  not any(x["id"] == mdel["id"] for x in ib.collect()))
-            code, _ = _post("/api/delete", {"id": mdel["id"]})
-            check("再删同一条 → 404（幂等不炸）", code == 404, f"got={code}")
-            check("delete_items 不吃空列表", store.delete_items([]) == 0
-                  and store.delete_items(None) == 0)
-        finally:
-            httpd2.shutdown()
-            httpd2.server_close()
-
-        # store.delete_items 直接测一遍（两种 kind 都能删、返回条数）
-        _dm = store.add_memo("g", "", "s", "", "备忘删我", kind=store.KIND_MEMO)
-        _di = store.add_memo("g", "", "s", "", "灵感删我", kind=store.KIND_IDEA)
-        check("delete_items 一次删多条（含灵感）",
-              store.delete_items([_dm["id"], _di["id"]]) == 2
-              and not any(x["id"] in (_dm["id"], _di["id"]) for x in ib.collect()))
-        check("delete_items 不存在的 id 不计数", store.delete_items(["nope"]) == 0)
-
-        # ── ✏️ 再次编辑正文（2026-10-10）────────────────────────────
-        # 🔴 这条需求的核心是「**不改变创建时间戳**」—— 只动 content，created_at 一个字节不碰
-        medit = store.add_memo("g", "", "s", "", "写错了的正文", kind=store.KIND_MEMO)
-        _created = next(x["created_at"] for x in store.list_memos(500, store.KIND_MEMO)
-                        if x["id"] == medit["id"])
-        check("update_content 改正文 → 改动 1 条",
-              store.update_content(medit["id"], "改好的正文") == 1)
-        _after = next(x for x in store.list_memos(500, store.KIND_MEMO) if x["id"] == medit["id"])
-        check("正文真的改了", _after["content"] == "改好的正文")
-        check("🔴 创建时间不变（这条需求的核心）", _after["created_at"] == _created)
-        check("update_content 不存在的 id → 0", store.update_content("nope", "x") == 0)
-        check("update_content 空 id / None → 0",
-              store.update_content("", "x") == 0 and store.update_content(medit["id"], None) == 0)
-        check("update_content 不按 kind 过滤（灵感也能改）",
-              store.update_content(b["id"], "灵感也改过了") == 1
-              and store.find_idea(b["id"])["content"] == "灵感也改过了")
-        _uc = _store_src.split("def update_content")[1].split("\n# ──")[0]
-        _uc_body = _uc.split('"""')[-1]      # 掐掉 docstring，只看真代码
-        check("🔴 update_content 的 SQL 里没有 created_at",
-              "SET content=?" in _uc_body and "created_at" not in _uc_body)
-
-        # 源码护栏：备忘在页面上是「一张带勾选框的卡片」
-        check("标题已换成「脑内抽屉」",
-              "🗂 脑内抽屉" in T2 and "灵感泡泡" not in T2)
-        check("<title> 同步改名", "<title>脑内抽屉" in T2)
-        check("备忘卡片挂勾选框",
-              "function makeChk" in T2
-              and "if(it.k === 'memo') hd.append(makeChk(it))" in T2)
-        check("勾选框用 CSS 画（方框 + ::after 对勾），不依赖字符字形",
-              ".bubble .chk{" in T2 and ".bubble .chk.on::after{" in T2)
-        check("完成走 /api/memo", "fetch('/api/memo'" in T2)
-        check("已完成的备忘有列表入口",
-              "✓ 已完成" in T2 and 'id="btn-memo_done"' in T2)
-        check("列表行也显示完成状态", "row.append(makeChk(it, renderList))" in T2)
-        check("浮层对备忘换一套动作（完成 / 丢弃 / 恢复）",
-              "modal.querySelectorAll('.ideaact button')" in T2
-              and "modal.querySelectorAll('.memoact button')" in T2
-              and 'data-memo="done"' in T2 and 'data-memo="drop"' in T2
-              and 'data-memo="open"' in T2 and "function syncMemoActions" in T2)
-        check("离线暂存区分备忘与灵感",
-              "v.k === 'memo'" in T2 and "op.kind = 'memo'" in T2)
-        check("旧导出文件名已改（抽屉操作.json）",
-              "抽屉操作.json" in T2 and "灵感操作.json" not in T2)
-        check("导出文件名/入口脚本名同步",
-              'os.path.join(WORKSPACE, "脑内抽屉.html")' in py_src)
-        check("🔴 页面上不该再出现「勾掉」",
-              "勾掉" not in T2 and "勾掉" not in py_src)
-
-        # ── 永久删除：确认弹窗 + 「以后不再提示」（2026-10-10）─────
-        check("永久删除走 /api/delete",
-              "fetch('/api/delete'" in T2 and 'path.startswith("/api/delete")' in py_src)
-        check("确认弹窗是自定义浮层（要放勾选框，window.confirm 做不到）",
-              'id="confirm"' in T2 and "function askDelete" in T2)
-        check("弹窗里写明找不回来",
-              "找不回来" in T2 and 'id="cquote"' in T2)
-        check("弹窗带「以后不再提示」勾选框",
-              'id="cnoask"' in T2 and "noAskDelete" in T2)
-        check("「不再提示」存浏览器本地（不进 settings.json）",
-              "bubble_del_noask_v1" in T2 and "lsSet(NOASK_KEY" in T2)
-        check("弹窗默认不勾（每次都从「没勾」开始）",
-              "cnoaskEl.checked = false;" in T2)
-        check("设置浮层能把它勾回来",
-              "function deleteConfirmItem" in T2 and "永久删除前再确认" in T2)
-        check("🔴 离线模式禁用永久删除",
-              "离线模式删不了" in T2 and "del.disabled = true" in T2)
-        check("🔴 --apply 不接受删除操作（不可恢复的不进那条链路）",
-              "不含永久删除" in py_src and '"/api/delete"' not in py_src.split("def apply_ops")[1]
-              .split("def _make_handler")[0])
-        check("永久删除按钮有独立的危险样式",
-              "button.danger" in T2 and "永久删除" in T2)
-
-        # ── ✏️ 再次编辑：页面入口 + 创建时间不变（2026-10-10）──────
-        check("编辑走 /api/edit",
-              "fetch('/api/edit'" in T2 and 'path.startswith("/api/edit")' in py_src)
-        check("浮层里有「✏️ 编辑」入口", 'id="btn-edit"' in T2 and "✏️ 编辑" in T2)
-        check("编辑态是独立 textarea + 保存 / 取消",
-              'id="editbox"' in T2 and 'id="esave"' in T2 and 'id="ecancel"' in T2)
-        check("🔴 页面写明了「创建时间不变」", "创建时间不变" in T2)
-        check("归档列表行也有编辑入口", "ed.textContent = '✏️ 编辑'" in T2)
-        check("🔴 编辑时空格是打字、不是暂停轮播",
-              "document.activeElement !== editboxEl" in T2)
-        check("Escape 先退出编辑态（再关浮层）",
-              "else if(editing) setEditMode(false)" in T2)
-        check("离线编辑也进 --apply（可逆，不受删除那条限制）",
-              "store.update_content" in py_src.split("def apply_ops")[1]
-              .split("def _make_handler")[0])
-    finally:
-        store.DB = orig_db
-        if _orig_set is None:
-            os.environ.pop("MEMO_SETTINGS_FILE", None)
-        else:
-            os.environ["MEMO_SETTINGS_FILE"] = _orig_set
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── [8] extensions ──────────────────────────────────────────────
@@ -1343,22 +861,13 @@ def test_ext_manager():
         check("移除不存在的包不抛、返回失败", not ok and bool(msg), msg)
 
         # 14) 配置中心接线：GROUPS / full_state / 路由 / 白名单
-        cw = _load_configweb()
-        csrc = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
+        cw = _load_configcore()
         gsrc = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
         check("GROUPS 里有 ext 分区",
               any(k == "ext" for k, _t, _d in cw.GROUPS))
         check("full_state 带 ext（列表 + 安装目录）",
               isinstance(cw.full_state().get("ext"), dict)
               and "items" in cw.full_state()["ext"])
-        check("页面有自定义指令区块（extSection + 导入按钮）",
-              "extSection(g)" in cw.PAGE and "ext-import" in cw.PAGE)
-        check("页面用 base64 上传（不走 multipart）",
-              "/api/ext/import" in cw.PAGE and "fileToB64" in cw.PAGE)
-        check("接口有 /api/ext/import 与 /api/ext/remove",
-              '"/api/ext/import"' in csrc and '"/api/ext/remove"' in csrc)
-        check("打开扩展目录走白名单（不是任意目录）",
-              '"ext": _extmgr.LOCAL_DIR' in csrc)
         check("🖥 桌面版也有「自定义指令」页（分派 + 导入对话框）",
               'key == "ext"' in gsrc and "_render_ext" in gsrc and "导入扩展…" in gsrc)
         check("🖥 桌面版探测走后台线程（不冻界面）",
@@ -1588,17 +1097,24 @@ def test_route():
         check("改完有回执", bool(m.replies) and "收工，明天见" in m.replies[0],
               f"got={m.replies}")
 
-        m = Msg("设置 bubbles_show 待处理,已处理")
+        m = Msg("设置 bubbles_show 待办,未整理的思绪")
         run(m)
         check("multi 键认中文标签",
-              bot._settings.get("bubbles_show") == ["open", "done"],
+              bot._settings.get("bubbles_show") == ["memo", "open"],
               f"got={bot._settings.get('bubbles_show')}")
 
         m = Msg("设置 bubbles_show 乱写")
         run(m)
         check("非法值被拒且给提示",
-              bot._settings.get("bubbles_show") == ["open", "done"]
+              bot._settings.get("bubbles_show") == ["memo", "open"]
               and bool(m.replies) and "认不出" in m.replies[0], f"got={m.replies}")
+        # 🔴 分类合并（2026-10-12）：decided 已并入「已整理」—— 旧值 / 旧叫法
+        #    都要能收，不能报「认不出」。
+        m = Msg("设置 bubbles_show decided")
+        run(m)
+        check("旧值 decided 收录进 done（分类合并）",
+              bot._settings.get("bubbles_show") == ["done"],
+              f"got={bot._settings.get('bubbles_show')}")
 
         # 9) 不是指令的普通话（「设置好了」）不能被吃掉
         m = Msg("设置好了")
@@ -1694,8 +1210,8 @@ def test_settings():
               < _order.index("memo_ack") < _order.index("idea_ack")
               < _order.index("bubbles_show"), f"got={_order}")
         check("默认展示范围是「备忘 + 待处理」", settings.get("bubbles_show") == ["memo", "open"])
-        check("展示范围标签：memo_done 叫「已完成」（不再叫「已勾掉」）",
-              settings.KEYS["bubbles_show"]["choice_labels"]["memo_done"] == "已完成")
+        check("展示范围标签：memo_done 叫「已完成的待办」",
+              settings.KEYS["bubbles_show"]["choice_labels"]["memo_done"] == "已完成的待办")
         check("没写过文件时 is_set 为假", settings.is_set("startup_msg") is False)
         check("文件还不存在", not os.path.exists(os.environ["MEMO_SETTINGS_FILE"]))
 
@@ -1713,10 +1229,10 @@ def test_settings():
         ok, info = settings.set_value("memo_ack", "")
         check("备忘回执可以清空（= 静默记下）", ok and info == "", f"got={info!r}")
 
-        ok, info = settings.set_value("bubbles_show", "待处理, done")
+        ok, info = settings.set_value("bubbles_show", "未整理的思绪, done")
         check("multi 认中文标签 + code", ok and info == ["open", "done"], f"got={info}")
-        ok, info = settings.set_value("bubbles_show", ["open", "open", "decided"])
-        check("multi 去重", ok and info == ["open", "decided"], f"got={info}")
+        ok, info = settings.set_value("bubbles_show", ["open", "open", "done"])
+        check("multi 去重", ok and info == ["open", "done"], f"got={info}")
 
         ok, info = settings.set_value("bubbles_show", ["乱写"])
         check("multi 非法值被拒", ok is False and "认不出" in info, f"got={info}")
@@ -1724,7 +1240,7 @@ def test_settings():
         check("multi 空值被拒", ok is False, f"got={info}")
         ok, info = settings.set_value("不存在的键", "x")
         check("未知键被拒", ok is False and "没有这个设置项" in info, f"got={info}")
-        check("被拒后值没变", settings.get("bubbles_show") == ["open", "decided"])
+        check("被拒后值没变", settings.get("bubbles_show") == ["open", "done"])
 
         # 批量写：先全量校验，再一次性落盘（一个坏 → 整批不写）
         n, errs = settings.apply_values(
@@ -1747,8 +1263,11 @@ def test_settings():
         check("is_command 普通聊天不算", settings.is_command("今天天气不错") is False)
 
         txt = settings.handle_command("设置")
-        check("「设置」列出全部键",
-              all(k["label"] in txt for k in settings.KEYS.values()), f"got={txt[:80]}")
+        check("「设置」列出可用键但不暴露隐藏收图键",
+              all(settings.KEYS[k]["label"] in txt
+                  for k in settings.KEYS if k not in settings._CHAT_HIDDEN_KEYS)
+              and all(settings.KEYS[k]["label"] not in txt
+                      for k in settings._CHAT_HIDDEN_KEYS), f"got={txt[:80]}")
         check("「设置」带改法提示", "设置 <键> <值>" in txt)
 
         settings.handle_command("设置 启动播报 我要下班了")
@@ -1760,18 +1279,18 @@ def test_settings():
               settings.is_set("startup_msg") is False and "恢复默认" in out, f"got={out}")
         out = settings.handle_command("设置 不存在的项 x")
         check("未知键给提示", "这个设置项" in out and "看列表" in out, f"got={out}")
-        settings.handle_command("设置 bubbles_show 待处理、已处理")
+        settings.handle_command("设置 bubbles_show 待办、未整理的思绪")
         check("multi 也能用指令改",
-              settings.get("bubbles_show") == ["open", "done"])
+              settings.get("bubbles_show") == ["memo", "open"])
 
         d = {x["key"]: x for x in settings.describe()}
         check("describe 含 label/kind/value/help",
               all(k in d["bubbles_show"] for k in ("label", "kind", "value", "help")))
         check("describe 带 choices 与中文标签",
               d["bubbles_show"]["choices"]
-              == ["memo", "memo_done", "open", "done", "decided", "dropped"]
-              and d["bubbles_show"]["choice_labels"]["memo"] == "备忘"
-              and d["bubbles_show"]["choice_labels"]["open"] == "待处理")
+              == ["memo", "memo_done", "open", "done", "dropped"]
+              and d["bubbles_show"]["choice_labels"]["memo"] == "待办"
+              and d["bubbles_show"]["choice_labels"]["open"] == "未整理的思绪")
     finally:
         if orig is None:
             os.environ.pop("MEMO_SETTINGS_FILE", None)
@@ -1780,10 +1299,10 @@ def test_settings():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── [12] config-web（配置中心）──────────────────────────────────
-def _load_configweb():
+# ── [11] config_core（配置后端）─────────────────────────────────
+def _load_configcore():
     spec = importlib.util.spec_from_file_location(
-        "cweb", os.path.join(ROOT, "config-web.py"))
+        "cweb", os.path.join(ROOT, "config_core.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -1798,8 +1317,10 @@ def _raises(fn, *a):
 
 
 def test_config_web():
-    print("\n[12] config-web 配置中心（.env 写入 / 白名单 / 字段表 / 页面护栏）")
-    cw = _load_configweb()
+    print("\n[12] config_core 配置后端（.env 写入 / 白名单 / 字段表）")
+    cw = _load_configcore()
+    _cn = open(os.path.join(ROOT, "config_core.py"), encoding="utf-8").read()
+    _g = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
 
     tmpdir = tempfile.mkdtemp(prefix="cweb_test_")
     orig_env, orig_bak = cw.ENV_PATH, cw.ENV_BAK
@@ -1871,7 +1392,8 @@ def test_config_web():
             k, e = cw.write_env({"MEMO_SEARCH_ROOT": f"{_ra}\n{_rb}"})
             check("多目录写 .env 成功", k == ["MEMO_SEARCH_ROOT"] and e is None, e)
             stored = cw.read_env_file()["MEMO_SEARCH_ROOT"]
-            check("多目录在 .env 里是分号串（换行已归一）", ";" in stored and "\n" not in stored, stored)
+            check("多目录在 .env 里是分号串（换行已归一）",
+                  ";" in stored and "\n" not in stored, stored)
             check("多目录写 .env 反斜杠转正斜杠", "\\" not in stored, stored)
         finally:
             shutil.rmtree(_ra, ignore_errors=True)
@@ -1896,38 +1418,42 @@ def test_config_web():
               == {"startup_msg", "intro_msg", "memo_ack", "idea_ack",
                   "bubbles_show", "boomerang_days", "boomerang_scope",
                   "image_collect", "image_alert_gb", "ui_font_scale"})
-        # 🔴 「运行方式」「摸鱼库」两块不走字段表（前者是自绘面板、后者是整块 textarea），
-        #    所以字段表只覆盖 6 个分区，别把这两个算进去。（忽略表并入群内行为）
+        # 5b) 收图入口暂隐（用户要求）：两个键仍在字段表（setDirty 靠它们认键），
+        #     但全部打 hidden —— 桌面端不再渲染收图区块；自绘函数与事件接线代码保留，
+        #     入口恢复只差一行拼接。
+        _hid = {f["key"]: f for f in fields
+                if f["key"] in ("image_collect", "image_alert_gb")}
+        check("收图两个键都还在字段表里", len(_hid) == 2, str(sorted(_hid)))
+        check("收图两个键都打了 hidden（渲染器全部跳过）",
+              all(f.get("hidden") for f in _hid.values()))
+        _g = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+        check("桌面版不再渲染收图自绘块（_render_fields 直接跳过）",
+              "self._render_self_drawn(f)" not in _g)
+        check("桌面版收图自绘实现代码保留",
+              "def _render_self_drawn" in _g)
+        # 「运行方式」「摸鱼库」两块不走字段表（前者是自绘面板、后者是整块 textarea），
+        # 所以字段表只覆盖 6 个分区。
         check("字段表覆盖 6 个「有字段」的分区",
               {f["group"] for f in fields}
               == {"bot", "behavior", "msg", "files", "bubbles", "boomerang"},
               str(sorted({f["group"] for f in fields})))
-        check("GROUPS 共 9 个分区，第 9 个是自定义指令",
-              len(cw.GROUPS) == 9 and cw.GROUPS[-1][0] == "ext",
+        check("GROUPS 共 10 个分区，第 10 个是版本（item19 拆出的独立页签）",
+              len(cw.GROUPS) == 10 and cw.GROUPS[-1][0] == "version",
               str([k for k, _, _ in cw.GROUPS]))
-        check("页签顺序 = GROUPS 顺序",
+        check("页签顺序 = GROUPS 顺序（版本在最后）",
               [g["key"] for g in [{"key": k} for k, _, _ in cw.GROUPS]]
               == ["bot", "behavior", "msg", "files", "bubbles", "boomerang",
-                  "runtime", "moyu", "ext"])
+                  "runtime", "moyu", "ext", "version"])
 
-        # 5b) 「界面字号」：桌面版和网页版读的是**同一个设置键**，口径必须一致。
+        # 5b) 「界面字号」：桌面版和后端读的是**同一个设置键**，口径必须一致。
         fs = [f for f in fields if f["key"] == "ui_font_scale"][0]
         check("界面字号归在「⑤ 脑内抽屉」",
               fs["group"] == "bubbles" and fs["kind"] == "int")
-        check("界面字号上下限透给界面（桌面 Spinbox / 网页 input 都用它）",
+        check("界面字号上下限透给界面（桌面 Spinbox 用）",
               fs["min"] == 80 and fs["max"] == 200)
         check("界面字号默认值 > 100（用户说字太小，默认就该大一档）",
               int(fs["value"]) > 100)
-        # 网页版：整页 zoom 跟着设置走。
-        # 🔴 body 的高度**不能**再除一次 zoom —— 实测 Chromium 的 zoom 不缩放
-        #    body 自身的盒高，除一次会让 body 矮一截、保存条悬在半空（真机截图确认）。
-        check("网页版整页跟随字号缩放（--z + body zoom）",
-              "zoom:var(--z,1)" in cw.PAGE
-              and "height:calc(100% / var(--z" not in cw.PAGE
-              and "function applyFontScale()" in cw.PAGE
-              and "applyFontScale();" in cw.PAGE)
         # 桌面版：字号助手 + 整窗重建
-        _g = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
         check("桌面版字号助手读的是同一个键",
               'get("ui_font_scale")' in _g and "def _font(" in _g)
 
@@ -1937,116 +1463,73 @@ def test_config_web():
         good = cw.browse_dirs(tmpdir)
         check("browse 正常目录返回 ok=true", good["ok"] is True and "dirs" in good)
 
-        # 7) 页面护栏
-        check("只监听 127.0.0.1（经严格模式包装的 Server 类）",
-              'srv(("127.0.0.1"' in
-              open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read())
-        check("写操作要求自定义请求头（CSRF 防护）",
-              cw.HEADER_FLAG == "X-Memo-Config" and cw.HEADER_FLAG in cw.PAGE)
-        check("页面有「保存并重启机器人」", "保存并重启机器人" in cw.PAGE)
-        check("页面有目录浏览器", "浏览…" in cw.PAGE)
-        check("页面有搜索目录实测按钮", "check-root" in cw.PAGE)
-        check("页面支持多目录字段（每行一个）", "f.kind === 'paths'" in cw.PAGE)
-
-        # 8) 数据文件位置：字段齐全 + 页面展示 + 打开文件夹走白名单
+        # 7) 数据文件位置：full_state 暴露齐全
         _st = cw.full_state()
         for _k in ("data_dir", "memos_db", "env", "settings"):
             check(f"paths 暴露 {_k}", bool(_st["paths"].get(_k)), str(_st["paths"].get(_k)))
-        check("页面有数据文件位置区块", "数据文件位置" in cw.PAGE)
-        check("页面有打开文件夹按钮", "data-open" in cw.PAGE)
-        _csrc = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
-        check("打开文件夹是白名单（不吃任意路径）",
-              'targets = {"data": data_dir()' in _csrc and 'payload.get("what")' in _csrc)
-        check("页面有开机自启开关", "autostart" in cw.PAGE)
-        check("页面有依赖自检", "依赖自检" in cw.PAGE)
 
-        # 9) 页签 + 未配置门禁（一屏一块，不用上下拉）
-        check("页面有页签条容器", 'id="tabs"' in cw.PAGE)
-        check("页签按后端分组渲染（页面不硬编码分组名）",
-              "function renderTabs" in cw.PAGE and "function visibleGroups" in cw.PAGE
-              and "const gs = visibleGroups()" in cw.PAGE)
-        check("一次只渲染当前页签那一块", "gs.find(x => x.key === ACTIVE_TAB)" in cw.PAGE)
-        check("未配凭据时只留「① 连接 QQ」",
-              "S.groups.filter(g => g.key === 'bot')" in cw.PAGE)
-        check("未配凭据时页签条隐藏",
-              "classList.add('hide')" in cw.PAGE and ".tabs.hide{display:none}" in cw.PAGE)
-        check("页面骨架是一屏一块（只有内容区滚动）",
-              "overflow:hidden" in cw.PAGE and "overflow-y:auto" in cw.PAGE)
-        check("多行文案用 textarea 渲染（kind=area）", "f.kind === 'area'" in cw.PAGE)
+        # 8) 版本独立页签（item19）：从「⑦ 运行方式」拆出 —— 桌面端对齐
+        check("GROUPS 里有 version 分区（⑩ 版本）",
+              any(k == "version" for k, _t, _d in cw.GROUPS))
+        check("桌面版有 _render_version（独立版本页签）",
+              "def _render_version" in _g)
+        check("桌面版 show_section 路由 version 到 _render_version",
+              'elif key == "version":\n            self._render_version()' in _g)
+        _rtd = _g.split("def _render_runtime", 1)[1]\
+                  .split("def _render_version", 1)[0]
+        check("桌面运行方式页已不含版本块（已拆出）", "版本" not in _rtd)
 
-        # 9b) 摸鱼库页签：页面护栏 + 端点 + 打开库文件走白名单
-        _csrc = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
-        check("页面有摸鱼库页签的渲染函数", "function moyuSection" in cw.PAGE)
-        check("摸鱼库是整库提交（改一类不丢另外两类）",
-              "function moyuPayload" in cw.PAGE and "function moyuValue" in cw.PAGE)
-        check("摸鱼库有分类切换按钮", "data-moyucat" in cw.PAGE)
-        check("摸鱼库有恢复内置按钮", 'id="moyu-reset"' in cw.PAGE)
-        check("摸鱼库有「打开库文件位置」", 'id="moyu-open"' in cw.PAGE)
-        check("摸鱼库保存走 /api/moyu", "api('/api/moyu', {groups: moyu})" in cw.PAGE)
-        check("摸鱼库恢复走 /api/moyu {reset:true}", "api('/api/moyu', {reset: true})" in cw.PAGE)
-        check("后端有 /api/moyu 端点", 'path == "/api/moyu"' in _csrc)
-        check("打开库文件在白名单里（不吃任意路径）", '"moyu": _moyu.user_path()' in _csrc)
-        check("页签尺寸锁在「九个能排一行」的档位（改标题要重算宽度）",
-              "font:12px/1.2 inherit" in cw.PAGE and "max-width:880px" in cw.PAGE)
+        # 8b) 一键安装缺失依赖（item17）：桌面端接了同一套
+        check("桌面配置中心也接了一键安装",
+              "self._install_deps" in _g
+              and "sys.executable" in _g and "0x08000000" in _g)
+        # 🔴 2026-10-12：按钮**必须 pack**（之前只建没 pack，按钮根本没显示，
+        #    旁边却写着「点一下自动装好」）；可装的项按 `install` 通道区分。
+        check("一键安装按钮会显形（pack）+ 按 install 通道数",
+              "self._install_btn.pack(" in _g
+              and 'd.get("install") == "pip"' in _g
+              and 'd.get("install") == "npm"' in _g)
+        check("依赖自检不再让用户自己敲命令（无「跑一次 npm install」）",
+              "跑一次 npm install" not in _g
+              and "跑一次 npm install" not in _cn
+              and "npm install 即可" not in _cn)
+        # 🔴 playwright-core 是 **Node 包** —— 必须能一键装（用户报的「依然没有
+        #    一键安装的方法」）。Python 包走 pip，node/浏览器装不了（install=""）。
+        _deps = {d["name"]: d for d in cw.dep_report()}
+        check("playwright-core 标 install=npm（能一键装，不再是无入口）",
+              _deps["playwright-core"].get("install") == "npm")
+        check("Python 包标 install=pip",
+              all(_deps[n].get("install") == "pip"
+                  for n in ("qq-botpy", "pillow")))
+        check("node / 浏览器标 install=''（装不了，界面只给引导）",
+              _deps["node"].get("install") == ""
+              and _deps["Chrome / Edge"].get("install") == "")
+        # 🔴 一键安装走**国内镜像**（用户问「国内直连速度」）——PyPI 官方源
+        #    在国内常年超时，默认挂清华 + npmmirror；MEMO_NO_MIRROR=1 可关。
+        check("一键安装默认走国内镜像（清华 PyPI + npmmirror）",
+              "pypi.tuna.tsinghua.edu.cn" in _g
+              and "registry.npmmirror.com" in _g
+              and "MEMO_NO_MIRROR" in _g)
 
-        # 9c) 「去 QQ 里开两个开关」提示块 —— 用户不看安装指南就会漏掉这两步，
-        #     不开的话机器人收不到普通发言 / 发不出播报，看起来就像「坏了」。
-        check("页面有「去 QQ 开两个开关」提示块", "function groupSwitchesHTML" in cw.PAGE)
-        check("提示块挂在「① 连接 QQ」分区上（不是别处）",
-              "groupSwitchesHTML()" in
-              cw.PAGE.split("function botSection")[1].split("function ")[0])
-        check("写清了第一条开关：群聊消息范围 = 获取群内全部消息",
-              "机器人可获取的群聊消息范围" in cw.PAGE and "获取群内全部消息" in cw.PAGE)
-        check("写清了第二条开关：机器人主动在群聊内发言",
-              "机器人主动在群聊内发言" in cw.PAGE)
-        check("两条都写了「不开会怎样」", cw.PAGE.count("不开：") >= 2)
-        check("提示块是 HTML 不是裸 markdown（help 走 esc 纯文本）",
-              "**" not in cw.PAGE.split("function groupSwitchesHTML")[1].split("\nfunction ")[0])
+        # 8c) 多目录字段：去重 + 保存前点名不存在的目录（2026-10-12）
+        check("多目录写 .env 会去重（保序）",
+              "if p not in _seen:" in _cn)
+        check("桌面端保存前逐行点名不存在的目录",
+              "def _bad_path_lines" in _g and "这几行目录不存在" in _g)
 
-        # 9d) 提示块里的 QQ 设置页截图 —— 走白名单静态路由，按文件头发类型
-        check("提示块里插了 QQ 设置页截图",
-              'class="swshot"' in cw.PAGE and 'src="/docs/qq-group-switches.png"' in cw.PAGE)
-        check("截图路由是白名单（不吃任意路径）",
-              "DOC_IMAGES = {" in _csrc and "if path in DOC_IMAGES" in _csrc
-              and "DOC_IMAGES[path]" in _csrc)
-        check("image_mime 按文件头认类型，不看扩展名",
-              cw.image_mime(b"\x89PNG\r\n\x1a\n" + b"x" * 20) == "image/png"
-              and cw.image_mime(b"\xff\xd8\xff\xe0" + b"x" * 20) == "image/jpeg"
-              and cw.image_mime(b"nope") == "application/octet-stream")
-        check("那张截图确实在仓库里",
-              os.path.isfile(os.path.join(ROOT, "docs", "qq-group-switches.png")))
-
-        # 8) sync_env：写完 .env 立刻让本进程看到新值
+        # 9) sync_env：写完 .env 灌进 os.environ
         cw.sync_env()
         check("sync_env 把 .env 灌进 os.environ",
               os.environ.get("MEMO_TRIGGER") == "备忘",
               os.environ.get("MEMO_TRIGGER"))
 
-        # 9) 文档同步：每个可配置键都要在 .env.example 里出现过
+        # 10) 文档同步：每个可配置键都要在 .env.example 里出现过
         example = open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
         missing = [k for k in cw.ENV_SPEC if k not in example]
         check(".env.example 覆盖全部可配置键", not missing, f"缺={missing}")
-
-        # 10) 泡泡页只管展示范围（启动播报 / 关机文案搬去配置中心了）
-        bubbles = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
-        check("泡泡页设置浮层只渲染 bubbles_show",
-              "const PAGE_KEYS = ['bubbles_show'];" in bubbles)
-        check("泡泡页不再渲染通知文案项",
-              "startup_msg" not in bubbles.split("const PAGE_KEYS")[1].split("</script>")[0])
     finally:
         cw.ENV_PATH, cw.ENV_BAK = orig_env, orig_bak
         shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ── [13] 控制台编码：GBK 环境下不许把进程带崩 ────────────────────
-def _free_port():
-    """要一个当前空闲的本地端口（起测试服务用）。"""
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
 
 
 def _extract_pid_alive(relpath):
@@ -2083,16 +1566,15 @@ def test_console_encoding():
     """🔴 中文 Windows 上 stdout 重定向到文件时按系统默认编码（GBK）写 —— 编不出的
     字符会让 print 抛 UnicodeEncodeError，把**整个进程**带崩。
 
-    真凶案例（2026-10-09）：用户双击「脑内抽屉.bat」页面打不开。open_drawer.py 用
-    pythonw 后台拉起 brain-drawer.py，子进程 stdout 重定向到日志文件，而启动提示里的
-    ⏻(U+23FB) 在 GBK 里没有字形 → 异常在 serve_forever() 之前冒出来，服务根本没起来。
-    开发机终端是 UTF-8（PYTHONIOENCODING=utf-8），源码文本护栏**完全抓不到**这种崩溃，
-    所以这里必须真起一次子进程、把环境强制成 GBK 来验。
+    真凶案例（2026-10-09）：pythonw 后台拉起子进程、stdout 重定向到日志文件，而启动提示里
+    的 ⏻(U+23FB) 在 GBK 里没有字形 → 异常在服务起来之前就冒出来。
+    开发机终端是 UTF-8（PYTHONIOENCODING=utf-8），源码文本护栏**抓不到**这类崩溃，
+    所以除了源码护栏，还对 `_pid_alive` 真调一次、把环境强制成「解码异常 / stdout 为 None」来验。
     """
     print("\n[13] 控制台编码（GBK 环境下不许把进程带崩）")
 
     # 1) 源码护栏：每个可执行入口都要把 stdout / stderr 切成 UTF-8
-    entries = ["bot.py", "config-web.py", "brain-drawer.py",
+    entries = ["bot.py", "config_core.py",
                "send_file.py", "ideas.py", os.path.join("test", "run-tests.py")]
     for name in entries:
         path = os.path.join(ROOT, name)
@@ -2106,52 +1588,6 @@ def test_console_encoding():
         check("open_drawer.py 给子进程设 PYTHONIOENCODING", "PYTHONIOENCODING" in ob)
     else:
         check("open_drawer.py 存在（工作区入口脚本）", True, "跳过：不在仓库内")
-
-    # 3) 行为验证：强制 GBK 起一次 --serve，必须真能起来
-    port = _free_port()
-    env = dict(os.environ)
-    for k in ("PYTHONUTF8", "PYTHONIOENCODING", "LANG", "LC_ALL", "LC_CTYPE"):
-        env.pop(k, None)
-    env["PYTHONIOENCODING"] = "gbk"          # 模拟中文 Windows 双击环境
-    proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "brain-drawer.py"),
-         "--serve", "--no-browser", "--port", str(port)],
-        cwd=ROOT, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    alive = False
-    try:
-        for _ in range(24):                  # 最多等 6 秒
-            time.sleep(0.25)
-            if proc.poll() is not None:
-                break                        # 崩了 —— 就是我们修的那个 bug
-            try:
-                with opener.open(f"http://127.0.0.1:{port}/api/ping", timeout=0.5) as r:
-                    alive = bool(json.load(r).get("ok"))
-                    if alive:
-                        break
-            except (OSError, ValueError, urllib.error.URLError):
-                pass
-        detail = ""
-        if not alive:
-            try:
-                out, _ = proc.communicate(timeout=2)
-                detail = (out or b"").decode("utf-8", "replace")[-400:]
-            except subprocess.TimeoutExpired:
-                pass
-        check("GBK 环境下 --serve 能起来（不被 ⏻ 编码问题带崩）", alive, detail)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            proc.stdout.close()
-        except (OSError, ValueError):
-            pass
 
     # 4) 🔴 行为护栏：`_pid_alive` 不许被「解码异常 / stdout 为 None」打断（2026-10-09 真凶）。
     #    重启机器人时崩在这里 —— bot_stop 成功 → bot_start 崩 → **机器人被停掉却起不来**：
@@ -2258,6 +1694,13 @@ def test_gui_speed():
           "OpenProcess" in src and "_fast=True" in src)
     check("🔒 快路径失败按错误码判「不存在」（87=ERROR_INVALID_PARAMETER）",
           "GetLastError() == 87" in src)
+    # 🔴 **拿到句柄 ≠ 进程在跑**（2026-10-12 真机踩到）：子进程退出后，只要别人
+    #    还持有它的句柄（Popen 就持有 → 管家一直握着 bot 的），它就成了**僵尸**，
+    #    `OpenProcess` 照样成功 ⇒ 快路径误报「bot 在跑」，桌面版「启动」按钮点不动。
+    #    修法：拿到句柄后必须再问 `GetExitCodeProcess`，只有 259(STILL_ACTIVE) 才算活。
+    check("🔒 快路径查 GetExitCodeProcess（僵尸进程不算活）",
+          "GetExitCodeProcess" in src and "259" in src
+          and "k32.OpenProcess.restype = ctypes.c_void_p" in src)
     check("🔒 bot_start 等 pid 时用 force（不吃 0.6s 缓存）",
           "bot_running(force=True)" in src)
     check("🔒 托盘读自启状态不 force（否则右键菜单卡 1.2 秒）",
@@ -2275,9 +1718,12 @@ def test_gui_update_check():
         check("memo_gui.py 存在", False, "文件不在")
         return
     src = open(p, encoding="utf-8").read()
-    check("🔄 运行方式页有「版本」区块 + 检查更新按钮",
-          "def _render_runtime" in src and '"检查更新"' in src
-          and 'text="版本"' in src)
+    # 🔴 item19（2026-10-12）：版本块已从「运行方式」拆到独立页签 `_render_version`
+    _rt = src.split("def _render_runtime", 1)[1].split("def _render_version", 1)[0]
+    _rv = src.split("def _render_version", 1)[1]
+    check("🔄 版本区块在独立页签 _render_version（不再塞运行方式）",
+          'text="版本"' in _rv and '"检查更新"' in _rv
+          and "版本" not in _rt)
     check("🔄 复用 version.py 的多源检查（不另写一套）",
           "_version.latest()" in src and "download_url" in src)
     check("🔄 有群文件兜底提示（国内 git 直连不稳）", "群文件" in src)
@@ -2304,12 +1750,31 @@ def test_gui_update_check():
     check("📐 正文同时截字数与行数（多行记录也能截住）",
           "_lines[:self.LINE_MAX]" in src)
 
-    # 🔴 别再自己插换行！实测 Tk 的 `wraplength` 对中文 / 长路径 / 超长 URL
-    #    都能按像素正确折行（长路径那串没空格也照样折）。曾经误判成
-    #    「Tk 只在空白处折」，加了个每 18 字硬插 \n 的函数，结果中文被断在句子中间
-    #    （「我可怎／么话啊」）——用户报「异常换行」。
-    check("📐 不用自己插换行（Tk 的 wraplength 会按像素折，包括中文/长路径）",
-          "_soft_wrap" not in src and "soft_wrap" not in src)
+    # 🔴 折行分两层：
+    #    ① 中文交给 Tk 的 `wraplength`（它按字折，本来就对）；
+    #    ② 英文 / URL / 路径这种**没空格的长串** Tk 折不好（只能从中间硬砍），
+    #       所以用一个**按像素量宽**的 `_soft_wrap` 先折一次。
+    # 🔴 历史教训：早期那个「每 18 字硬插 \n」的 `_soft_wrap` 把中文断在句子中间
+    #    （「我可怎／么话啊」）。现在这个**只在该断的位置断**（中文逐字、英文在
+    #    分隔符后），且是真按 `tkfont.measure` 量出来的宽度，不会再犯。
+    check("📐 有按像素量宽的折行助手 _soft_wrap（英文/路径长串不再被硬砍）",
+          "def _soft_wrap(" in src and "_wrap_font(" in src
+          and "font.measure(" in src)
+    check("📐 _soft_wrap 绝不在中文之间插断点（只在英文分隔符 / 中文整字处折）",
+          "_is_cjk" in src and "_BREAK_AFTER" in src)
+    check("📐 不再有「每 N 字硬插换行」的老实现",
+          "LONG_CHARS" not in src and "range(0, len(" not in src)
+    # 🔴 所有「长解释文字」都要过 `_soft_wrap`，否则 Tk 会在行尾留一片空白
+    #    （用户 2026-10-12：设置页 help「留空 = 」后面一大截空）。
+    check("📐 配置中心 help / 分区描述走 _soft_wrap（中文长句不留行尾空白）",
+          '_soft_wrap(f["help"], 720, 9)' in src
+          and '_soft_wrap(g["desc"], 720, 9)' in src)
+    # 🔴 思绪卡片正文：宽度是渲染后按卡宽定的（比初始 520 宽），必须**重折** ——
+    #    只改 wraplength 不会重排既有 `\n`，右边会留一大截空白
+    #    （用户 2026-10-12：「思绪卡片打开后右边存在较大空隙」）。
+    check("📐 思绪卡片正文按最终卡宽重折（右边不留空隙）",
+          'txt._orig_text = it["content"]' in src
+          and '_soft_wrap(getattr(txt, "_orig_text"' in src)
 
 
 # ── [14] 回旋镖 + 导出 ──────────────────────────────────────────
@@ -2445,7 +1910,7 @@ def test_boomerang_export():
         check("界面字号拒绝过大值（上限 200）", val is None)
         check("界面字号默认 115（比原始大一档，用户说字太小）",
               _settings.KEYS["ui_font_scale"]["default"] == 115)
-        val, err = _settings.normalize("boomerang_scope", "备忘、待处理灵感")
+        val, err = _settings.normalize("boomerang_scope", "待办、未整理")
         check("推送范围认中文标签", val == ["memo", "open"] and err is None)
         check("推送范围默认含备忘", "memo" in _settings.get("boomerang_scope"))
         check("回溯天数默认 3", _settings.get("boomerang_days") == 3)
@@ -2458,7 +1923,7 @@ def test_boomerang_export():
         text = data.decode("utf-8")
         check("导出文件名带时间戳", fname.startswith("摸鱼bot导出_") and fname.endswith(".md"))
         check("md 导出有总标题与备忘段", "# 摸鱼bot 导出" in text and "## 备忘" in text)
-        check("md 导出有灵感分组", "## 灵感" in text and "已决议" in text)
+        check("md 导出有灵感分组", "## 灵感" in text and "### 已整理" in text)
         check("md 导出带上结论", "当时的结论" in text)
         check("md 导出把正文放进引用块（保留换行）", "> 五天前的备忘" in text)
         # 🔴 图片必须写成**相对路径**的 Markdown 引用：导 zip 时图在 images/ 下，
@@ -2479,19 +1944,10 @@ def test_boomerang_export():
         check("parse_export 非指令不误判", _bot.parse_export("导出xx") == (False, None))
         check("parse_export 普通聊天不误判", _bot.parse_export("导出来看看") == (False, None))
 
-        # 8) 源码护栏：两个入口都接上了，且中文文件名不会乱码
-        T2 = open(os.path.join(ROOT, "brain-drawer.py"), encoding="utf-8").read()
-        check("泡泡页有「⬇ 导出」按钮", 'id="btn-export"' in T2)
-        check("导出按钮只在线模式显示", "btn-export').style.display = ''" in T2)
-        check("按钮走 /api/export", "/api/export?format=' + encodeURIComponent(f)" in T2)
-        check("服务端有 /api/export 路由", '"/api/export"' in T2)
-        check("导出响应带 filename*（中文名不乱码）", "filename*=UTF-8''" in T2)
-        CW = open(os.path.join(ROOT, "config-web.py"), encoding="utf-8").read()
-        # 🔴 不写死圈号（①~⑧ 会随分组增删变）—— 只认 group key
-        check("配置中心有回旋镖分区", '("boomerang", "' in CW and "回旋镖" in CW)
-        check("回旋镖两个键都归到该分区",
-              '"boomerang_days": "boomerang"' in CW
-              and '"boomerang_scope": "boomerang"' in CW)
+        # 8) 源码护栏：设置项 / 机器人侧的导出与回旋镖文案口径一致
+        _sk = open(os.path.join(ROOT, "settings.py"), encoding="utf-8").read()
+        check("回旋镖细节设置文案保留（回溯天数 help 仍在）",
+              '"boomerang_days"' in _sk and "填 0" in _sk and "今天记的也算" in _sk)
         B2 = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
         check("导出强制走文件卡片（不渲染成图）", "as_file=True" in B2)
         check("帮助菜单提到回旋镖与导出",
@@ -2827,6 +2283,9 @@ def test_gui_source():
     # extmgr 的源码也在这里锁一条（探针编码），省得起第二次窗口。
     _ep = os.path.join(ROOT, "extmgr.py")
     _EXTMGR_SRC = open(_ep, encoding="utf-8").read() if os.path.isfile(_ep) else ""
+    # store 的源码：抽屉的 SQL 查询 / 事务护栏要引用它
+    _sp = os.path.join(ROOT, "store.py")
+    _store_src = open(_sp, encoding="utf-8").read() if os.path.isfile(_sp) else ""
 
     # 🔴 pythonw 启动时 sys.stdout 是 None，一句 print 就会让整个窗口起不来。
     check("🖥 memo_gui 里没有 print()（pythonw 下会崩）",
@@ -2850,12 +2309,16 @@ def test_gui_source():
           'set_text("保存")' in src and 'set_text("编辑")' in src)
     check("🖥 进编辑态会收起标签/附件/动作区（一次只做一件事）",
           "grid_remove()" in src and "grid()" in src)
-    check("🖥 底部动作按**整条流程**摆、当前站灰化（不是按状态隐现）",
-          'st == _store.STATUS_OPEN' in src and "disabled=disabled" in src)
+    check("🖥 流程按钮出自同一份 _flow_plan（浮层 / 列表口径一致）",
+          "def _flow_plan(memo, st)" in src and "plan = _flow_plan(memo, st)" in src
+          and "disabled=disabled" in src)
+    check("🖥 完成 ⇄ 取消完成 是同一按钮两态（target 跟着状态走）",
+          '\"← 取消完成\", \"open\"' in src and '\"✓ 完成\", \"done\"' in src)
+    check("🖥 整理 ⇄ 取消整理 是同一按钮两态（target 跟着状态走）",
+          '\"← 取消整理\", \"open\"' in src and '\"✓ 整理\", \"done\"' in src)
     check("🖥 动作按钮图标只用基础几何符号（emoji 在 Win10 会缺字形）",
-          "✓ " in src and "★ " in src and "✅" not in src and "🗑" not in src,
-          # 只看 memo_gui.py 自身 —— brain-drawer.py（网页版）走浏览器渲染，
-          # emoji 没问题，不在这个护栏范围内。
+          "✓ " in src and "← " in src and "✅" not in src and "🗑" not in src,
+          # 只看 memo_gui.py 自身 —— 桌面端是 Tk 渲染，emoji 在 Win10 可能缺字形。
           f"✅×{src.count('✅')} 🗑×{src.count('🗑')}")
     # 标签行：输入框和「已有」必须同一行（用户要求把「已有」挪到输入框右边）
     check("🖥 「已有」标签与输入行并排（不再单独占一行）",
@@ -2876,11 +2339,20 @@ def test_gui_source():
     #    **列表窗口 / 回收站**不套（否则「已丢弃」和「已隐藏分类」就翻不出来了）。
     check("🖥 展示范围（bubbles_show）真的过滤条目",
           "def _collect(self, rows, *, gate_show):" in src
-          and 'if gate_show and b not in self._show:' in src
+          and 'if show_b not in self._show:' in src
           and "def _load_items" in src and "def _list_items" in src)
+    check("🖥 decided 过闸时按「已整理」一档判（与 done 合并显示）",
+          'show_b = "done" if b == "decided" else b' in src)
     check("🖥 只有轮播舞台套 bubbles_show 闸（列表/回收站不受限）",
           "self._collect(self._rows(), gate_show=True)" in src
-          and "self._collect(self._rows(), gate_show=False)" in src)
+          and "gate_show=False" in src
+          and "def _list_items(self, group=None, sub=None, bucket=None, query=None" in src)
+    # 🔴 列表 / 搜索走 **SQL 分页**（审查报告：500 条固定窗口会隐藏更早的数据）。
+    check("🗂 列表/搜索下推到 SQL + 分页（不再先捞 500 条再内存筛）",
+          "def query_items(kinds=None, statuses=None, text=None" in _store_src
+          and "def count_query_items(" in _store_src
+          and "_store.query_items(kinds=kinds, statuses=statuses, text=query" in src
+          and "def _list_total(self" in src)
     # ④ 排布要有随机感：首屏起始高度 + 横向漂移都是随机的，
     #    泳道也要随机挑（固定取 0 号道会让三条道利用率不均，看着有规律）。
     check("🖥 气泡排布有随机感（泳道/起始高度/横向漂移）",
@@ -2890,29 +2362,65 @@ def test_gui_source():
     check("🖥 有手动回旋镖按钮且复用 store 规则",
           "def _manual_boomerang" in src and "pick_boomerang" in src
           and "mark_boomerang" in src)
+    # ⑥ 外观三态顺序固定「跟随系统 / 浅色 / 深色」（用户 2026-10-12）
+    check("🖥 外观三态顺序：跟随系统在最前",
+          'for text, mode in (("跟随系统", "system"),\n                           ("浅色", "light"),\n                           ("深色", "dark")):' in src)
+    # ⑦ 卡片浮层宽度同时看正文与动作条（用户 2026-10-12：短文本按钮展示不全）
+    check("🖥 卡片宽度取正文与动作条的较大值",
+          "cwc = max(card.winfo_reqwidth(), bar_w) + CARD_INSET * 2" in src
+          and 'bar_w = 0 if editing["on"] else bar_wrap.winfo_reqwidth()' in src)
+    # ⑧ 「空格 暂停/继续」文案与绑定整条拆掉（用户 2026-10-12：功能是假的）
+    check("🖥 没有「空格 暂停/继续」文案（桌面版）",
+          "空格 暂停/继续" not in src and "空格暂停" not in src
+          and '"<space>"' not in src)
+    check("🖥 暂停机制（_toggle_pause / _running / _paused_at）已删除",
+          "_toggle_pause" not in src and "self._running" not in src
+          and "_paused_at" not in src)
 
-    # ── 底部按钮行：思维流 + 四分类（点击开列表窗口）+ 回收站 ──
+    # ── 底部按钮行：思维流 + 两分类（待办/思绪，点击开列表窗口）+ 回收站 ──
     # 已丢弃**不进轮播舞台**（_collect 里跳过），也不做分类 chip ——
     # 入口统一到底部常驻的「回收站」按钮。
     check("🖥 已丢弃不进轮播（_collect 里跳过）",
           'if b == "dropped":' in src)
     check("🖥 「全部」已改名「思维流」，且是选中态（当前视图本身）",
-          '"思维流"' in src and '"全部"' not in src
-          and 'self._chips[None] = view' in src)
-    check("🖥 chips 不列已丢弃（入口统一到回收站按钮）",
-          'for b in _BUCKET_ORDER:' in src
-          and 'if b == "dropped":' in src
-          and "continue" in src)
+          '"思维流"' in src and 'self._chips[None] = view' in src
+          and "view.set_selected(True)" in src)
+    check("🖥 chips 只剩「待办丨思绪」两个分类入口（已丢弃走回收站按钮）",
+          "for g in _LIST_GROUPS:" in src
+          and "_GROUP_LABEL[g]" in src)
     check("🖥 分类 chip 点击开「列表窗口」（不再就地筛轮播）",
-          "def _open_list" in src and "self._open_list(x)" in src)
+          "def _open_list" in src and "self._open_list(group=x)" in src)
+    # ── 分类大改版（2026-10-12）：灵感→思绪；已处理/已决议→已整理 ──
+    check("🖥 桶标签换成 待办/思绪 两套（memo=待办、open=思绪）",
+          '"memo": "待办 · 未完成"' in src
+          and '"open": "思绪 · 未整理"' in src
+          and '"done": "思绪 · 已整理"' in src)
+    check("🖥 「已决议」并入「已整理」（decided 与 done 同标签同色）",
+          '"decided": "思绪 · 已整理"' in src
+          and '"decided": _TERMINAL_GRAY' in src
+          and '"done": _TERMINAL_GRAY' in src)
+    check("🖥 已完成 / 已整理边框统一灰色（用户 2026-10-12）",
+          '_TERMINAL_GRAY = ("#6b7472", "#8b98a9")' in src
+          and '"memo_done": _TERMINAL_GRAY' in src)
+    check("🖥 已整理子筛同时收纳 done / decided 两种库里状态",
+          '_SUB_MATCH = {"done": ("done", "decided")}' in src)
+    check("🖥 备忘卡片删「← 恢复」（不可点击、冗余）；「✓ 完成这条备忘」→「✓ 完成」",
+          '"← 恢复"' not in src and "✓ 完成这条备忘" not in src
+          and '"✓ 完成"' in src)
+    check("🖥 灵感卡片删「★ 已决议」（done/decided 展示层合并）",
+          '"★ 已决议", "info", "decided"' not in src
+          and '"← 恢复待处理"' not in src
+          and '"✓ 整理"' in src and '"← 取消整理"' in src)
     check("🖥 底部有常驻「回收站」按钮（不看 bubbles_show）",
           '"回收站", self._open_trash' in src)
     check("🖥 回收站是静态列表（自带滚动条，不是轮播）",
           "def _open_trash" in src and "def _dropped_items" in src
           and "def _scroll_area" in src)
     check("🖥 回收站列表区可滚（否则底部按钮被顶出屏幕）",
-          'cv.configure(scrollregion=cv.bbox("all"))' in src
-          and "cv.itemconfigure(wid, width=e.width)" in src)
+          "def _scroll_area(self, parent, pad):" in src
+          and 'cv = tk.Canvas(body_wrap, highlightthickness=0, bd=0, bg=self._c("bg"))' in src
+          and "sb = ttk.Scrollbar(body_wrap" in src
+          and "create_window(0, 0, window=inner, anchor=\"nw\")" in src)
     check("🖥 回收站与列表窗口共用同一份可滚骨架（不各写一遍）",
           "def _scroll_area(self, parent, pad):" in src
           and src.count("self._scroll_area(win, PAD)") >= 2)
@@ -2983,23 +2491,29 @@ def test_gui_source():
     #    否则在抽屉页滚轮会去滚配置中心。
     check("🖥 滚轮只在配置中心可见时响应",
           "def _on_wheel" in src and "self.canvas.winfo_ismapped()" in src)
-    # ⑦ 顶部**不淡出**，改遮罩带 —— 长气泡的上半截不会再在还看得见的时候
-    #    先变灰（用户报的「视觉缺口」）。
-    check("🖥 顶部不淡出（_alpha_at 只剩底部渐入）",
-          "def _alpha_at" in src and "a_out" not in src
-          and 'L["h"] * 0.16' not in src)
-    # 🔴 遮罩带 / 筛选条必须是**舞台的同级兄弟控件**（place + lift）。
-    #    做成 canvas item 是盖不住气泡的：卡片本体是 canvas 的嵌入窗口，而嵌入
-    #    窗口在 Windows 上永远画在 canvas 自绘内容之上；`tag_raise()` 对窗口 item
-    #    也无效（真机像素实测：遮罩带里采到的还是卡片色）。同级兄弟才能盖住整块舞台。
-    check("🖥 遮罩带常驻置顶（气泡滑进来被盖住，不是渐变消失）",
-          "TOP_MASK_H" in src and "self._mask.lift()" in src
-          and "self._mask.place(x=0, y=0, relwidth=1, height=self.TOP_MASK_H)" in src)
-    # 底部现在是**两行**（搜索行 + 按钮行）包在一个 `foot` 里，`foot` 才是舞台的同级兄弟。
-    check("🖥 遮罩带 / 底栏是舞台的同级兄弟（canvas 窗口压不住）",
+    # ⑦ 顶部「化掉」不再靠实体遮罩带（用户 2026-10-12：「遮罩太硬…不能做渐变
+    #    就去掉黄框内容」）—— Tk 没有真正的 alpha，实色遮罩带必然是硬边。
+    #    改成 `_alpha_at` **整卡均匀淡出**：顶边升进 TOP_FADE_H 就一起化掉，
+    #    不是被页签栏齐刷刷切断；也不会有「上半截先变灰」的缺口（那是按位置
+    #    分片渐变的锅）。
+    check("🖥 顶部靠 _alpha_at 淡出（不再用实体遮罩带）",
+          "def _alpha_at" in src and "TOP_FADE_H" in src
+          and "fade_out" in src)
+    check("🖥 实体遮罩带已彻底移除（_mask / _paint_mask / _stipple 都没了）",
+          "_mask" not in src and "def _paint_mask" not in src
+          and "def _stipple" not in src and "TOP_MASK_H" not in src)
+    # 🔴 Canvas 控件升降必须走 Tcl 全局 `raise`（`_raise_widget`）：本机打包的
+    #    tkinter 把 `Canvas.lift = tkraise = tag_raise`（画布**条目**升降、要
+    #    tagOrId），对 Canvas 控件调 `.lift()` 直接抛 TclError，一 build 就炸
+    #    （真机探针实测，844 项全绿期间唯一抓到的真 bug）。工具留着给未来的浮层用。
+    check("🖥 Canvas 控件升降工具走全局 raise（lift/tkraise 在 Canvas 上是条目升降）",
+          'def _raise_widget(w):' in src
+          and 'w.tk.call("raise", str(w))' in src)
+    # 底部现在是**两行**（搜索行 + 按钮行）包在一个 `foot` 里，`foot` 是舞台的同级兄弟
+    # （做成 canvas 窗口会被后建的气泡盖住 —— 窗口 item 的层级提不上去）。
+    check("🖥 底栏是舞台的同级兄弟（canvas 窗口压不住）",
           'foot.place(relx=0, rely=1, anchor="sw", relwidth=1)' in src
           and "self._foot.lift()" in src
-          and "self.stage.tag_raise(self._mask)" not in src
           and "self.stage.tag_raise(self._bar)" not in src)
     # ⑧ 正文上限 1000 字（用户要求），行数兜底别让气泡高到离谱。
     check("🖥 气泡正文上限 1000 字",
@@ -3031,6 +2545,16 @@ def test_gui_source():
     # ⑬ 处理完**不弹通知**：卡片从轮播里消失、浮层关掉，本身就是反馈。
     check("🖥 改状态后不弹 toast（用户明确说这条通知无用）",
           'self.app.toast(f"已更新' not in src)
+    # ⑭ 右下角系统通知整条去掉（用户 2026-10-12）：ToastNotification 默认
+    #     position=(5, 50, 'se') = 屏幕右下角弹窗。全部收敛成应用内的一条
+    #     轻提示（主窗口底部居中、2.5s 自己消失），失败也不弹模态框。
+    check("🖥 没有右下角系统通知（ToastNotification 已删）",
+          "ToastNotification" not in src and "show_toast" not in src)
+    check("🖥 轻提示收敛成应用内文字（toast → 底部居中 Label）",
+          "def toast(self, msg, ok=True):" in src
+          and 'lbl.place(relx=0.5, rely=1.0, anchor="s", y=-16)' in src
+          and "self._toast_job = self.root.after(2500, _hide)" in src
+          and "不弹模态框" in src)
 
     # ── 「界面字号」缩放（用户：字太小、要能自己调）──
     # 🔴 全应用字号必须都过 `_font()`。写死 `font=("Microsoft YaHei", 9)`
@@ -3050,31 +2574,45 @@ def test_gui_source():
 
     # ── 第三轮反馈（字被裁 / 浮层撑爆 / 提示不说人话）──
     # 🔴 正文折行宽度必须**从布局常量算**。写死 `int(width) - 48` 时它比真实
-    #    可用宽度（`lane_w − 2·inset − 2·ROW_PADX − EDGE_W − EDGE_GAP` = −54）
-    #    大 6px，每行最后一个字的右边缘被容器裁掉 —— 用户报的「字边缘消失」。
+    #    可用宽度（`lane_w − 2·inset − 2·ROW_PADX` = −32）大 6px，每行最后一个
+    #    字的右边缘被容器裁掉 —— 用户报的「字边缘消失」。
+    # 🔴 状态色只画在圆角矩形的**边框**上（accent，按条目桶色）：去掉了左侧
+    #    强调条（EDGE_W / EDGE_GAP 已删除），那根直角边块和圆角矩形「内角不一致」
+    #    是用户报丑的根源。
     check("📐 正文折行宽度由布局常量算（不再是写死的 −48）",
           "content_w = max(120, w_int - inset * 2 - self.ROW_PADX * 2" in src
           and "int(width) - 48" not in src)
-    check("📐 排版常量齐全（ROW_PADX / ROW_PADY / EDGE_W / EDGE_GAP）",
-          all(k in src for k in ("ROW_PADX = 14", "ROW_PADY = 10",
-                                 "EDGE_W = 4", "EDGE_GAP = 10")))
+    check("📐 排版常量齐全（ROW_PADX / ROW_PADY，EDGE_W/EDGE_GAP 已删除）",
+          all(k in src for k in ("ROW_PADX = 14", "ROW_PADY = 10"))
+          and "EDGE_W = 4" not in src
+          and "EDGE_GAP = 10" not in src)
     check("📐 折行宽度确实小于气泡内宽（不留溢出）",
           "wraplength=content_w" in src and "int(width) - 48" not in src)
+    check("🎨 边框色 = 状态色（accent），不再用左强调条；描边已加粗",
+          "outline=accent,\n                           width=BUBBLE_BORDER_W)" in src
+          and "BUBBLE_BORDER_W = 2" in src
+          and "surf=surf, accent=accent," in src
+          and "surf=surf, accent=accent, shadow=shadow" in src
+          and "self.EDGE_W" not in src)
 
     # 🔴 浮层：动作条必须固定常显、正文区自己滚、窗口高度封顶。
     #    以前整张卡片一起长高，上千字的记录把窗口顶穿屏幕，
     #    底部「已处理 / 已决议」按钮点不到（用户报的「无法正常更改状态」）。
     check("🪟 浮层动作条挂在固定底栏（不跟正文一起滚）",
           "bar = tk.Frame(bar_wrap, bg=light)" in src
-          and 'bar_wrap.pack(side="bottom"' in src)
+          and 'bar_cv = tk.Canvas(win' in src
+          and 'bar_cv.pack(side="bottom", fill="x"' in src
+          and "bar_cv.create_window(CARD_INSET, 0, window=bar_wrap" in src)
     check("🪟 浮层高度封顶 + 设了 scrollregion",
           "cvh = min(chc, avail)" in src
           and "scrollregion=(0, 0, cwc, chc)" in src)
     check("🪟 滚轮绑在 Toplevel（不用 bind_all，免得跟配置中心抢）",
           'win.bind("<MouseWheel>", _on_wheel)' in src
           and 'bind_all("<MouseWheel>"' not in src.split("def _open_modal")[1])
-    check("🪟 编辑态收起动作条后能放回原位（before=cv）",
-          "bar_wrap.pack_forget()" in src and "before=cv" in src)
+    check("🪟 编辑态收起整条底栏后能放回原位（hide/show bar_cv）",
+          "bar_cv.pack_forget()" in src
+          and 'bar_cv.pack(side="bottom", fill="x", padx=PAD, pady=(0, PAD))'
+          in src)
 
     # 🔴 保存提示要说人话：以前报「.env 已写 2 项；settings.json 已写 4 项」，
     #    用户不知道那两个文件是什么、也看不出是成功还是写了一半。
@@ -3105,19 +2643,30 @@ def test_gui_source():
     check("🔍 底部有搜索框（回车 / 点按钮都能搜）",
           "self._q_var" in src and "def _search" in src
           and '"<Return>", lambda e: self._search()' in src)
-    check("🔍 搜索命中正文 / 标签 / 结论三处",
-          "x[\"content\"], x[\"note\"]" in src and "x[\"tags\"]" in src)
+    check("🔍 搜索命中正文 / 标签 / 结论并转义 LIKE 特殊字符",
+          "content LIKE ? ESCAPE" in _store_src
+          and "IFNULL(note,'') LIKE ? ESCAPE" in _store_src
+          and "IFNULL(tags,'') LIKE ? ESCAPE" in _store_src
+          and "def _like_contains(text):" in _store_src)
     check("🔍 搜索空串给提示、不静默开空窗",
           "先在搜索框里写点什么再搜" in src)
 
     # ④ 列表窗口：分类 chip / 搜索结果共用，行可点开浮层。
     check("🗂 列表窗口：分类与搜索共用，标题分两支",
           "def _open_list" in src
-          and 'f"{_BUCKET_LABEL[bucket]} · 列表"' in src
+          and 'f"{_GROUP_LABEL[group]} · 列表"' in src
           and 'f"搜索「{query}」"' in src)
-    check("🗂 列表窗口：点行开浮层（先关列表再开卡片）",
-          "def _open(it)" in src and "            _close()" in src
-          and "self._open_modal(it)" in src)
+    check("🗂 列表窗口有子筛选行（待办：未完成/已完成；思绪：未整理/已整理）",
+          '("memo", "未完成"), ("memo_done", "已完成")' in src
+          and '("open", "未整理"), ("done", "已整理")' in src)
+    check("🗂 列表窗口：点行开浮层（**列表留着**，不先关 —— 用户 2026-10-12）",
+          "def _open(it)" in src and "self._open_modal(it)" in src
+          and "_close()\n            self._open_modal(it)" not in src)
+    check("🗂 卡片改状态后回灌列表（列表不再随手关，得自己刷新）",
+          "def _refresh_open_list" in src and "self._list_rebuild(" in src
+          and "self._refresh_open_list()" in src)
+    check("🗂 重复点同一入口 → 置顶已开的列表窗，不重开（用户 2026-10-12）",
+          "self._list_key == key" in src and "self._list.lift()" in src)
     check("🗂 列表窗口也支持 Esc / 窗口 X 关闭",
           'win.bind("<Escape>"' in src
           and "WM_DELETE_WINDOW" in src)
@@ -3139,9 +2688,9 @@ def test_gui_source():
           'bootstyle="primary-round-toggle"' not in _trash_fn
           and 'bootstyle="primary"' in _trash_fn)
 
-    # ⑦ 浮层标题文案：脑内抽屉 → 思维卡片。
-    check("🏷 浮层标题改成「思维卡片」",
-          'win.title("思维卡片")' in src and 'win.title("脑内抽屉")' not in src)
+    # ⑦ 浮层标题文案：脑内抽屉 → 思绪卡片。
+    check("🏷 浮层标题改成「思绪卡片」",
+          'win.title("思绪卡片")' in src and 'win.title("脑内抽屉")' not in src)
 
     # ⑧ 编辑后尺寸突变 + 拉到极小丢内容：设 minsize 下限 + 摆窗用 req 尺寸。
     check("📏 浮层设了尺寸下限（编辑态不塌、不丢内容）",
@@ -3157,7 +2706,17 @@ def test_gui_source():
           and "bot + self.MIN_GAP > t and top - self.MIN_GAP < t + b[\"h\"]" in src)
     check("📐 _spawn 先量出真实高度再挑泳道（frac 那条路不预挑）",
           "if lane is None and frac is None:" in src
-          and "free = [ln for ln in range(L[\"lanes\"])" in src)
+          and 'free = [ln for ln in range(L["lanes"] - span + 1)' in src)
+    # ⑩ 长条目（>300 字）用 2 泳道宽大卡：宽卡横跨两条道，判据按 span 算。
+    check("📐 宽卡：超 300 字占两条泳道（lane/span 判据全部按 span 算）",
+          "WIDE_CHARS = 300" in src and "WIDE_SPAN = 2" in src
+          and 'span = self.WIDE_SPAN if len(it["content"]) > self.WIDE_CHARS else 1' in src
+          and 'width = L["lane_w"] * span + L["gap"] * (span - 1)' in src
+          and 'if lane is not None and lane + span > L["lanes"]:' in src
+          and "def _lane_span(self, lane, now, y0, h, span=1):" in src
+          and 'if b["lane"] + bs <= lane or b["lane"] >= lane + span:' in src
+          and "def _lane_ready(self, now, span=1):" in src
+          and "lane=lane, span=span," in src)
     # 🔴 「起点」与「出生位置」必须自洽：y_start 永远是舞台下方，frac 只改 y0，
     #    warm 由两者之差算出。以前 y_start 直接写 y0、warm 却按「从下方走到 y0」
     #    算，真实出生位置成了 `2*y0 − 舞台高 − 8` —— 首屏各段被压到屏幕上方、
@@ -3173,6 +2732,51 @@ def test_gui_source():
           "y_start=y_start" in src and "y_start=y0" not in src)
     check("📐 底部变两行后，气泡条高按实际底栏高算（不写死 BAR_H）",
           "def _bar_h" in src and "L[\"h\"] - self._bar_h()" in src)
+
+    # ⑪ 「① 连接 QQ」页补「去 QQ 里开两个开关」提示（用户 2026-10-12：
+    #    连接 QQ 的步骤里少了「在群聊中使用，一定要开那两个开关」）——
+    #    这两项在 QQ 那边管，配置中心碰不到；不开就收不到普通发言、也发不出
+    #    播报，用户会以为「机器人坏了」。
+    _bot_fn = src.split("    def _render_bot(self):")[1].split(
+        "    def _group_switches_box(self):")[0]
+    check("⚙ 「① 连接 QQ」页渲染时挂上两个开关提示块",
+          "self._group_switches_box()" in _bot_fn)
+    _sw = src.split("    def _group_switches_box(self):")[1].split(
+        "    def _render_msg(self):")[0]
+    check("⚙ 提示块内容（两个开关 + 各带后果 + 验证提示）",
+          "要在群聊中使用机器人，你需要打开的开关" in _sw
+          and "机器人可获取的群聊消息范围" in _sw
+          and "机器人主动在群聊内发言" in _sw
+          and "获取群内全部消息" in _sw
+          and "配置中心管不到它们" in _sw
+          and "普通发言它收不到" in _sw
+          and "上线播报发不出来" in _sw
+          and "备忘 测试" in _sw)
+
+    # ⑫ 列表滚动加固（用户 2026-10-12：备忘等列表「上滚空白、只显示一条」）：
+    #    · **视口钳制** —— 内容比视口矮时滚动区钳成视口本身。以前 bbox 比视口
+    #      高一截，滚轮能滚进一片啥都没有的空白，真内容被挤成「只显示一条」；
+    #    · **滚轮双闸** —— 方向上已经没得滚了就 break 拦下，并消费事件不往
+    #      父窗口窜（yview 到头还继续调 yview_scroll 会让位置漂）；
+    #    · **窗口位置过屏幕夹取**（_clamp_win）—— 主窗贴右下角时「主窗坐标
+    #      + 150/+110」会把列表窗 / 回收站整个推出屏幕，用户眼里只剩一条边。
+    _sa = src.split("    def _scroll_area(self, parent, pad):")[1].split(
+        "    def _search(self):")[0]
+    check("🖥 滚动区视口钳制（内容不比视口高 → 不留可滚空白）",
+          "def _sync(_e=None):" in _sa
+          and "if bot - top <= vh:" in _sa
+          and "cv.configure(scrollregion=(bb[0], 0, bb[2], max(bot, vh)))" in _sa
+          and "cv.configure(scrollregion=bb)" in _sa)
+    check("🖥 滚轮双闸：没得滚的方向 break 拦下、不往父窗窜",
+          "def _wheel(e):" in _sa
+          and "if e.delta > 0 and top <= 0.0:" in _sa
+          and "if e.delta < 0 and bot >= 1.0:" in _sa
+          and 'return "break"' in _sa)
+    check("🖥 列表窗口 / 回收站位置过屏幕夹取（_clamp_win）",
+          "def _clamp_win(win, x, y, w, h, margin=8):" in src
+          and src.count("_clamp_win(win, self.app.root.winfo_rootx() + 150,") >= 2)
+    check("🖥 列表 / 回收站重建都回顶（和网页 renderList 一个行为）",
+          src.count("cv.yview_moveto(0)") >= 3)
 
 
 def test_image_collect():
@@ -3340,7 +2944,7 @@ def test_no_window():
     check("CREATE_NO_WINDOW 常量 = 0x08000000",
           botctl._no_window_flags() == (0x08000000 if os.name == "nt" else 0))
 
-    targets = ["botctl.py", "hub.py", "extmgr.py", "md2img.py", "memo_gui.py", "config-web.py"]
+    targets = ["botctl.py", "hub.py", "extmgr.py", "md2img.py", "memo_gui.py"]
     _local = os.path.join(ROOT, "extensions", "local")
     if os.path.isdir(_local):
         targets += [os.path.join("extensions", "local", n)
@@ -3352,6 +2956,106 @@ def test_no_window():
         bad = _subproc_calls_without_flags(p)
         check(f"{rel} 的子进程调用都带 creationflags / **_no_window()",
               not bad, f"缺标志的行号：{bad}")
+
+
+def test_review_hardening():
+    """代码审查四条（2026-10-12）—— 事件循环 / 单实例锁 / 事务 / 分页。
+
+    这些都是「并发才出问题」的缺陷，静态护栏锁不住，所以要么真起多进程、
+    要么用假 subprocess 真调一次。
+    """
+    print("\n[26] 审查加固（异步收图 / 单实例锁 / 事务 / 分页）")
+    import bot as _bot
+    import store as _store
+    import single_lock
+
+    # ── ① 收图不能阻塞事件循环 ──
+    _bsrc = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    check("收图走了 to_thread（不再在 async 路由里同步阻塞）",
+          "async def collect_images_async" in _bsrc
+          and "await asyncio.to_thread(collect_images" in _bsrc)
+    check("路由里没有残留的同步 collect_images( 调用",
+          "pics = collect_images(message, scope)" not in _bsrc)
+    # ── ② 单实例锁：真起进程并发抢，只能有一个赢 ──
+    check("单实例锁走 OS 级互斥体（不再读 pid → 判活 → 写 pid）",
+          "def acquire(self)" in open(os.path.join(ROOT, "single_lock.py"),
+                                      encoding="utf-8").read()
+          and "CreateMutexW" in open(os.path.join(ROOT, "single_lock.py"),
+                                     encoding="utf-8").read())
+    check("bot / hub / 启动动作都用它",
+          "SingleInstance(\"bot\")" in _bsrc
+          and "SingleInstance(\"hub\")" in open(
+              os.path.join(ROOT, "hub.py"), encoding="utf-8").read()
+          and "SingleInstance(\"botstart\")" in open(
+              os.path.join(ROOT, "botctl.py"), encoding="utf-8").read())
+
+    if os.name == "nt":
+        # 起 4 个进程同时抢同一把锁，统计「拿到」的数量 —— 必须正好 1 个
+        tmp = tempfile.mkdtemp(prefix="lock_race_")
+        script = (
+            "import os,sys,time\n"
+            "sys.path.insert(0, r'%s')\n"
+            "os.environ['MEMO_DATA_DIR'] = r'%s'\n"
+            "from single_lock import SingleInstance\n"
+            "lk = SingleInstance('racetest')\n"
+            "got = lk.acquire()\n"
+            "print('GOT' if got else 'NO')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(1.2 if got else 0.1)\n" % (ROOT, tmp)
+        )
+        procs = [subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=0x08000000 if os.name == "nt" else 0)
+            for _ in range(4)]
+        outs = [p.communicate()[0] or "" for p in procs]
+        winners = sum(1 for o in outs if "GOT" in o)
+        check("4 个进程同时抢锁 → 恰好 1 个拿到（并发窗口已堵）",
+              winners == 1, f"winners={winners} outs={outs}")
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        check("4 个进程同时抢锁 → 恰好 1 个拿到（并发窗口已堵）",
+              True, "跳过：非 Windows")
+
+    # ── ③ store：事务边界 ──
+    _ssrc = open(os.path.join(ROOT, "store.py"), encoding="utf-8").read()
+    check("store 有统一连接上下文（异常也回滚 + 一定关闭）",
+          "def connect()" in _ssrc and "con.rollback()" in _ssrc)
+    check("init 用 BEGIN IMMEDIATE 把「判首次 → 建表 → 播种」圈成一个原子单元",
+          "BEGIN IMMEDIATE" in _ssrc and "def _init_locked(" in _ssrc)
+    check("add_memo 的「写条目 + 补标签字典」在同一事务",
+          "with connect() as con:" in _ssrc
+          and "_tags_ensure(con, names)" in _ssrc)
+    # 行为验证：建库 + add_memo 带标签，条目和字典**一起**存在
+    tmpdb = tempfile.mkdtemp(prefix="tx_test_")
+    _orig_db = _store.DB
+    try:
+        _store.DB = os.path.join(tmpdb, "t.db")
+        _store.init()
+        _store.add_memo("g", "", "s", "", "带标签的一条", tags=["设计", "UI"])
+        rows = _store.list_memos(10)
+        check("add_memo 后条目与标签都在（同一事务生效）",
+              rows and rows[0]["tags"] == ["设计", "UI"], f"got={rows[0]['tags']}")
+        check("标签字典也补上了",
+              {"设计", "UI"} <= {t["name"] for t in _store.tags_all()})
+        # 二次 init 不该重复播种（并发首次启动那个 bug 的守住版）
+        n1 = _store.count_memos()
+        _store.init()
+        check("重复 init 不重复播种（fresh 判据 + 事务）",
+              _store.count_memos() == n1, f"{n1} → {_store.count_memos()}")
+    finally:
+        _store.DB = _orig_db
+        shutil.rmtree(tmpdb, ignore_errors=True)
+
+    # ── ④ 抽屉分页：SQL 查询 + offset ──
+    check("query_items 支持 limit / offset（可翻到早期数据）",
+          "def query_items(kinds=None, statuses=None, text=None, limit=300, offset=0)"
+          in _ssrc)
+    _gsrc = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    check("抽屉列表窗口有「加载更多」分页",
+          "加载更多" in _gsrc and "LIST_PAGE" in _gsrc)
+    check("轮播舞台仍用有界窗口（舞台不需要全量）",
+          "STAGE_ROWS" in _gsrc and "limit=self.STAGE_ROWS" in _gsrc)
 
 
 def main():
@@ -3371,7 +3075,6 @@ def main():
         test_bot()
     test_send_file()
     test_md2img()
-    test_ideas_bubbles()
     test_extensions()
     test_ext_manager()
     test_ignore()
@@ -3390,6 +3093,7 @@ def main():
     test_no_window()
     test_gui_speed()
     test_gui_update_check()
+    test_review_hardening()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

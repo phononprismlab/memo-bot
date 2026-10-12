@@ -10,6 +10,7 @@
 
 生产替换：把这里换成 CloudBase PostgreSQL 的 bot_memos 表即可，接口不变。
 """
+import contextlib
 import json
 import os
 import re
@@ -18,6 +19,33 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 
 from paths import data_path
+
+
+@contextlib.contextmanager
+def connect():
+    """连接上下文：**正常提交、异常回滚、无论如何都关闭**。
+
+    为什么要它：以前到处是 `con = sqlite3.connect(DB); ...; con.commit();
+    con.close()` —— 中间任何一步抛异常，`close()` 就永远走不到：连接泄漏，
+    而且那次写停在「已执行、没提交」的中间态（审查报告点出的
+    「异常路径遗留未关闭的连接」）。用它包起来，异常路径也一定收得干净。
+
+    `isolation_level=None` = 关掉 Python 的隐式事务管理，改由调用方**显式**
+    用 `BEGIN` / `COMMIT` 圈事务 —— 需要多步原子写的地方（如 init 的
+    「判首次 → 建表 → 播种」）才控制得住；单条语句的调用方什么都不用写。
+    """
+    con = sqlite3.connect(DB, isolation_level=None)
+    try:
+        yield con
+        con.commit()                    # 显式事务下无事发生；隐式事务下提交
+    except BaseException:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        con.close()
 
 # 🔴 memos.db 是**可写数据** —— 安装版由 MEMO_DATA_DIR 指到用户目录（见 paths.py）
 DB = data_path("memos.db")
@@ -69,7 +97,28 @@ def _seed(con):
 
 
 def init():
-    con = sqlite3.connect(DB)
+    # 🔴 整个「判首次 → 建表 → 迁移 → 播种」必须在**同一个显式事务**里，
+    #    而且要 `BEGIN IMMEDIATE` 一上来就抢写锁 —— 否则 bot 和桌面 GUI 同时
+    #    首次启动时，两个都会先读到「表不存在」（fresh=True），最后各播一遍示例
+    #    （审查报告点出的「初始化需要更强的事务边界」）。IMMEDIATE 让后到的那个
+    #    等前者提交完，再读时表已存在 ⇒ fresh=False ⇒ 不重复播种。
+    con = sqlite3.connect(DB, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _init_locked(con)
+        con.execute("COMMIT")
+    except BaseException:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _init_locked(con):
+    """`init()` 的事务体（已 BEGIN IMMEDIATE）—— 建表 / 迁移 / 首次播种。"""
     # 🔴 建表**之前**先看表在不在 —— 这就是「是不是第一次用」的唯一判据。
     #    用「表是空的」当判据不行：用户把示例删光了，再启动就又给他塞回来。
     fresh = con.execute(
@@ -124,8 +173,6 @@ def init():
     # 全新的库才塞示例（老库 fresh=False，一个字节都不动）
     if fresh and not os.environ.get("MEMO_NO_SEED"):
         _seed(con)
-    con.commit()
-    con.close()
 
 
 def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_MEMO, tags=None,
@@ -134,21 +181,24 @@ def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_ME
     created = datetime.now().isoformat(timespec="seconds")
     names = _clean_tags(tags)
     pics = _clean_images(images)
-    con = sqlite3.connect(DB)
-    con.execute(
-        "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,content,created_at,kind,tags,images)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (
-            memo_id, group_id, group_name, sender_id, sender_name, content, created,
-            kind, json.dumps(names, ensure_ascii=False) if names else None,
-            json.dumps(pics, ensure_ascii=False) if pics else None,
-        ),
-    )
-    con.commit()
-    con.close()
-    # 🔴 顺手把这些标签补进字典表 —— 否则打了一个新标签，配置页的标签条里却看不到
-    if names:
-        tags_ensure(names)
+    # 🔴 写条目 + 补标签字典必须在**同一个事务**里。以前是「先 INSERT 提交，
+    #    再单独 tags_ensure」—— 第二步失败就留下「条目带了标签、标签字典里却
+    #    没有它」的半状态（审查报告点出的 add_memo 两步写）。现在同生共死。
+    with connect() as con:
+        con.execute("BEGIN")
+        con.execute(
+            "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,"
+            "content,created_at,kind,tags,images) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                memo_id, group_id, group_name, sender_id, sender_name, content,
+                created, kind,
+                json.dumps(names, ensure_ascii=False) if names else None,
+                json.dumps(pics, ensure_ascii=False) if pics else None,
+            ),
+        )
+        # 🔴 顺手把这些标签补进字典表 —— 否则打了个新标签，配置页的标签条里看不到
+        if names:
+            _tags_ensure(con, names)
     return {"id": memo_id, "content": content, "created_at": created, "kind": kind,
             "tags": names, "images": pics}
 
@@ -244,23 +294,29 @@ def tags_all():
     return out
 
 
-def tags_ensure(names):
-    """把还没进字典的标签名补进去（用默认色）。返回新增了几个。"""
-    names = _clean_tags(names)
-    if not names:
-        return 0
-    now = datetime.now().isoformat(timespec="seconds")
-    con = sqlite3.connect(DB)
+def _tags_ensure(con, names):
+    """在**已有连接**上把缺失的标签补进字典（不开新连接，见 add_memo 的事务）。
+
+    调用方负责事务边界；这里只发语句。`names` 必须是已清洗过的。
+    """
     n = 0
+    now = datetime.now().isoformat(timespec="seconds")
     for name in names:
         cur = con.execute(
             "INSERT OR IGNORE INTO tags (name,color,created_at) VALUES (?,?,?)",
             (name, DEFAULT_TAG_COLOR, now),
         )
         n += cur.rowcount
-    con.commit()
-    con.close()
     return n
+
+
+def tags_ensure(names):
+    """把还没进字典的标签名补进去（用默认色）。返回新增了几个。"""
+    names = _clean_tags(names)
+    if not names:
+        return 0
+    with connect() as con:
+        return _tags_ensure(con, names)
 
 
 def set_item_tags(item_id, names):
@@ -273,16 +329,16 @@ def set_item_tags(item_id, names):
     if not item_id:
         return 0
     clean = _clean_tags(names)
-    con = sqlite3.connect(DB)
-    cur = con.execute(
-        "UPDATE memos SET tags=? WHERE id=?",
-        (json.dumps(clean, ensure_ascii=False) if clean else None, item_id),
-    )
-    n = cur.rowcount
-    con.commit()
-    con.close()
-    if clean:
-        tags_ensure(clean)
+    # 改条目标签 + 补字典，同一事务（同 add_memo 的理由）
+    with connect() as con:
+        con.execute("BEGIN")
+        cur = con.execute(
+            "UPDATE memos SET tags=? WHERE id=?",
+            (json.dumps(clean, ensure_ascii=False) if clean else None, item_id),
+        )
+        n = cur.rowcount
+        if clean:
+            _tags_ensure(con, clean)
     return n
 
 
@@ -457,6 +513,66 @@ def list_ideas(status=None, limit=500, newest_first=False):
     return [_with_lists(dict(r)) for r in rows]
 
 
+def query_items(kinds=None, statuses=None, text=None, limit=300, offset=0):
+    """按条件从库里**取一页**条目（备忘 + 灵感混排，时间倒序）。
+
+    为什么要它：抽屉的列表 / 搜索以前是「先 `list_memos(500)` + `list_ideas(500)`
+    把固定窗口全捞进内存，再在界面上过滤」—— 记录一旦超过 500 条，更早的数据
+    明明在库里、导出里也有，但在列表和搜索里**永远翻不到**（审查报告点出的
+    「500 条限制会隐藏旧数据」）。改成把筛选下推到 SQL，再配合 `offset` 分页，
+    想翻多深就翻多深。
+    🔴 `text` 命中的字段和以前界面上一致：正文 / 备注 / 标签（标签是 JSON 列，
+       用 LIKE 粗筛）。
+    """
+    # 抽屉舞台 / 列表都不显示已丢弃项；过滤必须在 SQL 分页前做，
+    # 否则一页里大量 dropped 行会挤掉可见记录，并让计数与列表不一致。
+    where, args = ["IFNULL(status,'open') != ?"], [STATUS_DROPPED]
+    if kinds:
+        where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+        args += list(kinds)
+    if statuses:
+        where.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        args += list(statuses)
+    if text and text.strip():
+        like = _like_contains(text)
+        where.append("(content LIKE ? ESCAPE '\\' OR IFNULL(note,'') LIKE ? ESCAPE '\\' "
+                     "OR IFNULL(tags,'') LIKE ? ESCAPE '\\')")
+        args += [like, like, like]
+    sql = ("SELECT * FROM memos WHERE " + " AND ".join(where)
+           + " ORDER BY created_at DESC LIMIT ? OFFSET ?")
+    args += [int(limit), int(offset)]
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, args).fetchall()
+    return [_with_lists(dict(r)) for r in rows]
+
+
+def count_query_items(kinds=None, statuses=None, text=None):
+    """`query_items` 同条件的**总数**（给列表窗口显示「共 N 条 / 还能加载更多」）。"""
+    where, args = ["IFNULL(status,'open') != ?"], [STATUS_DROPPED]
+    if kinds:
+        where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+        args += list(kinds)
+    if statuses:
+        where.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        args += list(statuses)
+    if text and text.strip():
+        like = _like_contains(text)
+        where.append("(content LIKE ? ESCAPE '\\' OR IFNULL(note,'') LIKE ? ESCAPE '\\' "
+                     "OR IFNULL(tags,'') LIKE ? ESCAPE '\\')")
+        args += [like, like, like]
+    with connect() as con:
+        return con.execute("SELECT COUNT(*) FROM memos WHERE " + " AND ".join(where),
+                           args).fetchone()[0]
+
+
+def _like_contains(text):
+    """构造字面包含搜索模式，转义 SQL LIKE 的通配符与转义符本身。"""
+    value = str(text or "").strip()
+    value = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + value + "%"
+
+
 def idea_stats():
     """灵感计数：{'open','done','decided','dropped','total'}"""
     con = sqlite3.connect(DB)
@@ -610,6 +726,10 @@ def _boomerang_where(days, scope, now=None):
     """
     want_memo = "memo" in (scope or [])
     statuses = [_SCOPE_TO_STATUS[s] for s in (scope or []) if s in _SCOPE_TO_STATUS]
+    # 🔴 「已整理」同时收纳 done / decided（展示层两种分法已合并，用户 2026-10-12）——
+    #    范围里选了 done 就该把 decided 也带上，不然旧「已决议」条目凭空不再被翻。
+    if "done" in (scope or []) and STATUS_DECIDED not in statuses:
+        statuses.append(STATUS_DECIDED)
     if not want_memo and not statuses:
         return None, []
     cutoff = ((now or datetime.now()) - timedelta(days=int(days))).isoformat(timespec="seconds")

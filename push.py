@@ -22,7 +22,7 @@
 `QQ_GROUP_OPENID`（纯 openid，视作群）+ `QQ_C2C_OPENID`；配过就以它为准，
 **空值不回退**（见 `targets()` 的说明）。
 
-谁调用它：`bot.py`（记录 + 启动播报）、`config-web.py`（页面）。
+谁调用它：`bot.py`（记录 + 启动播报）、`config_core.py`（桌面配置中心的「播报目标」列表）。
 """
 import json
 import os

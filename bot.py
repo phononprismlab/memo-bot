@@ -60,6 +60,8 @@ from store import (
     KIND_MEMO,
     KIND_IDEA,
     STATUS_OPEN,
+    STATUS_DONE,
+    STATUS_DECIDED,
     pick_boomerang,
     count_boomerang,
     mark_boomerang,
@@ -77,6 +79,8 @@ import media as _media
 #    重启流程里崩（bot_stop 成功 → bot_start 崩 → 机器人被停掉却起不来）。
 from botctl import _pid_alive  # noqa: E402
 
+import single_lock as _single_lock  # noqa: E402  （OS 级单实例锁）
+
 from paths import data_path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -85,28 +89,41 @@ LAST_MSG_FILE = data_path("last_group_msg.json")
 PID_FILE = data_path("bot.pid")
 
 
+_INSTANCE_LOCK = _single_lock.SingleInstance("bot")
+
+
 def acquire_pid_lock():
     """单实例锁：已有活着的实例就返回 False。
 
     🔴 为什么需要：计划任务只保证「同一个任务不并发」，手动执行
     `python bot.py` 会起第二个进程 → 两条 WS 连接抢事件、消息随机丢。
+    🔴 **判据是 OS 级命名互斥体**（`single_lock`），不是「读 pid → 判活 → 写 pid」
+       那三步 —— 那三步不是原子的，两个进程同时启动会**都通过检查**，
+       结果跑起两个（审查报告点出的「单实例锁存在并发窗口」）。
+       pid 文件仍写，但它现在只当**信息**（`botctl` 用它找到进程去停 / 判活），
+       不再承担「锁」的职责。
     """
-    old = 0
-    try:
-        with open(PID_FILE, encoding="utf-8") as f:
-            old = int((f.read() or "0").strip() or 0)
-    except (OSError, ValueError):
-        old = 0
-    if old and old != os.getpid() and _pid_alive(old):
-        print(f"[拒绝启动] 已有实例在跑（PID {old}）—— 同一时刻只能跑一个 bot。", flush=True)
+    if not _INSTANCE_LOCK.acquire():
+        old = bot_pid()
+        print(f"[拒绝启动] 已有实例在跑"
+              f"{f'（PID {old}）' if old else ''} —— 同一时刻只能跑一个 bot。",
+              flush=True)
         return False
     try:
         with open(PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
     except OSError as e:
         print(f"[warn] 写 PID 文件失败（不阻塞启动）: {e}", flush=True)
-        return True
     return True
+
+
+def bot_pid():
+    """`bot.pid` 里记的进程号（0 = 没记）。仅供展示 / 排查，不参与判活。"""
+    try:
+        with open(PID_FILE, encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
 
 
 def release_pid_lock():
@@ -168,6 +185,86 @@ def handle_event(group_id, group_name, sender_id, sender_name, message):
     return add_memo(group_id, group_name, sender_id, sender_name, content)
 
 
+# ── 「#」标签：写灵感时 # 后面的内容自动变成标签 ────────────────────
+# 约定（用户 2026-10-12）：
+#   · `#` 落在**词边界**时开启一段「标签区」，直到下一个 `#` 或结尾；
+#   · 标签区内部再按「标点 / 空格 / 换行」切成**多个**标签名；
+#   · 标签区从正文里摘掉，只留正文落库。
+# 🔴 词边界 = 空白 / 标点 / **汉字**。汉字算边界是因为中文里「配色#设计」
+#    的 # 就是标签起手（没有空格也认）；而拉丁字母 / 数字后面**不算** ——
+#    「C#」「issue#42」这种 # 是词的一部分，不能剪（真机上两种都出现过）。
+_TAG_OPEN = "#＃"
+_BOUNDARY = set(" \t\r\n,，。;；:：、.．!！?？~～…·/\\|｜+＋()（）[]【】{}「」『』\"'“”‘’<>《》")
+# 标签区内部的分隔符 = 边界字符 + # 自己（「#设计#UI」连写也要切开）
+_TAG_SEP = _BOUNDARY | set(_TAG_OPEN)
+TAG_MAX_PER_ITEM = 10      # 一条最多切几个标签，防「整段话全是 #」的 abusive 输入
+
+
+def _is_tag_boundary(ch):
+    """# 能不能在这个字符后面开标签区（空白 / 标点 / 汉字算，字母数字不算）。"""
+    if ch in _BOUNDARY:
+        return True
+    o = ord(ch)
+    # 常用汉字区（基本区 + 扩展 A + 兼容表 + 扩展 B 起头）—— 标签名本身
+    # 可以含汉字，这里只看「# 前面那个字符」是不是汉字。
+    return (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF
+            or 0xF900 <= o <= 0xFAFF or 0x20000 <= o <= 0x2A6DF)
+
+
+def split_tags(text):
+    """把 `#标签` 片段从正文里摘出来 → `(正文, [标签名...])`。
+
+    干嘛的：聊天里写「参考这个配色 #设计」时，# 后面是用户的分类意图，
+            不该混在正文里。标签落库后，搜索灵感 / 脑内抽屉都能用。
+    谁调用它：bot.py 收灵感的两条入库路径（_store_media / @ 带图兜底）。
+
+    例：
+        "参考这个配色 #设计 UI"   → ("参考这个配色", ["设计", "UI"])
+        "参考配色#设计"           → ("参考配色", ["设计"])       # 汉字后直接跟 #
+        "C# 和 Python 都学"       → ("C# 和 Python 都学", [])   # 字母后的 # 不动
+        "issue#42 已修"           → ("issue#42 已修", [])       # 同理
+        "#设计 #UI 参考"          → 原样返回（整条都是标签、没正文）
+        "没有标签"                → ("没有标签", [])
+    🔴 全是标签、没正文时**原样返回**（不切）—— 空正文的条目在抽屉里
+       就是一张空白卡片，不如把原文留着。
+    """
+    body = text or ""
+    if not any(ch in _TAG_OPEN for ch in body):
+        return body, []
+    tags, keep = [], []
+    i, n, last = 0, len(body), 0
+    while i < n:
+        if body[i] in _TAG_OPEN and (i == 0 or _is_tag_boundary(body[i - 1])):
+            j = i + 1
+            while j < n and body[j] not in _TAG_OPEN:   # 标签区到下一个 # 或结尾
+                j += 1
+            keep.append(body[last:i])
+            # 区内按「标点 / 空格 / 换行 / #」切成多个名字
+            part = []
+            for ch in body[i + 1:j]:
+                if ch in _TAG_SEP:
+                    if part:
+                        nm = "".join(part)
+                        if nm not in tags and len(tags) < TAG_MAX_PER_ITEM:
+                            tags.append(nm)
+                        part = []
+                else:
+                    part.append(ch)
+            if part and len(tags) < TAG_MAX_PER_ITEM:
+                nm = "".join(part)
+                if nm not in tags:
+                    tags.append(nm)
+            last = j
+            i = j
+            continue
+        i += 1
+    keep.append(body[last:])
+    content = re.sub(r"[ \t]+", " ", "".join(keep)).strip()
+    if not content:                      # 全是标签、没正文 → 不切，原文照存
+        return body, []
+    return content, tags
+
+
 # ── 收图：把消息里的图片落盘 ──────────────────────────────────────
 # 🔴 **只在「这条消息确实会入库」时才下载** —— 被忽略表拦掉的、被指令吃掉的、
 #    纯图片但收图开关关着的，一律不下载。否则光是别人在群里发图，硬盘就悄悄满了。
@@ -225,33 +322,27 @@ def image_urls(message):
     return out[: _media.MAX_PER_MSG]
 
 
-def collect_images(message, scope):
-    """按开关决定收不收图 → 相对路径数组（不收 / 失败都返回空数组）。
+async def collect_images_async(message, scope):
+    """`collect_images` 的**异步**版本 —— 给 `route_message` 用。
 
-    收图是**静默**行为：下载失败只进日志，不往群里说话。
+    🔴 为什么必须异步：收图是**阻塞式网络下载**（单张超时 10s、每条消息最多 9 张
+       ⇒ 极端情况能占住事件循环约 90s）。`route_message` 是 async 路由，
+       在里面同步调它 = 整个 bot 卡死 90 秒 —— WebSocket 心跳发不出去、
+       别的消息全排队（审查报告点出的「事件循环阻塞」）。丢进线程池，
+       事件循环照常转。
+    🔴 逻辑**只有一份**：`collect_images` 仍是纯同步函数（测试直接调它），
+       这里只是 `to_thread` 包一层，不复制任何判断。
     """
-    want = _settings.get("image_collect") or []
-    if scope not in want:
-        return []
-    urls = image_urls(message)
-    if not urls:
-        # 有附件却一个 URL 都没解析出来 —— 多半是平台换了结构。留个痕，
-        # 免得又变成「什么都没发生」（收图静默失败过一次，查了很久）。
-        n_att = len(getattr(message, "attachments", None) or [])
-        if n_att:
-            print(f"[收图·跳过] 有 {n_att} 个附件，但没解析出图片 URL", flush=True)
-        return []
-    paths, errs = _media.collect(urls)
-    if errs:
-        print(f"[收图·部分失败] {len(errs)}/{len(urls)}: {'; '.join(errs[:3])}", flush=True)
-    if paths:
-        print(f"[收图] 存入 {len(paths)} 张：{', '.join(paths)}", flush=True)
-        # 🔴 落盘后立刻查一次占用 —— 报警要在「刚超过阈值」那一刻发出来，
-        #    不然要等到下次 bot 启动才提，用户早忘了自己开过收图。
-        check_image_alert()
-    return paths
+    return await asyncio.to_thread(collect_images, message, scope)
 
 
+def collect_images(message, scope):
+    """当前发布版本关闭收图；保留函数供后续版本恢复与既有调用兼容。
+
+    配置入口虽隐藏，但旧 settings.json 或机器人设置指令仍可能保留 / 写入开关；
+    因此发布开关必须在实际下载边界生效，不能只依赖 UI 隐藏。
+    """
+    return []
 def check_image_alert():
     """占用超阈值就往播报目标发提醒（防刷屏靠 push 里的回滞状态）。"""
     try:
@@ -285,18 +376,20 @@ HELP_BASE = (
     "备忘 <内容> —— 记一条备忘\n"
     "查备忘 —— 看最近 10 条备忘\n"
     "查灵感 —— 看还没处理的灵感\n"
-    "发文件 <关键词> —— 搜文件并渲染成图片发出\n"
+    "搜索灵感 <关键词> —— 在灵感里搜（正文 / 标签 / 结论都算）\n"
+    "发文件 <关键词> —— 在配置中心「④ 发文件」设的目录里搜文件、渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
     "回旋镖 [天数] —— 把 N 天前（默认 3 天）记过的旧账翻一条回来\n"
     "导出 [格式] —— 把全部备忘 + 灵感导成一个文件发给你（格式 md / txt / json / zip）\n"
     "            zip 连收进来的图片原图一起打包（太大发不出来时会告诉你去哪拿）\n"
     "忽略 <内容> —— 含该内容的消息一律跳过（不收灵感、不响应）；\n"
     "            「忽略 列表 / 忽略 删除 X / 忽略 清空」管理\n"
-    "设置 —— 看/改本机设置（网页「配置中心」改的是同一份）；\n"
+    "设置 —— 看/改本机设置（桌面「配置中心」改的是同一份）；\n"
     "            「设置 <键> <值> / 设置 重置 <键>」\n"
     "你好 —— 看我都能干什么（说明里写清了：我没有语言生成能力）\n"
     "帮助 —— 显示本菜单\n"
-    "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰"
+    "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰\n"
+    "写灵感带 # 号：# 后面的内容自动存成标签（空格 / 标点分隔多个）"
 )
 MEMO_LIST_CMDS = {"查备忘", "查看备忘", "备忘列表", "列备忘"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
@@ -307,7 +400,8 @@ HELLO_CMDS = {"你好", "您好", "hi", "hello", "嗨"}
 # 设置里「功能介绍」被清空时的兜底 —— 保证「你好」永远有话说。
 HELLO_FALLBACK = (
     "你好，我是摸鱼bot 🐟\n"
-    "我只会记事和搬文件：记备忘、收灵感、发文件、摸鱼、回旋镖、导出。\n"
+    "我只会记事和搬文件：记备忘、收灵感、搜索灵感、发文件、摸鱼、回旋镖、导出。\n"
+    "写灵感时加 #标签，之后可以按标签找回来。\n"
     "我没有语言生成能力，不会聊天、也不会回答问题。\n"
     "发「帮助」看完整指令。"
 )
@@ -483,13 +577,15 @@ def memo_list_text(limit=10, kind=KIND_MEMO):
         label, icon = "备忘", "📝"
         head = f"{icon} 最近 {len(rows)} 条{label}："
     else:
-        # 灵感只看「待处理」——处理过的在电脑上用灵感池.md 看
+        # 灵感只看「待处理」——处理过的在电脑上用脑内抽屉看
         rows = list_ideas(STATUS_OPEN, limit, newest_first=True)
         label, icon = "灵感", "💡"
         st = idea_stats()
+        # 🔴 「已处理 / 已决议」合并报「已整理」（用户 2026-10-12：两种烧脑分法
+        #    简化成一种；库里 status 不动，decided 照常算进已整理）
         head = (
             f"{icon} 待处理灵感 {st['open']} 条"
-            f"（已处理 {st['done']} / 已决议 {st['decided']} / 已丢弃 {st['dropped']}）："
+            f"（已整理 {st['done'] + st['decided']} / 已丢弃 {st['dropped']}）："
         )
     if not rows:
         return f"（暂无{label}）"
@@ -500,9 +596,58 @@ def memo_list_text(limit=10, kind=KIND_MEMO):
     return "\n".join(lines)
 
 
+# ── 「搜索灵感 <关键词>」：在灵感里按正文 / 标签 / 结论搜 ────────────
+# 🔴 @ 与非 @ 都认：非 @ 群消息也认，不然「搜索灵感 设计」会被当成普通
+#    发言收成灵感，越收越乱（和查备忘 / 查灵感 同一处理）。
+# 🔴 「已处理 / 已决议」对外一律报「已整理」（用户 2026-10-12 简化）；
+#    库里的 status 不动，decided 照常算进已整理。
+IDEA_SEARCH_RE = re.compile(r"^(?:搜索灵感|搜灵感|灵感搜索|搜索)\s*(.+)$", re.S)
+IDEA_SEARCH_HINT = "告诉我搜什么，例如「搜索灵感 设计」"
+IDEA_SEARCH_SCAN = 500        # 只扫最近 500 条灵感（再老的让抽屉去翻）
+
+
+def idea_search_text(q, limit=10):
+    """按「正文 / 标签 / 结论」搜灵感，命中按时间倒序回前 limit 条。
+
+    干嘛的：灵感一多，轮播等不到、列表翻不完 —— 「搜索灵感 设计」直接
+            按关键词找（用户 2026-10-12 的要求）。写灵感时 # 出来的标签
+            也参与匹配：打了「#设计」的条目，搜「设计」照样命中。
+    谁调用它：消息处理器里「搜索灵感」指令分支。
+    """
+    q = " ".join((q or "").split())          # 多行 / 连续空格折成一个
+    if not q:
+        return IDEA_SEARCH_HINT
+    key = q.lower()
+    hits = []
+    for it in list_ideas(None, IDEA_SEARCH_SCAN, newest_first=True):
+        tags = [str(t) for t in (it.get("tags") or [])]
+        hay = "\n".join([str(it.get("content") or ""),
+                         str(it.get("note") or "")] + tags).lower()
+        if key in hay:
+            hits.append((it, tags))
+    if not hits:
+        return (f"（没有含「{q}」的灵感 —— 换个词试试；"
+                f"发「查灵感」可以看全部待处理）")
+    lines = [f"💡 搜「{q}」命中 {len(hits)} 条灵感"
+             f"（列出前 {min(limit, len(hits))} 条，按时间倒序）："]
+    for it, tags in hits[:limit]:
+        ts = (it.get("created_at") or "")[5:16].replace("T", " ")
+        st = it.get("status")
+        if st == STATUS_OPEN:
+            mark = ""
+        elif st in (STATUS_DONE, STATUS_DECIDED):
+            mark = "（已整理）"
+        else:
+            mark = "（已丢弃）"
+        tag_s = (" · " + " ".join("#" + t for t in tags)) if tags else ""
+        lines.append(f"[{ts}] {strip_at(it['content'])}{tag_s}{mark}")
+    return "\n".join(lines)
+
+
 # ── 「发文件」：搜索文件根目录 + 交互式选择 ────────────────────────
 # 🔴 搜索根默认是你的用户主目录（~）；用环境变量 MEMO_SEARCH_ROOT 改成任意目录
-#    （比如只搜某个项目文件夹）。注意：这是「发文件」功能的检索范围，
+#    （比如只搜某个项目文件夹）。**支持多个目录**（分号或换行分隔），配置中心
+#    「④ 发文件」里一行一个。注意：这是「发文件」功能的检索范围，
 #    不要指向含凭据 / 私密文件的目录。
 # 🔴 同目录文件在搜索里加权（同分时优先）；用 MEMO_WORKSPACE_ROOT 覆盖。
 WORKSPACE_ROOT = os.getenv("MEMO_WORKSPACE_ROOT") or HERE
@@ -538,6 +683,16 @@ def _prune_roots(roots):
 
 SEARCH_ROOTS = parse_search_roots()
 SEARCH_ROOT = SEARCH_ROOTS[0]      # 兼容：扩展 API / 老代码只认单个根
+
+
+def search_scope_text(limit=120):
+    """「没找到文件」回执里附的搜索范围说明（多个根用顿号连；过长截断）。
+
+    默认根是用户主目录也照样显示 —— 用户得知道「刚才到底搜了哪儿」，
+    才好判断是该换个关键词，还是去配置中心「④ 发文件」加目录。
+    """
+    s = "、".join(_prune_roots(SEARCH_ROOTS))
+    return s if len(s) <= limit else s[: limit - 1] + "…"
 EXCLUDE_DIRS = {
     "node_modules", ".git", "__pycache__", "envs", ".venv",
     "binaries", ".cache", "dist", "build", ".next",
@@ -749,6 +904,16 @@ def self_test():
         for s in samples:
             r = handle_event(s.group_id, s.group_name, s.sender_id, s.sender_name, s.message)
             print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非备忘）'}")
+        print("\n=== 「#」标签切分（split_tags）===")
+        for s in ("参考这个配色 #设计 UI",
+                  "参考配色#设计",
+                  "C# 和 Python 都学",
+                  "issue#42 已修",
+                  "#设计 #UI 参考",
+                  "设计、UI、参考 三个词 #设计,UI,参考",
+                  "没有标签"):
+            c, tg = split_tags(s)
+            print(f"  {s!r}\n    -> 正文 {c!r} / 标签 {tg}")
         print("\n=== 本次模拟落库结果（临时库，已丢弃）===")
         for m in list_memos():
             print(f"  [{m['created_at']}] {m['group_name']}/{m['sender_name']}: {m['content']}")
@@ -912,8 +1077,11 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         #    卡死几十秒 —— 期间收不到任何消息、心跳也停摆。
         matches = await asyncio.to_thread(search_files, q)
         if not matches:
+            # 把实际搜索范围回给用户：根可能是好几个（配置中心「④ 发文件」），
+            # 不说清楚「搜了哪儿」，用户只会反复换关键词干着急。
             await message.reply(
-                content=f"（没找到含「{q}」的文件，已搜配置的根目录）", msg_seq=1
+                content=f"（没找到含「{q}」的文件 —— 只搜这些目录："
+                        f"{search_scope_text()}）", msg_seq=1
             )
             return
         if len(matches) == 1:
@@ -1003,6 +1171,18 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     if text in IDEA_LIST_CMDS:
         await message.reply(content=memo_list_text(10, KIND_IDEA), msg_seq=1)
         return
+    # 搜索灵感：按正文 / 标签 / 结论搜（@ 与非 @ 都认）
+    sm = IDEA_SEARCH_RE.match(text)
+    if sm:
+        q = sm.group(1).strip()
+        if not q:
+            await message.reply(content=IDEA_SEARCH_HINT, msg_seq=1)
+            return
+        reply = idea_search_text(q)
+        print(f"[搜索灵感] {gid} q={q!r} -> {reply.splitlines()[0][:40]!r}",
+              flush=True)
+        await message.reply(content=reply, msg_seq=1)
+        return
     if text in HELLO_CMDS:
         await message.reply(content=intro_text(), msg_seq=1)
         return
@@ -1014,7 +1194,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     result = handle_event(t["store_id"], t["store_name"], t["sender_id"], "", raw)
     if result:
         # 🔴 备忘是「明确要记」的 —— 这时才把图和它绑在一起
-        pics = collect_images(message, scope)
+        pics = await collect_images_async(message, scope)
         if pics:
             _attach_images(result["id"], pics)
         print(f"[备忘] {gid} -> {result['content']}"
@@ -1037,10 +1217,12 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     if mentioned:
         # 🔴 @ 了但没认出指令 —— 但如果带了图，图还是要按开关收的
         #    （用户发了图 + @ 机器人，意思就是「给我存着」）
-        pics = collect_images(message, scope)
+        pics = await collect_images_async(message, scope)
         if pics:
+            _txt, _tags = split_tags(text.strip())
             idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                            text.strip() or _IMAGE_ONLY_TEXT, kind=KIND_IDEA, images=pics)
+                            _txt or _IMAGE_ONLY_TEXT, kind=KIND_IDEA,
+                            images=pics, tags=_tags or None)
             print(f"[图·@] {gid} -> {idea['id']}（{len(pics)} 图）", flush=True)
         print(f"[未识别] @消息 text={text!r}", flush=True)
         await message.reply(
@@ -1058,7 +1240,7 @@ async def _store_media(message, t, scope, urls, text, mentioned):
     🔴 纯图片消息的 `content` 是空的 —— 但**不能丢**（用户发图就是想存），
        给一个占位文本 `[图片]` / `[图片 ×3]`，否则抽屉里是一条空白卡片。
     """
-    pics = collect_images(message, scope)
+    pics = await collect_images_async(message, scope)
     body = text
     if not body:
         if not pics:
@@ -1066,8 +1248,10 @@ async def _store_media(message, t, scope, urls, text, mentioned):
         body = f"[图片 ×{len(pics)}]" if len(pics) > 1 else "[图片]"
     if not text and not pics:
         return
+    # 「# 标签」：正文按约定切给标签列（词边界之外的 # 不当标签，见 split_tags）
+    body, tags = split_tags(body)
     idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                    body, kind=KIND_IDEA, images=pics)
+                    body, kind=KIND_IDEA, images=pics, tags=tags or None)
     tag = "灵感·私聊" if scope == SCOPE_C2C else "灵感"
     print(f"[{tag}] {t['key']} -> {idea['content']}"
           f"{f'（+{len(pics)} 图）' if pics else ''}", flush=True)

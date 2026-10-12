@@ -11,7 +11,7 @@
                 **没设时回退到 HERE** —— 也就是直接跑源码时，行为与以前完全一致。
 
 谁调用它：`store.py` / `settings.py` / `bot.py` / `send_file.py` / `ignore.py` /
-`moyu.py` / `config-web.py` / `brain-drawer.py` / `ideas.py`。
+`moyu.py` / `config_core.py` / `memo_gui.py` / `ideas.py`。
 """
 import os
 

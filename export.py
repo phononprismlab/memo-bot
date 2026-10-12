@@ -1,16 +1,16 @@
 """把备忘 / 灵感导出成一个文件（Markdown / 纯文本 / JSON / zip）。
 
-这个文件是干嘛的：给「导出」指令和脑内抽屉页的「⬇ 导出」按钮**共用**，
+这个文件是干嘛的：给「导出」指令和脑内抽屉的「导出」按钮**共用**，
    排版与格式只有这一处定义 —— 两边调的是同一个 `render()`。
   - `bot.py` 的「导出」指令：`render()` 落临时文件 → `send_file` 发回群里 / 私聊
-  - `brain-drawer.py` 的 `GET /api/export`：`render()` 直接当下载流吐给浏览器
+  - `memo_gui.py`（脑内抽屉底部「导出」按钮）：`render()` 落盘后打开文件 / 所在目录
 
 导出内容 = **全部备忘**（kind=memo）+ **全部灵感**（kind=idea，含状态与结论），
 按时间**正序**（先记的在前），换行原样保留。
 
 🔴 `zip` 格式会**连图片原图一起打包**（`导出.md` + `导出.json` + `images/`）。
    机器人发文件有 ~10MB 上限，超了由调用方降级（见 `too_big_for_qq()`）；
-   抽屉页走本地 HTTP 下载，不受这个限制。
+   桌面抽屉导出到本地文件，不受这个限制。
 
 对外只有四个函数：`render()` / `filename()` / `normalize_format()` / `too_big_for_qq()`。
 """
@@ -38,13 +38,18 @@ MIME = {
 QQ_FILE_LIMIT = 10 * 1024 * 1024
 
 STATUS_LABEL = {
-    store.STATUS_OPEN: "待处理",
-    store.STATUS_DONE: "已处理",
-    store.STATUS_DECIDED: "已决议",
+    store.STATUS_OPEN: "未整理",
+    store.STATUS_DONE: "已整理",
+    # 🔴 decided 与 done 在导出里合并成同一节「已整理」（跟桌面 / 网页同一套
+    #    口径，用户 2026-10-12：两种烧脑分法简化成一种；库里 status 不动）
+    store.STATUS_DECIDED: "已整理",
     store.STATUS_DROPPED: "已丢弃",
 }
-STATUS_ORDER = (store.STATUS_OPEN, store.STATUS_DONE,
-                store.STATUS_DECIDED, store.STATUS_DROPPED)
+STATUS_ORDER = ("未整理", "已整理", "已丢弃")
+_STATUS_TO_LABEL = {
+    store.STATUS_OPEN: "未整理", store.STATUS_DONE: "已整理",
+    store.STATUS_DECIDED: "已整理", store.STATUS_DROPPED: "已丢弃",
+}
 
 
 def normalize_format(fmt):
@@ -175,11 +180,12 @@ def _render_md(memos, ideas, now):
     L += [f"## 灵感（{len(ideas)} 条）", ""]
     if not ideas:
         L += ["_（还没有灵感）_", ""]
-    for st in STATUS_ORDER:
-        group = [i for i in ideas if i.get("status") == st]
+    for lab in STATUS_ORDER:
+        group = [i for i in ideas
+                 if _STATUS_TO_LABEL.get(i.get("status")) == lab]
         if not group:
             continue
-        L += [f"### {STATUS_LABEL.get(st, st)}（{len(group)} 条）", ""]
+        L += [f"### {lab}（{len(group)} 条）", ""]
         for i in group:
             L.append(f"- **{_when(i.get('created_at'))}** {_one_line(i.get('content'))}")
             if i.get("note"):
@@ -209,11 +215,12 @@ def _render_txt(memos, ideas, now):
     L += [f"── 灵感（{len(ideas)} 条）" + "─" * 20, ""]
     if not ideas:
         L += ["（还没有灵感）", ""]
-    for st in STATUS_ORDER:
-        group = [i for i in ideas if i.get("status") == st]
+    for lab in STATUS_ORDER:
+        group = [i for i in ideas
+                 if _STATUS_TO_LABEL.get(i.get("status")) == lab]
         if not group:
             continue
-        L += [f"· {STATUS_LABEL.get(st, st)}（{len(group)} 条）", ""]
+        L += [f"· {lab}（{len(group)} 条）", ""]
         for i in group:
             L.append(f"  [{_when(i.get('created_at'))}] {str(i.get('content') or '').strip()}")
             if i.get("note"):
@@ -284,9 +291,7 @@ def _render_zip(memos, ideas, now):
                 continue        # 单张读不到不该让整包导出失败
         # 收图关着的用户没有 images/，给个说明文件免得解压出来一头雾水
         if not media.list_files():
-            zf.writestr("images/说明.txt",
-                        "这次导出没有图片。\n"
-                        "在配置中心「⑤ 脑内抽屉」里打开「收集图片」，之后收到的图就会存进来。\n")
+            zf.writestr("images/说明.txt", "这次导出没有图片。\n")
     return buf.getvalue()
 
 

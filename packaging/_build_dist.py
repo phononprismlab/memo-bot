@@ -22,23 +22,58 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PKG = Path(__file__).resolve().parent      # <仓库>/packaging/
 REPO = PKG.parent                          # <仓库>（= memo-bot 源码目录）
 PY = PKG / "py"                            # 已装好依赖的 embeddable（本地重建，不进仓库）
-NODE_EXE = Path("C:/Users/Administrator/.workbuddy-ai/binaries/node/versions/22.22.2-6/node.exe")
-PWC = Path("C:/Users/Administrator/.workbuddy-ai/binaries/node/workspace/node_modules/playwright-core")
 DIST = PKG / "build" / "memo-bot"
 
 # app/ 里要拷的代码文件（不含开发用的 test/ 和打包用的脚本）
 APP_FILES = [
-    "bot.py", "brain-drawer.py", "config-web.py", "export.py", "ideas.py",
+    "bot.py", "export.py", "ideas.py",
     "ignore.py", "md2img.py", "moyu.py", "send_file.py", "settings.py",
     "store.py", "paths.py", "memo-launcher.py", "hub.py", "media.py",
     "push.py", "version.py",
-    # 桌面版这条线（原生界面 + 进程/计划任务查询 + 自定义指令管理）
-    "memo_gui.py", "botctl.py", "extmgr.py",
-    "md2png.mjs", "moyu-data.json", "README.md", ".env.example",
+    # 配置后端（原 config-web.py 的纯逻辑，网页 UI 下线后独立成此文件）
+    "config_core.py",
+    # 桌面版这条线（原生界面 + 进程/计划任务查询 + 自定义指令管理 + 单实例锁）
+    "memo_gui.py", "botctl.py", "extmgr.py", "single_lock.py",
+    "md2png.mjs", "moyu-data.json", "README.md", "安装指南.md", "功能清单.md",
+    ".env.example",
     "VERSION",
 ]
-# app/ 里要拷的目录（extensions/local 是私有扩展，不对外发）
-APP_DIRS = ["docs", "extensions"]
+# app/ 里要拷的目录（extensions/local 是私有扩展，不对外发；
+# assets 放图标等运行时资源（icons/src 是美术原图、`_make_icons.py` 的输入，
+# 不进安装包）；docs 里那张 QQ 设置页截图随包走。
+APP_DIRS = ["docs", "extensions", "assets"]
+COPY_IGNORE = shutil.ignore_patterns("local", "__pycache__", "src")
+
+
+def _resolve_node():
+    """使用与运行时相同的 MEMO_NODE 配置，或退回 PATH 上的 node。"""
+    candidates = [os.environ.get("MEMO_NODE"), shutil.which("node")]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate)
+    raise FileNotFoundError(
+        "找不到 Node.js。请安装 Node.js 并加入 PATH，或设置 MEMO_NODE 指向 node.exe。"
+    )
+
+
+def _resolve_playwright_core():
+    """使用 MEMO_PLAYWRIGHT_CORE、仓库 node_modules 或 NODE_PATH 查找依赖。"""
+    candidates = [
+        os.environ.get("MEMO_PLAYWRIGHT_CORE"),
+        str(REPO / "node_modules" / "playwright-core"),
+    ]
+    candidates.extend(
+        str(Path(root) / "playwright-core")
+        for root in (os.environ.get("NODE_PATH") or "").split(os.pathsep)
+        if root
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).is_dir():
+            return Path(candidate)
+    raise FileNotFoundError(
+        "找不到 playwright-core。请在仓库根目录运行 npm install，或设置 "
+        "MEMO_PLAYWRIGHT_CORE 指向它的安装目录。"
+    )
 
 
 def size_of(p):
@@ -48,6 +83,11 @@ def size_of(p):
 
 
 def main():
+    if not PY.is_dir():
+        raise FileNotFoundError(f"找不到 Python 打包运行时：{PY}")
+    node_exe = _resolve_node()
+    playwright_core = _resolve_playwright_core()
+
     if DIST.exists():
         shutil.rmtree(DIST)
     DIST.mkdir(parents=True)
@@ -68,17 +108,16 @@ def main():
     for d in APP_DIRS:
         s = REPO / d
         if s.is_dir():
-            shutil.copytree(s, app / d,
-                            ignore=shutil.ignore_patterns("local", "__pycache__"))
+            shutil.copytree(s, app / d, ignore=COPY_IGNORE)
 
     # 3) node
     (DIST / "node").mkdir()
-    shutil.copy2(NODE_EXE, DIST / "node" / "node.exe")
+    shutil.copy2(node_exe, DIST / "node" / "node.exe")
 
     # 4) playwright-core —— 放 app/node_modules 下，探测逻辑（HERE/node_modules/…）自动命中
     nm = app / "node_modules"
     nm.mkdir()
-    shutil.copytree(PWC, nm / "playwright-core")
+    shutil.copytree(playwright_core, nm / "playwright-core")
 
     # 5) 报告
     print("组装完成：", DIST)

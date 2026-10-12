@@ -48,6 +48,7 @@ sys.path.insert(0, HERE)
 from paths import data_path  # noqa: E402  （数据目录：pid 等可写文件落哪）
 
 import botctl  # noqa: E402  （机器人进程控制：start/stop/restart，配置中心与管家共用）
+import single_lock  # noqa: E402  （OS 级单实例锁）
 
 LAUNCHER = os.path.join(HERE, "memo-launcher.py")
 HUB_PID_FILE = data_path("hub.pid")
@@ -84,17 +85,24 @@ def hub_running():
     return pid if botctl._pid_alive(pid) else 0
 
 
+_HUB_LOCK = single_lock.SingleInstance("hub")
+
+
 def claim_single_instance():
     """抢单实例锁 → True 表示本进程是唯一的管家；False 表示已有别的在跑。
 
-    🔴 判断顺序不能反：**先查再写**。先写会把正在跑的管家的 pid 覆盖掉，
-       那个管家随后退出时 `atexit` 会把我们的 pid 文件的删除，锁就废了。
+    🔴 **判据是 OS 级命名互斥体**（见 `single_lock`）—— 「查 pid → 写 pid」
+       两步法不原子，两个管家同时启动会都写、都以为自己是唯一（审查报告点出的
+       「单实例锁存在并发窗口」）。互斥体由内核保证只有一个持有者。
+       `hub.pid` 仍写，只当信息（谁在跑 / 排查），不再当锁。
     """
-    running = hub_running()
-    if running:
+    if not _HUB_LOCK.acquire():
         return False
-    with open(HUB_PID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    try:
+        with open(HUB_PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
     return True
 
 

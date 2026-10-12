@@ -1,10 +1,10 @@
 """摸鱼bot 本地应用界面（原生 Tkinter / ttkbootstrap）。
 
 干嘛的：
-  把原来「配置中心网页（config-web.py 起的 127.0.0.1 服务）」和「脑内抽屉」搬进一个
+  把原来「配置中心网页」和「脑内抽屉」搬进一个
   本地桌面窗口。跑起来后不用再开浏览器访问 webui —— 配置、看抽屉都在这个窗口里完成。
   本文件只负责「界面 + 把用户操作翻译成对 bot 代码的调用」，所有真正的读写都复用
-  config-web.py / settings.py / push.py / ignore.py / moyu.py / botctl 里的纯逻辑函数，
+  config_core.py / settings.py / push.py / ignore.py / moyu.py / botctl 里的纯逻辑函数，
   不重复造轮子，也不起任何 HTTP 服务。
 
 谁调用它：
@@ -34,7 +34,7 @@ import webbrowser
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 
-# 把脚本所在目录钉进 sys.path / 工作目录，本地模块（store / media / config-web）才能稳定导入。
+# 把脚本所在目录钉进 sys.path / 工作目录，本地模块（store / media / config_core）才能稳定导入。
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 if HERE not in sys.path:
@@ -47,7 +47,7 @@ import export as _export       # 导出：与机器人「导出」指令、网�
 import settings as _settings   # 设置项：脑内抽屉的展示范围 / 回旋镖规则都在这
 import extmgr as _extmgr       # 自定义指令：扩展包的导入 / 列出 / 移除
 import botctl as _botctl       # 进程 / 计划任务查询（首屏靠它的非阻塞接口提速）
-from paths import data_path  # noqa: E402  （gui.pid 单实例锁落数据目录）
+from paths import data_path, data_dir  # noqa: E402  （gui.pid 单实例锁 / 主题偏好落数据目录）
 
 # 单实例锁（和 hub.pid / bot.pid 一个套路）：第二次启动顶到前面，不各开一份
 _GUI_PID_FILE = data_path("gui.pid")
@@ -90,14 +90,44 @@ def _font(size, weight=None):
     return (_FONT_FAMILY, n, weight) if weight else (_FONT_FAMILY, n)
 
 
-def load_config_web():
-    """把 config-web.py（文件名带连字符，不能直接 import）当模块加载并返回。
+def _raise_widget(w):
+    """把控件提到同级控件的栈顶 —— **对 Canvas 控件必须走这里**。
 
-    只认它的纯逻辑函数（full_state / write_env / bot_start …），HTTP 服务只在
-    `if __name__ == "__main__"` 里起，所以这里 import 不会拉起任何服务。
+    干嘛的：需要「盖在舞台上面」的同级兄弟控件（例如底部的筛选条）建好后置顶。
+    谁调用它：目前没有调用点（顶部遮罩带已弃用，见 BrainDrawerTab 的说明）；
+            留着是给以后新增浮层用的工具。
+    🔴 本机打包的 tkinter 把 `Canvas.lift = tkraise = tag_raise`（画布**条目**
+        升降，要求 tagOrId）—— 对 Canvas 控件调 `.lift()` / `.tkraise()` 会抛
+        `wrong # args: should be … raise tagOrId ?aboveThis?`，抽屉一 build 就
+        炸（真机探针实测）。全局 `raise` 对任何控件类型都对。
+    """
+    w.tk.call("raise", str(w))
+
+
+def _clamp_win(win, x, y, w, h, margin=8):
+    """把顶级窗口的 x/y 夹取进屏幕，返回夹好后的 `(x, y)`。
+
+    干嘛的：主窗口贴在屏幕右下角时，「主窗坐标 + 120/+150」那套偏移会把
+            列表窗 / 回收站整个推出屏幕 —— 用户眼里只剩一条窗边，就是反馈
+            单里的「只显示一条」（真机：主窗最大化或靠右下时必现）。
+    谁调用它：_open_list / _open_trash 摆窗口位置时。
+    🔴 多屏按**虚拟屏**算（winfo_screenwidth/height 就是整个虚拟桌面的尺寸），
+       负坐标屏也覆盖；任务栏高度不可知，只按屏幕边界夹、不猜任务栏。
+    """
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    return (min(max(margin, int(x)), max(margin, sw - w - margin)),
+            min(max(margin, int(y)), max(margin, sh - h - margin)))
+
+
+def load_config_web():
+    """把 config_core.py（配置后端）当模块加载并返回。
+
+    桌面端的配置中心 / 脑内抽屉 / 运行方式 / 版本四个页签全部走它提供的纯逻辑函数
+    （full_state / write_env / bot_start …）。原先的网页后端已抽成 config_core.py，
+    后端逻辑独立成 config_core.py，这里 import 不会拉起任何服务。
     """
     spec = importlib.util.spec_from_file_location(
-        "config_web", os.path.join(HERE, "config-web.py"))
+        "config_web", os.path.join(HERE, "config_core.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -118,6 +148,33 @@ def detect_system_dark():
         return val == 0
     except Exception:
         return False
+
+
+# ── 主题偏好持久化（浅色 / 深色 / 跟随系统）───────────────────────
+# 单独落一个小文件进数据目录，不碰 .env / settings.json（那是连接与机器人设置）。
+_THEME_FILE = "ui-theme.txt"
+
+
+def load_ui_theme():
+    """读主题偏好：'light' / 'dark' / 'system'，读不到或非法默认 'system'。"""
+    try:
+        with open(os.path.join(data_dir(), _THEME_FILE), encoding="utf-8") as f:
+            v = (f.read() or "").strip()
+        if v in ("light", "dark", "system"):
+            return v
+    except Exception:
+        pass
+    return "system"
+
+
+def save_ui_theme(mode):
+    """把主题偏好写进数据目录（失败静默，不影响切换）。"""
+    try:
+        with open(os.path.join(data_dir(), _THEME_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write(mode)
+    except Exception:
+        pass
 
 
 def win_app_id(appid="PhononPrismLab.MoyuBot.Desktop"):
@@ -156,6 +213,27 @@ BRAND_DARK = {
 
 THEME_LIGHT = "brand-light"
 THEME_DARK = "brand-dark"
+
+# ── 泳道气泡卡片配色（独立于浮层卡片，让气泡「浮起来」）──────────────
+# 浅色：纯白面 + 淡青描边 + 青灰投影；深色：抬升的深面 + 更深的描边 + 黑投影。
+# 用一套专属值，不蹭 modal 的 light/border —— 气泡要的是「比背景亮一档且有影」，
+# 而 modal 是贴在窗口上的实卡，两者观感诉求不同。
+BUBBLE_SURF_LIGHT = "#ffffff"
+BUBBLE_SURF_DARK = "#1b2735"
+BUBBLE_BORDER_LIGHT = "#cfe3ee"
+BUBBLE_BORDER_DARK = "#2c3a4d"
+BUBBLE_SHADOW_LIGHT = "#a9c2cf"
+BUBBLE_SHADOW_DARK = "#000000"
+BUBBLE_SHADOW_OFS = (3, 5)   # 投影相对卡片的偏移（右下），营造悬浮感
+BUBBLE_BORDER_W = 2          # 气泡描边粗细（状态色那道边），用户 2026-10-12 要求加粗
+
+
+def bubble_palette(theme):
+    """按当前主题返回 (surf, border, shadow) 三个 hex。"""
+    dark = theme == THEME_DARK
+    return (BUBBLE_SURF_DARK if dark else BUBBLE_SURF_LIGHT,
+            BUBBLE_BORDER_DARK if dark else BUBBLE_BORDER_LIGHT,
+            BUBBLE_SHADOW_DARK if dark else BUBBLE_SHADOW_LIGHT)
 
 
 def register_brand_themes(style):
@@ -238,6 +316,45 @@ def round_rect(cv, x1, y1, x2, y2, r=12, **kw):
         for i in range(steps + 1):
             a = math.radians(a0 + 90.0 * i / steps)
             pts += [cx + r * math.cos(a), cy + r * math.sin(a)]
+    return cv.create_polygon(pts, smooth=False, **kw)
+
+
+def round_rect_bottom(cv, x1, y1, x2, y2, r=12, **kw):
+    """圆角矩形，只圆**底边**两角：顶边是直线（贴着上面的卡片底，填住它的凹角），
+    左右下角圆弧。`round_rect` 的对偶 —— 浮层里上下两半拼成一个完整圆角卡用。
+    """
+    r = max(0, min(int(r), int((x2 - x1) // 2), int((y2 - y1) // 2)))
+    if r <= 0:
+        return cv.create_rectangle(x1, y1, x2, y2, **kw)
+    steps = max(3, min(10, r // 2 + 3))
+    pts = [x1, y1, x2, y1]          # 顺时针：左上 → 右上（顶边直线）
+    for i in range(steps + 1):      # 右下弧：0° → 90°
+        a = math.radians(90.0 * i / steps)
+        pts += [x2 - r + r * math.cos(a), y2 - r + r * math.sin(a)]
+    for i in range(steps + 1):      # 左下弧：90° → 180°
+        a = math.radians(90.0 + 90.0 * i / steps)
+        pts += [x1 + r + r * math.cos(a), y2 - r + r * math.sin(a)]
+    pts += [x1, y1]
+    return cv.create_polygon(pts, smooth=False, **kw)
+
+
+def round_rect_top(cv, x1, y1, x2, y2, r=12, **kw):
+    """圆角矩形，只圆**顶边**两角：底边直线，左右上角圆弧。`round_rect_bottom`
+    的对偶 —— 浮层里上下两半拼成一个完整圆角卡用（上卡圆顶、下条圆底，中间
+    那段接缝是直线，看着像同一张卡）。"""
+    r = max(0, min(int(r), int((x2 - x1) // 2), int((y2 - y1) // 2)))
+    if r <= 0:
+        return cv.create_rectangle(x1, y1, x2, y2, **kw)
+    steps = max(3, min(10, r // 2 + 3))
+    pts = [x1, y2, x2, y2, x2, y1 + r]   # 左下 → 右下 → 右上（底边 + 右边直线）
+    for i in range(steps + 1):           # 右上弧：0° → -90°
+        a = math.radians(-90.0 * i / steps)
+        pts += [x2 - r + r * math.cos(a), y1 + r + r * math.sin(a)]
+    pts += [x1 + r, y1]                  # 顶边到左上弧起点
+    for i in range(steps + 1):           # 左上弧：-90° → -180°
+        a = math.radians(-90.0 - 90.0 * i / steps)
+        pts += [x1 + r + r * math.cos(a), y1 + r + r * math.sin(a)]
+    pts += [x1, y2]
     return cv.create_polygon(pts, smooth=False, **kw)
 
 
@@ -384,8 +501,10 @@ class App:
         win_app_id()
         self._poll_job = None       # 顶栏「计划任务」后台轮询的定时器 id
         self.cw = load_config_web()
-        dark = detect_system_dark()
-        self.theme = THEME_DARK if dark else THEME_LIGHT
+        # 主题偏好：'light' / 'dark' / 'system'（默认跟随系统）。
+        # 读不到就退化为跟随系统，别因为偏好文件坏了就黑屏。
+        self.theme_mode = load_ui_theme()
+        self.theme = self._resolve_theme()
         # 🔴 ttkbootstrap 强制单根：先建唯一的 Window（它内部会建 root + style），
         # 再从 Window 上拿 style 注册品牌主题，绝不能在建 Window 之前另建 Style（会多一个 root）。
         self.root = ttk.Window(
@@ -400,6 +519,7 @@ class App:
         self.style.theme_use(self.theme)
         _reload_font_scale()      # 先读一次用户设的界面字号，首屏就按它建
         self._flat_styles()
+        self._sync_system_poll()  # 跟随系统模式下开始盯注册表
 
     def _flat_styles(self):
         """极简白基调的全局控件样式：无边框、弱化矩形感、留白呼吸。"""
@@ -494,7 +614,7 @@ class App:
         self.brain_drawer = BrainDrawerTab(nb, self)
         nb.add(self.config_center, text="配置中心")
         nb.add(self.brain_drawer, text="脑内抽屉")
-        # 切到脑内抽屉时把焦点给舞台 —— 空格暂停/继续才能生效
+        # 切到脑内抽屉时把焦点给舞台（点气泡 / 拖选区都从它出发，行为统一）
         nb.bind("<<NotebookTabChanged>>",
                 lambda e: e.widget.nametowidget(
                     e.widget.select()).focus_set()
@@ -550,6 +670,73 @@ class App:
             except (tk.TclError, StopIteration):
                 pass
 
+    # ── 浅色 / 深色 / 跟随系统 ────────────────────────────────────
+    def _resolve_theme(self):
+        """按当前偏好算出要用的 ttkbootstrap 主题名。"""
+        if self.theme_mode == "dark":
+            return THEME_DARK
+        if self.theme_mode == "light":
+            return THEME_LIGHT
+        return THEME_DARK if detect_system_dark() else THEME_LIGHT
+
+    def set_theme_mode(self, mode):
+        """切换浅色 / 深色 / 跟随系统，并把偏好落盘。
+
+        🔴 必须整窗重建：Tk 的字号/主题都是**建控件时定死**的，没有事后改主题的
+           统一入口；重建是唯一干净的做法（和字号变更走同一条 `_rebuild_window`）。
+            主题没变就不重建 —— 点同一个按钮只是把偏好再写一遍，不闪屏。
+        """
+        if mode not in ("light", "dark", "system"):
+            return
+        save_ui_theme(mode)
+        self.theme_mode = mode
+        target = self._resolve_theme()
+        if target == self.theme:
+            self._sync_system_poll()   # 偏好变了，把轮询状态对齐一下
+            return
+        self.theme = target
+        self._rebuild_window()
+
+    def _rebuild_window(self):
+        """拆掉所有子控件、换主题、按当前分区重建（字号变更也复用这条）。"""
+        keep = getattr(getattr(self, "config_center", None), "current", None)
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.style.theme_use(self.theme)
+        self._flat_styles()            # 末尾会 _build() + refresh()
+        if keep:
+            try:
+                self.config_center.show_section(keep)
+            except (tk.TclError, StopIteration):
+                pass
+        self._sync_system_poll()
+
+    def _sync_system_poll(self):
+        """跟随系统模式下，周期性读注册表盯系统主题切换；其余模式关掉轮询。"""
+        if getattr(self, "theme_mode", "system") == "system":
+            if getattr(self, "_sys_job", None) is None:
+                self._sys_job = self.root.after(1500, self._poll_system)
+        else:
+            job = getattr(self, "_sys_job", None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                self._sys_job = None
+
+    def _poll_system(self):
+        """注册表里的系统主题变了就跟着换；没变就继续轮询。"""
+        self._sys_job = None
+        if getattr(self, "theme_mode", "system") != "system":
+            return
+        target = THEME_DARK if detect_system_dark() else THEME_LIGHT
+        if target != self.theme:
+            self.theme = target
+            self._rebuild_window()
+            return
+        self._sys_job = self.root.after(1500, self._poll_system)
+
     def _update_bot_status(self):
         try:
             bot = self.state["bot"]
@@ -591,7 +778,7 @@ class App:
            用户根本不知道 `.env` / `settings.json` 是什么、更不知道「已写」是
            成功了还是写了一半（用户明确反馈「这里的提示太不说人话了，看不懂」）。
            现在按用户能理解的两类来报：**连接设置**（凭据 / 搜索目录）与
-           **机器人设置**（播报文案、展示范围、收图开关这些）。
+           **机器人设置**（播报文案、展示范围这些）。
         """
         parts = []
         if env_vals:
@@ -610,10 +797,46 @@ class App:
         return True, "已保存：" + "、".join(parts)
 
     def toast(self, msg, ok=True):
+        """轻提示：主窗口底部居中的一条应用内文字，2.5s 自己消失。
+
+        🔴 用户 2026-10-12：去掉所有右下角通知。ttkbootstrap 自带的
+           系统级弹窗默认 position=(5, 50, 'se') —— 屏幕右下角的
+           弹窗，挡视野、和别的软件弹窗叠在一起，还容易直接被
+           Windows 通知设置吞掉。改成应用内的一条：不抢焦点、不挡操作。
+        🔴 失败信息也只做轻提示，不弹模态框 —— 保存失败时用户往往正盯着
+           表单，一个 messagebox 会把视线整个抢走。
+        """
         try:
-            ttk.ToastNotification(
-                title="保存结果" if ok else "出错了",
-                message=msg, duration=2500).show_toast()
+            lbl = getattr(self, "_toast_lbl", None)
+            if lbl is None or not lbl.winfo_exists():
+                lbl = tk.Label(self.root, text="", anchor="center",
+                               padx=16, pady=7, font=_font(9))
+                self._toast_lbl = lbl
+            dark = self.theme == THEME_DARK
+            # 色板跟着主题走：成功用品牌色、出错用 danger；字色取底色系的前景。
+            conf = dict(bg=self.style.colors.primary if ok
+                        else self.style.colors.danger,
+                        fg="#0b2a3d" if dark else "#ffffff")
+            lbl.configure(text=msg, **conf)
+            # 底部居中、压在底栏上方一点（别盖住状态栏 / 任务栏）
+            lbl.place(relx=0.5, rely=1.0, anchor="s", y=-16)
+            lbl.lift()
+            job = getattr(self, "_toast_job", None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except (tk.TclError, ValueError):
+                    pass
+
+            def _hide():
+                # 🔴 整窗重建（切主题 / 改字号）后控件已经没了 —— winfo_exists()
+                #    不过关就别碰，否则异常会一路冒到全局钩子弹错误框。
+                try:
+                    if lbl.winfo_exists():
+                        lbl.place_forget()
+                except tk.TclError:
+                    pass
+            self._toast_job = self.root.after(2500, _hide)
         except Exception:
             pass
 
@@ -736,6 +959,9 @@ class ConfigCenter(ttk.Frame):
                 parent_bg=self._c("bg"), fixed_width=174)
             b.pack(anchor="w", pady=2, fill="x")
             self._nav.append((b, g["key"]))
+        # 主题切换常驻在导航底部（浅色 / 跟随系统 / 深色）—— 不进任何分区，
+        # 三个功能里「切换深浅色」的入口就在这。
+        self._build_theme_switch()
         if self.current is None:
             self.current = state["groups"][0]["key"]
         self.show_section(self.current)
@@ -743,6 +969,46 @@ class ConfigCenter(ttk.Frame):
     def _c(self, key):
         """当前主题色（ttkbootstrap Colors 的字段）。"""
         return getattr(self.app.style.colors, key)
+
+    def _build_theme_switch(self):
+        """导航底部常驻「跟随系统 / 浅色 / 深色」三态切换。
+
+        偏好落在数据目录 ui-theme.txt（见 load/save_ui_theme），选中即整窗重建换肤。
+        三个按钮竖排、样式同分区导航，避免 RoundedButton 不支持 fill 拉伸导致
+        并排时圆角矩形只画在左半边。
+        🔴 顺序固定「跟随系统 / 浅色 / 深色」（用户 2026-10-12）——
+           「跟随系统」是默认值，排第一；别再把它夹在中间。
+        """
+        for w in getattr(self, "_theme_widgets", []):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self._theme_widgets = []
+        nav = self.nav
+        sep = tk.Frame(nav, bg=self._c("border"), height=1)
+        sep.pack(fill="x", padx=8, pady=(8, 6))
+        self._theme_widgets.append(sep)
+        lbl = tk.Label(nav, text="外观", bg=self._c("bg"),
+                       fg=self._c("secondary"), font=_font(10, "bold"))
+        lbl.pack(anchor="w", padx=12, pady=(0, 4))
+        self._theme_widgets.append(lbl)
+        cur = getattr(self.app, "theme_mode", "system")
+        for text, mode in (("跟随系统", "system"),
+                           ("浅色", "light"),
+                           ("深色", "dark")):
+            b = RoundedButton(nav, text, lambda m=mode: self.app.set_theme_mode(m),
+                              kind="ghost", anchor="w", padx=12, pady=5, radius=10,
+                              font=_font(9),
+                              fg=self._c("secondary"),
+                              hover_fill=self._c("active"),
+                              selected_fg=self._c("primary"),
+                              selected_fill=self._c("active"),
+                              parent_bg=self._c("bg"), fixed_width=174)
+            b.pack(anchor="w", pady=2, fill="x")
+            if mode == cur:
+                b.set_selected(True)
+            self._theme_widgets.append(b)
 
     def _dim(self):
         """禁用 / 占位文字色：比正文淡但仍看得见（别用 border，那是边框色）。"""
@@ -782,7 +1048,8 @@ class ConfigCenter(ttk.Frame):
 
         g = next(x for x in self.state["groups"] if x["key"] == key)
         self.title.configure(text=g["title"])
-        self.desc.configure(text=g["desc"])
+        # 分区描述也过 `_soft_wrap`（同上：中文长句 Tk 会留大片行尾空白）
+        self.desc.configure(text=_soft_wrap(g["desc"], 720, 9))
 
         if key == "bot":
             self._render_bot()
@@ -794,6 +1061,8 @@ class ConfigCenter(ttk.Frame):
             self._render_moyu()
         elif key == "ext":
             self._render_ext()
+        elif key == "version":
+            self._render_version()
         else:
             self._render_fields(key)
             self._save_btn()
@@ -813,11 +1082,12 @@ class ConfigCenter(ttk.Frame):
     def _render_fields(self, group_key):
         for f in section_fields(self.state, group_key):
             if f.get("hidden"):
-                # hidden 字段（image_collect）由自绘区块画，但它必须留在字段表里，
-                # 否则保存时 setDirty 认不出键会静默丢改动。
-                self._render_self_drawn(f)
-            else:
-                self._render_one_field(f)
+                # 收图入口暂隐（用户要求）：hidden 字段（image_collect /
+                # image_alert_gb）一个都不画了。它们仍留在字段表里，否则保存时
+                # 认不出键会静默丢改动 —— 见 config_core.state_fields 的说明。
+                # 自绘实现 `_render_self_drawn` 原样保留，入口恢复只需删掉这个分支。
+                continue
+            self._render_one_field(f)
 
     def _render_one_field(self, f):
         target, key, kind = f["target"], f["key"], f["kind"]
@@ -825,7 +1095,10 @@ class ConfigCenter(ttk.Frame):
         wrap.pack(fill="x", pady=4)
         ttk.Label(wrap, text=f["label"], font=_font(10, "bold")).pack(anchor="w")
         if f.get("help"):
-            ttk.Label(wrap, text=f["help"], bootstyle="secondary",
+            # 🔴 help 也过 `_soft_wrap`：Tk 的 wraplength 只按空格折行，中文长句
+            #    会在行尾留一大截空白（用户报的「右边较大空隙 / 符号后异常换行」）。
+            ttk.Label(wrap, text=_soft_wrap(f["help"], 720, 9),
+                      bootstyle="secondary",
                       wraplength=720, font=_font(9)).pack(anchor="w", pady=(0, 4))
 
         if kind == "bool":
@@ -841,14 +1114,24 @@ class ConfigCenter(ttk.Frame):
                       font=_font(8)).pack(anchor="w")
             self._var_map[(target, key)] = var
         elif kind == "paths":
-            var = tk.StringVar(value=str(f.get("value", "")))
+            # 多个搜索根（「发文件」用）：一行一个目录，和网页版 textarea 同规格。
+            # 存进来的值可能是分号串（write_env 归一后的形态）或换行串（手改的），
+            # 一律拆开展示；保存时原样交出去，write_env 会再归一分号串。
+            _dirs = [p.strip() for p in
+                     re.split(r"[;\n]", str(f.get("value", ""))) if p.strip()]
+            txt = scrolledtext.ScrolledText(wrap, height=max(3, min(8, len(_dirs) + 1)),
+                                            width=64, wrap="none")
+            txt.insert("1.0", "\n".join(_dirs))
+            txt.pack(fill="x")
             row = ttk.Frame(wrap)
-            row.pack(fill="x")
-            ttk.Entry(row, textvariable=var, width=64).pack(side="left", fill="x", expand=True)
-            self._ghost_btn(row, "浏览",
-                            lambda v=var: self._browse(v),
-                            padx=10, pady=4).pack(side="left", padx=4)
-            self._var_map[(target, key)] = var
+            row.pack(fill="x", pady=(4, 0))
+            self._ghost_btn(row, "浏览…",
+                            lambda t=txt: self._browse_into(t),
+                            padx=10, pady=4).pack(side="left")
+            ttk.Label(row, text="一行一个目录 —— 「发文件」只在这些目录下面找；"
+                                "目录越大搜得越慢。",
+                      bootstyle="secondary", font=_font(8)).pack(side="left", padx=8)
+            self._var_map[(target, key)] = txt
         elif kind == "area":
             txt = scrolledtext.ScrolledText(wrap, height=5, width=80, wrap="word")
             txt.insert("1.0", str(f.get("value", "")))
@@ -883,13 +1166,18 @@ class ConfigCenter(ttk.Frame):
         self._multi[(target, key)] = vars_
 
     def _render_self_drawn(self, f):
-        """image_collect 自绘区块：主开关（c2c/group）+ 超限报警阈值。"""
+        """image_collect 自绘区块：主开关（c2c/group）+ 超限报警阈值。
+
+        🔴 收图入口暂隐（用户要求）—— `_render_fields` 不再调它，函数体保留：
+            入口要恢复只需把 `_render_fields` 里 hidden 分支的 `continue` 改回来。
+        """
         key = f["key"]
         cur = as_set(f.get("value"))
         lf = ttk.LabelFrame(self.scroll, text=f["label"], padding=8)
         lf.pack(fill="x", pady=6)
         if f.get("help"):
-            ttk.Label(lf, text=f["help"], bootstyle="secondary",
+            ttk.Label(lf, text=_soft_wrap(f["help"], 720, 9),
+                      bootstyle="secondary",
                       wraplength=720, font=_font(9)).pack(anchor="w")
         vars_ = {}
         for scope, label in (("c2c", "收私聊图片"), ("group", "收群图片")):
@@ -898,15 +1186,6 @@ class ConfigCenter(ttk.Frame):
                             bootstyle="primary-round-toggle").pack(anchor="w", pady=4)
             vars_[scope] = v
         self._multi[("settings", key)] = vars_
-
-        alert = next((x for x in self.state["fields"] if x["key"] == "image_alert_gb"), None)
-        if alert:
-            av = tk.IntVar(value=int(alert.get("value") or 5))
-            row = ttk.Frame(lf, padding=(0, 4))
-            row.pack(fill="x")
-            ttk.Label(row, text=alert["label"]).pack(side="left")
-            ttk.Spinbox(row, from_=0, to=1024, textvariable=av, width=8).pack(side="left", padx=6)
-            self._var_map[("settings", "image_alert_gb")] = av
 
     def _save_btn(self):
         self._solid_btn(self.scroll, "保存更改",
@@ -917,6 +1196,40 @@ class ConfigCenter(ttk.Frame):
         d = fd.askdirectory(initialdir=var.get() or os.path.expanduser("~"))
         if d:
             var.set(d.replace("\\", "/"))
+
+    def _browse_into(self, txt):
+        """「浏览…」把选中的目录**追加**进行数目录框（一行一个，不盖掉已填的）。
+
+        干嘛的：「发文件」的搜索根是 paths 字段（多个目录），浏览选一个就追加
+        一行；初始目录取当前最后一行，连续挑同一个目录下的子目录时不用每次重找。
+        谁调用它：`_render_one_field` 的 paths 分支（桌面配置中心「④ 发文件」）。
+        """
+        import tkinter.filedialog as fd
+        cur = txt.get("1.0", "end").strip()
+        last = cur.splitlines()[-1].strip() if cur else ""
+        d = fd.askdirectory(initialdir=last or os.path.expanduser("~"))
+        if d:
+            txt.insert("end", ("" if not cur else "\n") + d.replace("\\", "/"))
+
+    def _bad_path_lines(self, env_vals):
+        """检查多目录字段：把**不存在**的目录挑出来（逐行给名字）。
+
+        🔴 框里只要有一条不存在的目录，后端会整批拒写 —— 但报错只说「这个目录
+           不存在：X」不好定位是哪一行。这里先逐个点名，让用户能对症删行 / 改行，
+           而不是面对一句笼统的失败提示（用户 2026-10-12 提的「框里有条不存在的
+           文件夹怎么办」）。
+        """
+        bad = []
+        for f in self.state.get("fields", []):
+            if f.get("target") != "env" or f.get("kind") != "paths":
+                continue
+            raw = env_vals.get(f["key"])
+            if raw is None:
+                continue
+            for p in self.cw.split_roots(str(raw)):
+                if not os.path.isdir(os.path.expanduser(p)):
+                    bad.append(p)
+        return bad
 
     def _on_save(self):
         env_vals, set_vals = {}, {}
@@ -931,14 +1244,65 @@ class ConfigCenter(ttk.Frame):
         for (target, key), vars_ in self._multi.items():
             checked = [c for c, v in vars_.items() if v.get()]
             (env_vals if target == "env" else set_vals)[key] = ",".join(checked)
+        # 多目录先点名：有不存在的一律拦下，指出具体是哪几行。
+        bad = self._bad_path_lines(env_vals)
+        if bad:
+            shown = "、".join(bad[:3]) + ("…" if len(bad) > 3 else "")
+            self.app.toast(f"这几行目录不存在，删掉或改对再保存：{shown}", False)
+            return
         ok, msg = self.app.save(env_vals, set_vals)
         self.app.toast(msg, ok)
 
     # ---- ① 连接 QQ：凭据 ----
     def _render_bot(self):
         self._render_fields("bot")
+        self._group_switches_box()
         self._solid_btn(self.scroll, "保存凭据", self._on_save
                         ).pack(anchor="e", pady=(4, 10))
+
+    def _group_switches_box(self):
+        """「去 QQ 里开两个开关」提示块（内容与网页版配置中心一致）。
+
+        干嘛的：这两个开关在 QQ 那边管，配置中心碰不到它们；不开的话机器人
+        收不到普通发言、也发不出播报，用户会以为「机器人坏了」。十个人有九个
+        不看说明书，所以直接摆在「① 连接 QQ」页上，别指望人家去翻安装指南。
+        谁调用它：`_render_bot()`（桌面配置中心「① 连接 QQ」页）。
+        """
+        lf = ttk.LabelFrame(
+            self.scroll,
+            text="要在群聊中使用机器人，你需要打开的开关：",
+            padding=8)
+        lf.pack(fill="x", pady=8)
+        # 🔴 关键限制要先讲清楚（用户 2026-10-12 定稿）：机器人**分不清是谁说的**，
+        #    多人同时聊会串；按用户分别收集还在开发。不先说明白，用户在多人群里
+        #    用一次就会觉得「这机器人记的东西全乱了」。
+        _limit = ("注意：机器人现在分不清一句话是谁说的，只适合单人活跃的群；"
+                  "多人同时聊会串。按用户分别收集正在开发中。")
+        ttk.Label(lf, text=_soft_wrap(_limit, 720, 9),
+                  bootstyle="warning", wraplength=720,
+                  font=_font(9)).pack(anchor="w", pady=(0, 8))
+        _intro = ("把机器人拉进群之后，用手机点群里的机器人头像 → 右上角"
+                  "「设置」→ 打开下面这两项。这两项在 QQ 那边管，"
+                  "配置中心管不到它们。")
+        ttk.Label(lf, text=_soft_wrap(_intro, 720, 9),
+                  bootstyle="secondary", wraplength=720,
+                  font=_font(9)).pack(anchor="w", pady=(0, 6))
+        for title, action, note in (
+            ("机器人可获取的群聊消息范围", "选「获取群内全部消息」",
+             "不开：只有 @ 它才理你，群里的普通发言它收不到"),
+            ("机器人主动在群聊内发言", "打开",
+             "不开：它没法主动发东西 —— 上线播报发不出来"),
+        ):
+            row = ttk.Frame(lf)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=f"{title} → {action}",
+                      font=_font(10, "bold")).pack(anchor="w")
+            ttk.Label(row, text=note, bootstyle="secondary",
+                      font=_font(9)).pack(anchor="w")
+        _done = "开完在群里发一句「备忘 测试」，能收到回执就说明配好了。"
+        ttk.Label(lf, text=_soft_wrap(_done, 720, 9),
+                  bootstyle="secondary", wraplength=720,
+                  font=_font(9)).pack(anchor="w", pady=(6, 0))
 
     # ---- ③ 播报：文案 + 播报目标勾选 ----
     def _render_msg(self):
@@ -1029,21 +1393,64 @@ class ConfigCenter(ttk.Frame):
             ttk.Label(lf3, text=f"{mark} {d['name']}：{d['detail']}", bootstyle=col,
                       font=_font(9)).pack(anchor="w", pady=1)
 
-        # ── 版本 / 检查更新 ────────────────────────────────────────
-        # 🔴 桌面版一开始漏了这块（只在网页版有），用户找不到「检查更新」。
-        #    逻辑复用 `version.py`（三源重试 + 人话报错）和网页版同一套，不另写。
+        # 🔴「一键安装缺失依赖」：缺**任何可自动装的东西**（pip 包 / npm 包）就显形。
+        #    以前只数 pip 包 —— playwright-core（Node 包）缺着时按钮根本不出现，
+        #    用户报的「依赖自检依然没有一键安装的方法」就是这个（2026-10-12）。
+        #    装不上的（node 本身、系统浏览器）不在这里，只能给出引导文字。
+        _need_pip = [d for d in self.state.get("deps", [])
+                     if not d["ok"] and d.get("install") == "pip"]
+        _need_npm = [d for d in self.state.get("deps", [])
+                     if not d["ok"] and d.get("install") == "npm"]
+        if _need_pip or _need_npm:
+            _row = ttk.Frame(lf3, padding=(0, 6))
+            _row.pack(anchor="w", fill="x")
+            self._install_btn = self._solid_btn(
+                _row, "一键安装缺失依赖", self._install_deps, padx=14, pady=5)
+            self._install_btn.pack(side="left")
+            parts = []
+            if _need_pip:
+                parts.append(f"{len(_need_pip)} 个 Python 包")
+            if _need_npm:
+                parts.append(f"{len(_need_npm)} 个 Node 包")
+            self._install_note = ttk.Label(
+                _row, text=f"缺 {' + '.join(parts)} —— 点左边按钮自动装好"
+                           f"（走国内镜像，不用自己敲命令）",
+                bootstyle="secondary", font=_font(8))
+            self._install_note.pack(side="left", padx=(10, 0))
+        else:
+            self._install_btn = None
+            self._install_note = None
+        # 装不了的那些（node / 浏览器）单独给一句引导，别让用户干瞪眼
+        _manual = [d for d in self.state.get("deps", [])
+                   if not d["ok"] and not d.get("install")]
+        if _manual:
+            _m = "、".join(d["name"] for d in _manual)
+            ttk.Label(lf3, text=_soft_wrap(
+                f"另外还缺 {_m} —— 这两个得你自己装（装了才能把文件渲染成图片；"
+                f"不装也能用，只是发文件时给的是文件卡片）。", 720, 8),
+                bootstyle="secondary", wraplength=720,
+                font=_font(8)).pack(anchor="w", pady=(4, 0))
+
+    def _render_version(self):
+        """「⑩ 版本」独立页签（item19 2026-10-12）：当前版本、检查更新、下载新版。
+
+        干嘛的：把原来塞在「⑦ 运行方式」里的版本块单独拆成一页，和网页版
+                config_core 的「⑩ 版本」页签对齐。
+        谁调用它：show_section 在 key == "version" 时调它，不再走通用表单
+                （version 没有可编辑字段，走通用表单会成一页空壳还多个没用的保存按钮）。
+        🔴 检查更新的结果存在 `_upd_view` 里、每次重建回填 —— 换肤会整窗
+           重建这一页，不然用户刚点出来的「有新版」一秒后被冲回默认。
+        """
+        # 🔴 逻辑复用 `version.py`（三源重试 + 人话报错），和网页版同一套，不另写。
         lf4 = ttk.LabelFrame(self.scroll, text="版本", padding=8)
         lf4.pack(fill="x", pady=6)
-        ttk.Label(lf4, text="更新：点「下载新版」拿安装包（文件名带版本号），双击装上就行"
-                            "—— 装到同一个目录，你的数据（备忘 / 灵感 / 配置）不受影响。",
+        _upd = ("更新：点「下载新版」拿安装包（文件名带版本号），双击装上就行"
+                "—— 装到同一个目录，你的数据（待办 / 思绪 / 配置）不受影响。")
+        ttk.Label(lf4, text=_soft_wrap(_upd, 720, 9),
                   bootstyle="secondary", wraplength=720,
                   font=_font(9)).pack(anchor="w")
         ver_row = ttk.Frame(lf4, padding=(0, 6))
         ver_row.pack(anchor="w", fill="x")
-        # 🔴 这一页**会被重建**（顶栏后台查到计划任务状态后会 `show_section("runtime")`
-        #    一次，好让「开机自启」勾选框跟着刷新）。所以检查更新的结果显示在
-        #    `_upd_view` 里、每次重建回填 —— 否则用户刚点出来的「有新版」
-        #    过一两秒就被冲回默认值（真实踩到过）。
         _v = self._upd_view
         self._ver_note = ttk.Label(
             ver_row, text=_v["note"] or f"v{self.state.get('version', '?')}",
@@ -1147,6 +1554,148 @@ class ConfigCenter(ttk.Frame):
         except tk.TclError:
             pass
 
+    # ── 一键安装缺失依赖（item17 2026-10-12）──
+    def _install_deps(self):
+        """后台装齐缺失依赖（pip 包 + npm 包）；子线程不碰 Tk，结果回主线程再画。
+
+        干嘛的：让用户不用自己敲命令。用**当前这个 Python**（sys.executable）
+        跑 pip、用**随包的 node** 跑 npm，保证装到 bot 真正用到的地方。
+
+        🔴 **走国内镜像**（用户问「国内网络直连那些依赖的速度」）：PyPI 和
+           npm registry 官方源在国内经常慢到超时（实测几十 KB/s 甚至直接断），
+           所以默认挂清华 PyPI 镜像 + npmmirror。想用官方源就设环境变量
+           `MEMO_NO_MIRROR=1`。
+        谁调用它：_render_runtime 里「依赖自检」块的「一键安装缺失依赖」按钮。
+        """
+        if self._install_btn is None:
+            return
+        need_pip = any(not d["ok"] and d.get("install") == "pip"
+                       for d in self.state.get("deps", []))
+        need_npm = any(not d["ok"] and d.get("install") == "npm"
+                       for d in self.state.get("deps", []))
+        if not need_pip and not need_npm:
+            self.app.toast("可自动安装的依赖已经齐全", True)
+            return
+        self._install_btn.set_text("安装中…")
+        self._install_btn.configure(state="disabled")
+        if getattr(self, "_install_note", None) is not None:
+            self._install_note.configure(text="正在安装，别关窗口…")
+        self._install_result = None
+
+        def _pip_args(here):
+            """pip 安装参数 —— 官方源 + **国内镜像做备用索引**。
+
+            🔴 实测（2026-10-12 本机）：
+               · 官方 pypi.org 能连、7MB 的 wheel 约 4 秒；
+               · 清华镜像单独用时 pip 反而报「找不到包」。
+               所以**不把镜像当唯一源**：官方为主索引、清华挂 `--extra-index-url`
+               —— pip 会把两个索引的候选合并，哪个有、哪个快就用哪个。
+               国内连不上官方时镜像顶上，镜像缺包时官方兜底。
+               `MEMO_NO_MIRROR=1` 可强制只用官方。
+            """
+            args = ["install"]
+            for _r in (os.path.join(here, "requirements.txt"),
+                       os.path.join(here, "extensions", "local", "requirements.txt")):
+                if os.path.isfile(_r):
+                    args += ["-r", _r]
+            if not os.environ.get("MEMO_NO_MIRROR"):
+                args += ["--extra-index-url",
+                         "https://pypi.tuna.tsinghua.edu.cn/simple"]
+            return args
+
+        def _npm_args(here):
+            """npm 安装 playwright-core 的参数 —— 默认走 npmmirror。
+
+            🔴 实测（2026-10-12 本机）：**官方 registry.npmjs.org 根本连不上**
+               （curl 返回 000、11 秒无响应），npmmirror 正常（15MB / 8.6 秒）。
+               所以 npm 这边**必须**默认挂 npmmirror，不像 pip 那样能用官方兜底。
+               `MEMO_NO_MIRROR=1` 时退回官方（给能直连官方的网络用）。
+            """
+            args = ["install", "--no-audit", "--no-fund"]
+            if not os.environ.get("MEMO_NO_MIRROR"):
+                args += ["--registry=https://registry.npmmirror.com"]
+            return args
+
+        def work():
+            py = sys.executable
+            here = os.path.dirname(os.path.abspath(__file__))
+            _cf = 0x08000000 if os.name == "nt" else 0
+            logs, ok_all = [], True
+            if need_pip:
+                try:
+                    proc = subprocess.run([py, "-m", "pip"] + _pip_args(here),
+                                          capture_output=True, text=True,
+                                          creationflags=_cf, timeout=600)
+                    ok_all &= proc.returncode == 0
+                    logs.append("=== pip ===\n" + (proc.stdout or "")
+                                + "\n" + (proc.stderr or ""))
+                except Exception as e:                   # noqa: BLE001
+                    ok_all = False
+                    logs.append(f"=== pip ===\n{type(e).__name__}: {e}")
+            if need_npm:
+                node = self.cw._find_node()
+                npm = os.path.join(os.path.dirname(node), "npm.cmd") \
+                    if node and os.name == "nt" else "npm"
+                if not node or (os.name == "nt" and not os.path.isfile(npm)):
+                    ok_all = False
+                    logs.append("=== npm ===\n没找到 node/npm，装不了 playwright-core")
+                else:
+                    try:
+                        proc = subprocess.run([npm] + _npm_args(here), cwd=here,
+                                              capture_output=True, text=True,
+                                              creationflags=_cf, timeout=600)
+                        ok_all &= proc.returncode == 0
+                        logs.append("=== npm ===\n" + (proc.stdout or "")
+                                    + "\n" + (proc.stderr or ""))
+                    except Exception as e:               # noqa: BLE001
+                        ok_all = False
+                        logs.append(f"=== npm ===\n{type(e).__name__}: {e}")
+            self._install_result = (ok_all, "\n".join(logs))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._poll_install(0)
+
+    def _poll_install(self, tries):
+        """主线程轮询：后台装完就画，没装完就再等一轮。"""
+        try:
+            if self._install_result is not None:
+                ok, log = self._install_result
+                self._install_result = None
+                self._on_install_result(ok, log)
+                return
+            if tries < 600:                  # 最多等 ~60 秒（pip 快的几秒，慢的一两分钟）
+                self._poll_job = self.app.root.after(
+                    100, lambda: self._poll_install(tries + 1))
+        except tk.TclError:
+            pass
+
+    def _on_install_result(self, ok, log):
+        try:
+            if self._install_btn is not None and self._install_btn.winfo_exists():
+                self._install_btn.set_text("一键安装缺失依赖")
+                self._install_btn.configure(state="normal")
+            if getattr(self, "_install_note", None) is not None:
+                self._install_note.configure(
+                    text="装好了 ✓" if ok else "安装失败，看日志文件")
+        except tk.TclError:
+            pass
+        if not ok:
+            # 🔴 桌面端无控制台（pythonw），失败日志落地成文件，不往 stdout 打。
+            try:
+                _logp = os.path.join(data_dir(), "install-deps.log")
+                with open(_logp, "w", encoding="utf-8") as _f:
+                    _f.write(log)
+                self.app.toast(f"依赖安装失败，日志在 {_logp}", False)
+            except Exception:                                # noqa: BLE001
+                self.app.toast("依赖安装失败", False)
+            return
+        # 🔴 装完重抓 state（dep_report 会重算）整页重画 —— 让「依赖自检」立刻反映新状态
+        try:
+            self.refresh(self.cw.full_state())
+        except Exception:                                    # noqa: BLE001
+            pass
+        self.app.toast("依赖已装好", True)
+
     def _open_download(self):
         """用系统浏览器打开安装包直链（直链打不开时页面上还有 Releases 兜底）。"""
         url = self._ver_dl_url or self.cw._version.releases_url()
@@ -1178,7 +1727,8 @@ class ConfigCenter(ttk.Frame):
             lf = ttk.LabelFrame(self.scroll, text=f"{c['icon']} {c['name']}", padding=6)
             lf.pack(fill="x", pady=4)
             if c.get("help"):
-                ttk.Label(lf, text=c["help"], bootstyle="secondary",
+                ttk.Label(lf, text=_soft_wrap(c["help"], 700, 8),
+                          bootstyle="secondary",
                           font=_font(8), wraplength=700).pack(anchor="w")
             txt = scrolledtext.ScrolledText(lf, height=6, width=80, wrap="word")
             txt.insert("1.0", "\n".join(m["groups"].get(c["key"], [])))
@@ -1218,9 +1768,9 @@ class ConfigCenter(ttk.Frame):
 
         head = ttk.LabelFrame(self.scroll, text="导入一个指令包", padding=8)
         head.pack(fill="x", pady=6)
-        ttk.Label(head,
-                  text="选一个 .py（单文件指令）或 .zip（指令包）。导入不会自动生效 ——"
-                       " 导完到「⑦ 运行方式」点一下「重启」，指令才会注册进机器人。",
+        _ext_help = ("选一个 .py（单文件指令）或 .zip（指令包）。导入不会自动生效 ——"
+                     " 导完到「⑦ 运行方式」点一下「重启」，指令才会注册进机器人。")
+        ttk.Label(head, text=_soft_wrap(_ext_help, 720, 9),
                   bootstyle="secondary", wraplength=720,
                   font=_font(9)).pack(anchor="w")
         bar = ttk.Frame(head, padding=(0, 8))
@@ -1301,8 +1851,8 @@ class ConfigCenter(ttk.Frame):
             self._ghost_btn(top, "移除", lambda i=it["id"]: self._ext_remove(i),
                             color="danger", padx=10, pady=3).pack(side="right")
             cmds = "、".join(it["commands"]) if it["commands"] else ""
-            ttk.Label(row,
-                      text=("指令：" + cmds) if cmds else "没注册任何指令 —— 这个包装进来是死的",
+            _cline = ("指令：" + cmds) if cmds else "没注册任何指令 —— 这个包装进来是死的"
+            ttk.Label(row, text=_soft_wrap(_cline, 700, 9),
                       bootstyle="secondary" if cmds else "danger",
                       wraplength=700, font=_font(9)).pack(anchor="w")
             ttk.Label(row, text=f"{'、'.join(it['files'])} · {_human_size(it['size'])}",
@@ -1313,11 +1863,13 @@ class ConfigCenter(ttk.Frame):
                           bootstyle="secondary",
                           font=_font(8)).pack(anchor="w")
             if it.get("error"):
-                ttk.Label(row, text="⚠ 加载失败：" + it["error"], bootstyle="danger",
+                ttk.Label(row, text=_soft_wrap("⚠ 加载失败：" + it["error"], 700, 8),
+                          bootstyle="danger",
                           wraplength=700, font=_font(8)).pack(anchor="w")
             if it.get("dup"):
-                ttk.Label(row, text="⚠ 指令名和别的扩展撞了：" + "、".join(it["dup"])
-                                     + "（同名时按加载顺序，后面的盖住前面的）",
+                _dup = ("⚠ 指令名和别的扩展撞了：" + "、".join(it["dup"])
+                        + "（同名时按加载顺序，后面的盖住前面的）")
+                ttk.Label(row, text=_soft_wrap(_dup, 700, 8),
                           bootstyle="danger", wraplength=700,
                           font=_font(8)).pack(anchor="w")
             ttk.Separator(box).pack(fill="x")
@@ -1386,49 +1938,198 @@ def _human_size(n):
 
 
 # ── 脑内抽屉标签页（Phase 2 原生渲染）────────────────────────────
-# 桶名 / 标签跟 web 版脑内抽屉（brain-drawer.py）对齐，配色用的是同一套状态色。
+# 桶名 / 标签沿用原来的抽屉口径（待办 / 思绪两大类），配色用的是同一套状态色。
+# 🔴 分类大改版（用户 2026-10-12 定）：展示层只剩「待办」和「思绪」两大类 ——
+#    · 备忘 = 待办（未完成 / 已完成），灵感 = 思绪（未整理 / 已整理）；
+#    · 「已处理 / 已决议」两种烧脑分法**合并**为「已整理」（库里 status 不动，
+#      存量 decided 照常读，只是不再单独展示）。
 _BUCKET_LABEL = {
-    "memo": "备忘",
-    "memo_done": "备忘 · 已完成",
-    "open": "待处理",
-    "done": "已处理",
-    "decided": "已决议",
+    "memo": "待办 · 未完成",
+    "memo_done": "待办 · 已完成",
+    "open": "思绪 · 未整理",
+    "done": "思绪 · 已整理",
+    "decided": "思绪 · 已整理",
     "dropped": "已丢弃",
 }
 _BUCKET_ORDER = ("memo", "memo_done", "open", "done", "decided", "dropped")
+
+# 底部 chips 的两大类入口（点开是列表窗口，不是就地筛轮播）。
+_LIST_GROUPS = ("todo", "thought")
+_GROUP_LABEL = {"todo": "待办", "thought": "思绪"}
+_GROUP_BUCKETS = {"todo": ("memo", "memo_done"),
+                   "thought": ("open", "done", "decided")}
+# 列表窗口里的子筛选：待办 → 未完成 / 已完成；思绪 → 未整理 / 已整理。
+_SUB_LABEL = {"memo": "未完成", "memo_done": "已完成",
+              "open": "未整理", "done": "已整理", "decided": "已整理"}
+# 子筛选项的「码」用的是桶名；「已整理」同时收纳库里 done / decided 两种状态。
+_SUB_MATCH = {"done": ("done", "decided")}
 
 
 def _meta_text(it, memo):
     """气泡 / 浮层左上角那行「类型 · 状态 · 日期」。
 
-    🔴 桶名和类型名会撞：备忘的桶就叫「备忘」（已完成时叫「备忘 · 已完成」），
-       无脑拼起来就是「备忘 · 备忘 · 2026-10-08」（用户报的重复）。
-       桶名已经带了类型前缀就只留桶名，否则才补类型。
+    桶名已经带了类型前缀（「待办 · 未完成」）就只留桶名，否则才补类型。
     """
-    kind_label = "备忘" if memo else "灵感"
+    kind_label = "待办" if memo else "思绪"
     bucket_label = _BUCKET_LABEL[it["bucket"]]
     if bucket_label.startswith(kind_label):
         return f"{bucket_label} · {it['date']}"
     return f"{kind_label} · {bucket_label} · {it['date']}"
+
+
+def _flow_plan(memo, st):
+    """浮层 / 列表右侧那排流程按钮：(文案, 颜色, 目标状态, 是否禁用)。
+
+    🔴 「完成」与「取消完成」、「整理」与「取消整理」是**同一个按钮的两种状态**
+       （用户 2026-10-12）—— 按当前状态给文案，并把 target 指到**相反**的状态。
+    🔴 以前「取消完成」的 target 也写死成 "done"（等于再点一次「完成」），
+       所以点了没反应（用户报的「待办列表点击取消完成没反应」）。这里 target
+       跟着状态走：已完成 → open，未完成 → done。
+    🔴 已丢弃不在这两个按钮可及的范围内（它在回收站处理），所以丢了禁用。
+    """
+    dropped = st == _store.STATUS_DROPPED
+    if memo:
+        toggle = (("← 取消完成", "open") if st == _store.STATUS_DONE
+                  else ("✓ 完成", "done"))
+    else:
+        toggle = (("← 取消整理", "open")
+                  if st in (_store.STATUS_DONE, _store.STATUS_DECIDED)
+                  else ("✓ 整理", "done"))
+    return [
+        (toggle[0], "success", toggle[1], dropped),
+        ("× 丢弃", "danger", "dropped", dropped),
+    ]
+
+
 # 桶 → (浅色 hex, 深色 hex)，跟 web 抽屉的状态色一致
+# 🔴 「已完成」（memo_done）/「已整理」（done, decided）都是**终态**，边框统一用
+#    灰色（用户 2026-10-12：「把已整理和已完成的内容边框颜色改成灰的」）——
+#    不再用绿色，绿色会和「未完成」的橙 / 「未整理」的青抢注意力。
+#    decided 与 done 展示上合并，所以**同色**（否则两条都写「已整理」却两个色）。
+_TERMINAL_GRAY = ("#6b7472", "#8b98a9")
 _BUCKET_COLOR = {
     "memo": ("#b8791a", "#f6ad55"),
-    "memo_done": ("#6b7472", "#8b98a9"),
+    "memo_done": _TERMINAL_GRAY,
     "open": ("#0f8f85", "#4fd1c5"),
-    "done": ("#3f8a4a", "#68d391"),
-    "decided": ("#6b4fb8", "#b794f4"),
+    "done": _TERMINAL_GRAY,
+    "decided": _TERMINAL_GRAY,
     "dropped": ("#6b7472", "#7c8798"),
 }
 
 
 def _clean_text(text):
-    """和 brain-drawer.clean 一致：去 @ 占位、压掉多余空白、保留换行。"""
+    """清洗正文：去 @ 占位、压掉多余空白、**保留换行**。"""
     t = re.sub(r"<[^<>\s]{1,40}>", " ", text or "")
     t = t.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r" *\n *", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
+# ── 展示层折行（英文 / 符号串不再被硬砍）────────────────────────────
+# 🔴 症状（用户报的「出现英文与符号就会异常换行」）：气泡 / 卡片里的 URL、路径
+#    这种**没有空格的长串**，Tk 的 `wraplength` 只能从中间硬砍
+#    （`Administrator/Desk` → `.../D` + `esktop`），而它前一行的短文本又因为整串
+#    塞不下被迫单独占一行（「看看这个」后面一大截空白）。
+# 🔴 Tk 的折行**只认 ASCII 空格**（实测：细空格 U+2009 / 发丝空格 U+200A /
+#    零宽空格 U+200B / 全角空格 U+3000 一律不当断行点）—— 所以既不能用零宽
+#    空格「骗」它，也不能靠改字体。
+# 🔴 于是自己按**像素**贪心折行：中文/全角**逐字**可断（Tk 本来也这么做），
+#    英文串在「`/ ? & = . -`」这些分隔符**之后**可断；单块仍超宽才硬切。
+#    换行是**纯展示**的 `\n`，库里正文一个字都不改 —— 卡片编辑框 / 导出 /
+#    搜索命中的都还是原文。
+# 🔴 历史教训：早期那个「每 18 字硬插 \n」的函数把中文断在句子中间
+#    （「我可怎／么话啊」）。这里的规矩是**绝不**在中文之间插断点，
+#    且只在「整块放不下」时才折 —— 不会再犯。
+_BREAK_AFTER = set("/?&=.:,;!@#%+~|\\-_")
+_WRAP_FONTS = {}
+
+
+def _wrap_font(size, weight=None):
+    """按字号取（并缓存）一个 Tk 字体对象，用来量像素宽。"""
+    key = (size, weight)
+    f = _WRAP_FONTS.get(key)
+    if f is None:
+        f = tkfont.Font(font=_font(size, weight))
+        _WRAP_FONTS[key] = f
+    return f
+
+
+def _is_cjk(ch):
+    """中日韩字符 / 全角标点：**逐字**可断行。"""
+    o = ord(ch)
+    return (0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF
+            or 0xFE30 <= o <= 0xFE4F or 0xFF00 <= o <= 0xFFEF
+            or 0x3040 <= o <= 0x30FF)
+
+
+def _wrap_chunks(par):
+    """把一段文本拆成「可在其后断行」的最小块。"""
+    out, buf = [], ""
+
+    def flush(breakable):
+        nonlocal buf
+        if buf:
+            out.append((buf, breakable))
+            buf = ""
+
+    for ch in par:
+        if ch in " \t":
+            flush(True)
+            out.append((" ", True))
+        elif _is_cjk(ch):
+            flush(True)
+            out.append((ch, True))
+        else:
+            buf += ch
+            if ch in _BREAK_AFTER:
+                flush(True)
+    flush(False)
+    return out
+
+
+def _soft_wrap(text, width, size, weight=None):
+    """按像素把 text 折成多行（纯展示）→ 保证每行都放得下、长串不留大片空白。
+
+    `width` = 可用像素宽（调用方给的是 wraplength 同级的可用宽）。留 2px 余量，
+    免得字体度量取整后仍比 Tk 的边界略宽、被 Tk 再折一次。
+    """
+    if not text:
+        return text
+    font = _wrap_font(size, weight)
+    avail = max(40, int(width) - 2)
+    lines = []
+    for par in text.split("\n"):
+        if not par:
+            lines.append("")
+            continue
+        line = ""
+        for seg, _brk in _wrap_chunks(par):
+            if seg == " " and not line:
+                continue                      # 行首空格丢掉
+            if font.measure(line + seg) <= avail:
+                line += seg
+                continue
+            if font.measure(seg) > avail:     # 单块自己就超宽 → 硬切
+                if line:
+                    lines.append(line.rstrip())
+                    line = ""
+                piece = ""
+                for ch in seg:
+                    if piece and font.measure(piece + ch) > avail:
+                        lines.append(piece)
+                        piece = ""
+                    piece += ch
+                line = piece
+            else:
+                lines.append(line.rstrip())
+                line = seg.lstrip()
+        lines.append(line.rstrip())
+    # 去掉末尾可能多出来的空行
+    while len(lines) > 1 and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
 
 def _bucket_of(row):
     """一条库记录 → 它在这个抽屉里的桶名。"""
@@ -1445,7 +2146,7 @@ class BrainDrawerTab(ttk.Frame):
     """脑内抽屉：泡泡上浮轮播舞台（产品核心特色）。
 
     形态与 web 抽屉一致——条目像泡泡从窗口底部缓缓上浮、到顶部渐隐消失、
-    循环轮播；点气泡弹出全文浮层并处理，处理后移出轮播；空格暂停/继续。
+    循环轮播；点气泡弹出全文浮层并处理，处理后移出轮播。
     Tk 控件没有透明度，渐入渐出用「颜色向底色插值」模拟。
 
     布局要点：
@@ -1455,10 +2156,11 @@ class BrainDrawerTab(ttk.Frame):
     · 速度一致：所有气泡按同一个 px/s 走，行程 = 舞台高 + 自身高度 + 余量，
       所以越高的气泡走得越久，但都能完整飘出顶部，不会半路被切掉。
     · 开屏预热：每条泳道先摆一个、直接放到飞行途中（首屏立刻有内容）。
-    · 顶部遮罩：气泡**不淡出**，而是从下面滑进舞台顶部的遮罩带、被整块擦掉。
-      以前是「气泡顶部升进舞台上方若干比例就整体插值到背景色」，长气泡的
-      上半截会在下半截还很清楚的时候先变灰 —— 看着像被啃掉一块（用户报的
-      「视觉缺口」）。遮罩带没有这个问题：气泡保持实色，被盖住多少就是多少。
+    · 顶部遮罩：气泡**不用整体渐色**，而是从下面滑进舞台顶部的渐变带、
+      被逐层擦掉（用户 2026-10-12 把原来的 64px 实色带改成「不透明度 0」的渐变）。
+      早期用「整块插值到背景色」的做法是全局 alpha：长气泡的上半截会在
+      下半截还很清楚的时候先变灰 —— 看着像被啃掉一块（用户报的「视觉缺口」）。
+      渐变带没有这个问题：每层只盖住自己那一层，盖住多少就是多少。
     """
 
     BASE_DUR = 26.0        # 基准行程（1.26 倍舞台高）走完的秒数
@@ -1472,8 +2174,19 @@ class BrainDrawerTab(ttk.Frame):
     MIN_GAP = 24           # 同泳道相邻气泡的最小纵向间隔
     TEXT_MAX = 1000        # 气泡正文最多显示多少字（超了截断 + 省略号，点开看全文）
     LINE_MAX = 45          # 气泡正文最多几行（极端多行的记录兜个底，别让气泡高到离谱）
+    # 🔴 超过这个字数的条目用 **2 条泳道宽**的大卡（用户 2026-10-12）：
+    #    长记录挤在单泳道里又高又窄（三四百 px 高、两百多 px 宽），一屏放不下
+    #    几条；给它两条泳道的宽度，高度立刻塌下来，观感从「一根柱子」变「一张卡」。
+    #    大卡占 2 条泳道，泳道判据（_lane_span / _lane_bottom）都按 span 算。
+    WIDE_CHARS = 300
+    WIDE_SPAN = 2
     BAR_H = 34             # 底部筛选条高度（气泡在它下沿之下就开始渐显）
-    TOP_MASK_H = 64        # 顶部遮罩带高度（气泡从下面滑进来、被它干净地擦掉）
+    # 🔴 顶部渐隐区高度（气泡升到这里就开始化掉）。**不再用实体遮罩带** ——
+    #    用户 2026-10-12：「遮罩太硬…不能做渐变就去掉黄框内容，思绪卡片直接被
+    #    页签栏切断」。Tk 没有真正的 alpha，实色遮罩带就是一条硬边（还比底深，
+    #    看着像一道缝），所以改成**整卡按位置均匀渐隐**（见 `_alpha_at`）：
+    #    整张卡一起化掉，不会出现「上半截先变灰」的缺口（那是按位置分片渐变的锅）。
+    TOP_FADE_H = 84
     ALPHA_STEP = 0.05      # 渐隐渐出的量化步长（0.12 只有 8 档，肉眼是「跳」的）
     BUBBLE_R = 13          # 气泡圆角半径（背景画在舞台 Canvas 上）
     # 🔴 内容控件相对圆角矩形要内缩多少（占半径的比例）。
@@ -1483,13 +2196,12 @@ class BrainDrawerTab(ttk.Frame):
     INSET_RATIO = 0.45
     # 🔴 气泡内部的排版常量 —— **正文折行宽度必须由它们算出来**，别在别处
     #    另写一个魔数。以前 wraplength 写死 `泳道宽 − 48`，而真实可用宽度是
-    #    `泳道宽 − 2·inset − 2·ROW_PADX − EDGE_W − EDGE_GAP`（= −54），
-    #    折行宽度比容器宽 6px ⇒ 每行最后一个字的右边缘被容器裁掉，
-    #    用户看到的就是「字边缘消失」。
+    #    `泳道宽 − 2·inset − 2·ROW_PADX`（= −32），折行宽度比容器宽会
+    #    让每行最后一个字的右边缘被容器裁掉，用户看到的就是「字边缘消失」。
+    # 🔴 状态色只画在圆角矩形的**边框**上（accent）：去掉了左侧强调条，
+    #    那根直角边块和圆角矩形的「内角不一致」是用户报丑的根源。
     ROW_PADX = 14          # 气泡内边距（左右）
     ROW_PADY = 10          # 气泡内边距（上下）
-    EDGE_W = 4             # 左侧强调条宽度
-    EDGE_GAP = 10          # 强调条与正文的间距
 
     def __init__(self, master, app):
         super().__init__(master, padding=0)
@@ -1504,12 +2216,15 @@ class BrainDrawerTab(ttk.Frame):
         self._items = []         # 当前筛选下的轮播条目
         self._queue = []         # pick 队列（**存 id**，轮转；见 _sync 的说明）
         self._bubbles = []       # 在屏气泡记录
-        self._running = True     # 空格暂停旗
-        self._paused_at = None
         self._modal = None
         self._trash = None       # 回收站窗口（同一时刻只开一个）
         self._trash_pick = {}    # 回收站里 id → BooleanVar（勾选态）
         self._list = None        # 分类 / 搜索结果列表窗口（同上，只开一个）
+        # 🔴 当前列表窗对应哪个入口（("group", "todo") / ("query", "xx") …）+
+        #    重建回调。用户重复点同一个入口时**置顶**而不是重开（见 _open_list）；
+        #    卡片里改了状态后要靠回调把列表刷新（见 _set_status）。
+        self._list_key = None
+        self._list_rebuild = None
         self._tick_job = None
         self._due = None         # 下一帧该跑的时刻（_tick 自校正用）
         self._rebuild_job = None
@@ -1552,27 +2267,19 @@ class BrainDrawerTab(ttk.Frame):
                                bg=self._c("bg"))
         self.stage.pack(fill="both", expand=True)
         self.stage.bind("<Configure>", lambda e: self._relayout())
-        # 🔴 空格绑定挂在标签页上、不挂舞台：遮罩带 / 筛选条是**舞台的同级兄弟**
-        #    （见下），点它们再按空格，焦点不在舞台，挂舞台就收不到了。
-        self.bind("<space>", lambda e: self._toggle_pause())
+        # 焦点给舞台（点气泡 / 拖选区都从它出发，行为统一）
         self.stage.focus_set()
 
-        # ── 顶部遮罩带 ────────────────────────────────────────────
-        # 气泡从下往上滑，滑进这块纯底色带里就被干净地盖住（不是渐变消失）。
-        #
-        # 🔴 它必须是**舞台的同级兄弟控件**，不能是 canvas 上的矩形 item：
-        #    卡片本体是 canvas 的嵌入窗口（`create_window`），而嵌入窗口在
-        #    Windows 上永远画在 canvas 自绘内容（矩形/多边形）**之上** ——
-        #    矩形遮罩压根盖不住它（真机像素实测：遮罩带里仍是卡片色）。
-        #    而且 `tag_raise()` 对 canvas 的窗口 item **无效**（实测），
-        #    没法靠提层级解决。同级兄弟用 place + lift 才能真正盖住整块舞台。
-        self._mask = tk.Frame(self, bg=self._c("bg"), bd=0, highlightthickness=0)
-        self._mask.place(x=0, y=0, relwidth=1, height=self.TOP_MASK_H)
-        self._mask.lift()
+        # 🔴 顶部**不再有实色遮罩带**（用户 2026-10-12：「遮罩太硬」）。
+        #    气泡升到顶端的化掉是靠 `_alpha_at` 的**顶部渐隐**做的：
+        #    整张卡一起淡出，不是被一条实色墙齐刷刷切掉。
+        #    （Tk 没有真正的 alpha，实色遮罩带必然是硬边，而且是**比底更深**的
+        #     一条 —— 真机像素采样实测：遮罩带里 16,22,31，带外也 16,22,31，
+        #     看着就是一道缝。0.25px 的抖动渐变也盖不住这层观感，所以直接弃用。）
 
         # 底部：**两行** —— 上面一行搜索，下面一行是原来的 chips + 工具按钮。
-        # 🔴 同样做成舞台的**同级兄弟**（不是 canvas window）—— 否则后建的气泡
-        #    会盖在筛选条上面（窗口 item 的层级提不上去，同上）。place 到最底、
+        # 🔴 做成舞台的**同级兄弟**（不是 canvas window）—— 否则后建的气泡
+        #    会盖在筛选条上面（窗口 item 的层级提不上去）。place 到最底、
         #    铺满全宽，气泡永远从它下面过。
         foot = tk.Frame(self, bg=self._c("bg"))
         self._foot = foot
@@ -1661,21 +2368,17 @@ class BrainDrawerTab(ttk.Frame):
                       hover_outline=self._c("danger"),
                       hover_fg=self._c("danger"),
                       parent_bg=self._c("bg")).pack(side="left", padx=(6, 0))
-        # 🔴 这行提示别写太长：筛选条是一整行 pack，字多了会把 chips 顶出窗口。
-        hint = tk.Label(bar, text="空格 暂停/继续",
-                        bg=self._c("bg"), fg=self._c("secondary"),
-                        font=_font(8))
-        hint.pack(side="left", padx=(12, 0))
         self._build_chips()
 
     def _build_chips(self):
-        """底部那一排：**「思维流」+ 四个分类入口**。
+        """底部那一排：**「思维流」+ 「待办 / 思绪」两个分类入口**。
 
-        🔴 语义变了（用户 2026-10-11 定）—— 这一排**不再是轮播的筛选器**：
+        🔴 语义变了（用户 2026-10-12 定）—— 这一排**不再是轮播的筛选器**：
            · 「思维流」（原来的「全部」）= 当前这个视图本身，永远选中；点它只是
-             把焦点还给舞台（空格暂停才收得到）。
-           · 点「备忘 / 待处理 / 已处理 / 已决议」= 打开一个**列表窗口**
-             （和回收站同一套骨架），在那儿按时间倒序翻 —— 不用等轮播飘过来。
+             把焦点还给舞台。
+           · 点「待办 / 思绪」= 打开一个**列表窗口**（和回收站同一套骨架），
+             在那儿按时间倒序翻，并再按【未完成/已完成】/【未整理/已整理】子筛 ——
+             不用等轮播飘过来。
            轮播舞台永远展示 `bubbles_show` 范围内的全部条目。
         🔴 分类入口**不看 `bubbles_show`**：那个设置管的是「轮播舞台上展示哪几类」，
            而列表窗口是「回头找东西」，再拿它挡一道就本末倒置了。
@@ -1696,11 +2399,9 @@ class BrainDrawerTab(ttk.Frame):
         view.pack(side="left", padx=(0, 3))
         view.set_selected(True)
         self._chips[None] = view
-        for b in _BUCKET_ORDER:
-            if b == "dropped":
-                continue
-            chip = RoundedButton(self._chips_box, _BUCKET_LABEL[b],
-                                 lambda x=b: self._open_list(x),
+        for g in _LIST_GROUPS:
+            chip = RoundedButton(self._chips_box, _GROUP_LABEL[g],
+                                 lambda x=g: self._open_list(group=x),
                                  kind="ghost", radius=10, padx=10, pady=4,
                                  font=_font(10),
                                  fg=self._c("secondary"),
@@ -1709,7 +2410,7 @@ class BrainDrawerTab(ttk.Frame):
                                  selected_fill=self._c("active"),
                                  parent_bg=self._c("bg"))
             chip.pack(side="left", padx=(0, 3))
-            self._chips[b] = chip
+            self._chips[g] = chip
 
     def _relayout(self):
         """舞台尺寸变化 → 重算泳道；泳道宽变了就重摆整屏。"""
@@ -1721,10 +2422,9 @@ class BrainDrawerTab(ttk.Frame):
         old = self._L
         self._L = dict(w=w, h=h, lanes=lanes, gap=gap, lane_w=lane_w,
                        travel=h * self.TRAVEL_VH)
-        # 遮罩带 / 筛选条是舞台的同级兄弟，靠 place(relwidth=1) 自己跟着变宽，
-        # 这里只要保证它们仍在舞台之上（重建气泡不会影响兄弟控件的层级，
+        # 筛选条是舞台的同级兄弟，靠 place(relwidth=1) 自己跟着变宽，
+        # 这里只要保证它仍在舞台之上（重建气泡不会影响兄弟控件的层级，
         # 但重建整个标签页之后要再提一次）。
-        self._mask.lift()
         self._foot.lift()
         # 🔴 气泡**宽度**是创建时按当时的泳道宽定死的，只挪 x0 不够 ——
         #    窗口一变宽，老气泡还按旧宽度铺，会横着压进隔壁泳道（实测重叠 26px）。
@@ -1750,29 +2450,37 @@ class BrainDrawerTab(ttk.Frame):
         self._fill(spread=True)
 
     def _alpha_at(self, y, h):
-        """气泡在高度 y（顶边）时的不透明度。
+        """气泡在高度 y（顶边）时的不透明度 —— 底部渐入 + 顶部渐隐。
 
-        🔴 **只在底部渐入，顶部不渐出** —— 顶部交给遮罩带（见类 docstring）。
-           以前顶部也按位置插值到背景色，长气泡的上半截会在下半截还很清楚的
-           时候先变灰，看着像被啃掉一块（用户报的「视觉缺口」）。
-
-        · 渐入：**顶边**从舞台底边冒上来的 60px 内淡入。
+        · **渐入**：顶边从舞台底边冒上来的 60px 内淡入。
           🔴 不能用「底边越过筛选条」当判据 —— 那样高气泡（能有两百多 px）
              顶边早就进视口了，alpha 还是 0，表现是「气泡隐形上升好几秒」。
+        · **渐隐（顶部）**：顶边升进顶端 TOP_FADE_H 之内开始淡出，到顶边贴住
+             舞台上沿时几乎透明 —— 于是气泡是「化掉」的，不是被页签栏硬切。
+          🔴 判据用**顶边 y**（不是底边）：整张卡的 alpha 是同一个数，一起化。
+             按位置分片渐变会让长卡「上半截先变灰」，那才是以前的「视觉缺口」。
+          🔴 渐隐终点**不用到 0**：留一个极小值（0.04）让它完全贴边时基本看不见，
+             但不会因为「alpha 必须正好 0」而多算一轮 —— 反正下一帧 p≥1 就摘掉了。
         """
         L = self._L
-        return max(0.0, min(1.0, (L["h"] - y) / 60.0))
+        fade_in = max(0.0, min(1.0, (L["h"] - y) / 60.0))
+        fade_out = max(0.0, min(1.0, (y + 8.0) / self.TOP_FADE_H))
+        return max(0.0, min(1.0, min(fade_in, fade_out)))
 
     def _lane_x(self, lane):
         """第 lane 条泳道的横向起点。"""
         L = self._L
         return L["gap"] + lane * (L["lane_w"] + L["gap"])
 
-    def _lane_bottom(self, lane, now):
-        """这条泳道上最低（y 最大）气泡的底边；空泳道返回 None。"""
+    def _lane_bottom(self, lane, now, span=1):
+        """这 span 条泳道上最低（y 最大）气泡的底边；空泳道返回 None。
+
+        span > 1 时（大卡）把跨这几条泳道的现有气泡都算进来。
+        """
         low = None
         for b in self._bubbles:
-            if b["lane"] != lane:
+            bs = b.get("span", 1)
+            if b["lane"] + bs <= lane or b["lane"] >= lane + span:
                 continue
             y = b["y_start"] - b["travel"] * (now - b["t0"]) / b["dur"]
             bottom = y + b["h"]
@@ -1780,8 +2488,8 @@ class BrainDrawerTab(ttk.Frame):
                 low = bottom
         return low
 
-    def _lane_span(self, lane, now, y0, h):
-        """候选气泡 [y0, y0+h] 放进这条泳道，会不会和现有的撞（含 MIN_GAP 间距）。
+    def _lane_span(self, lane, now, y0, h, span=1):
+        """候选气泡 [y0, y0+h] 放进这 span 条泳道，会不会和现有的撞（含 MIN_GAP 间距）。
 
         🔴 必须和**每一个**现有气泡比，不能只看最低的那个 —— 首屏 spread 是往
            舞台中间几个固定高度插的，只比最低的挡不住「插到两条中间压上去」。
@@ -1791,36 +2499,45 @@ class BrainDrawerTab(ttk.Frame):
         """
         top, bot = y0, y0 + h
         for b in self._bubbles:
-            if b["lane"] != lane:
+            bs = b.get("span", 1)
+            if b["lane"] + bs <= lane or b["lane"] >= lane + span:
                 continue
             t = b["y_start"] - b["travel"] * (now - b["t0"]) / b["dur"]
             if bot + self.MIN_GAP > t and top - self.MIN_GAP < t + b["h"]:
                 return False
         return True
 
-    def _lane_ok(self, lane, now):
+    def _lane_ok(self, lane, now, span=1):
         """这条泳道现在能不能再放一个：新气泡从屏幕下方起步，只要求它和
         该泳道现有最低气泡之间留出 MIN_GAP 间距。
 
         🔴 因为所有气泡**同速**上升，间距一旦留出来就永远保持，所以只需在
         进入时刻判一次 —— 不会出现「后面追上来撞上」的情况。
         """
-        low = self._lane_bottom(lane, now)
+        low = self._lane_bottom(lane, now, span)
         if low is None:
             return True
         return low <= (self._L["h"] + 8) - self.MIN_GAP
 
-    def _lane_ready(self, now):
+    def _lane_ready(self, now, span=1):
         """随机挑一条能放的泳道；都没有返回 None。
 
         🔴 随机而不是「取编号最小的那条」：按编号取的话，先空出来的永远是
-        0 号道，长时间跑下来三条道的利用率完全不均，看着像有规律。
+           0 号道，长时间跑下来三条道的利用率完全不均，看着像有规律。
+        🔴 span=2（大卡）要保证 lane+span 不越界 —— 最后一条泳道放不下宽卡。
         """
-        free = [ln for ln in range(self._L["lanes"]) if self._lane_ok(ln, now)]
+        free = [ln for ln in range(self._L["lanes"] - span + 1)
+                if self._lane_ok(ln, now, span)]
         return random.choice(free) if free else None
 
+    # 🔴 一帧最多新建几个气泡窗口。全屏时舞台从 4 条泳道变 9 条、上限
+    #    9×PER_LANE = 54 个 —— 一口气建 54 个子窗口会给窗口系统一次猛冲，
+    #    实测在那一下能看到卡片文字「花」掉（用户报的「全屏后卡片出现乱码」）。
+    #    分批建（每帧 6 个）既保住首屏观感，又不给系统那一下子。
+    SPAWN_PER_FRAME = 6
+
     def _fill(self, spread=False):
-        """把空位补齐到上限。
+        """把空位补齐到上限（**分批**：每帧最多 `SPAWN_PER_FRAME` 个）。
 
         spread=True 用于首屏：**每条泳道按 PER_LANE 个位置散开摆**（不是只摆一个、
         剩下的全从屏幕下方往上爬 —— 那样首屏只有两三条，看着很空）。
@@ -1832,10 +2549,15 @@ class BrainDrawerTab(ttk.Frame):
 
         🔴 每摆一个都要过 `_lane_ok`（`_spawn` 内部会判）—— 长文本气泡能有三百多 px
         高，硬塞满 PER_LANE 个会撞在一起。放不下就少放几个，安全优先。
+
+        🔴 **分批建**：先把这一轮要摆的位置列出来（`_fill_plan`），再每帧建几个；
+        没建完的排到下一帧（`_drain_fill`）。`spread` 的计划只算一次，
+        后续帧只按计划继续建 —— 否则每帧重算会打乱随机、也可能重复摆同一段。
         """
         L = self._L
         cap = L["lanes"] * self.PER_LANE
         if spread:
+            plan = []
             lanes = L["lanes"]
             # 把可见竖直区间均分成 PER_LANE 段；每段里随机取一点。
             # 分段保证同泳道两条之间的起始高度至少差一个段宽 —— 不会撞，也不齐。
@@ -1843,15 +2565,38 @@ class BrainDrawerTab(ttk.Frame):
                 bands = list(range(self.PER_LANE))
                 random.shuffle(bands)
                 for r in bands:
-                    if len(self._bubbles) >= cap:
-                        return
                     lo = r / self.PER_LANE
                     hi = (r + 1) / self.PER_LANE
                     frac = 0.84 - 0.66 * random.uniform(lo, min(hi, 1.0))
-                    self._spawn(frac=frac, lane=lane)
-        while len(self._bubbles) < cap:
-            if not self._spawn():
-                break
+                    plan.append((frac, lane))
+            random.shuffle(plan)      # 打散顺序：先建哪几个不该有规律
+            self._fill_plan = plan
+            self._fill_cap = cap
+        self._drain_fill(spread)
+
+    def _drain_fill(self, spread):
+        """按计划建若干个（最多一帧的量）；没建完排下一帧。"""
+        L = self._L
+        cap = getattr(self, "_fill_cap", L["lanes"] * self.PER_LANE)
+        n = 0
+        if spread and getattr(self, "_fill_plan", None):
+            plan = self._fill_plan
+            while plan and n < self.SPAWN_PER_FRAME:
+                if len(self._bubbles) >= cap:
+                    break
+                frac, lane = plan.pop(0)
+                self._spawn(frac=frac, lane=lane)
+                n += 1
+        elif not spread:
+            while len(self._bubbles) < cap and n < self.SPAWN_PER_FRAME:
+                if not self._spawn():
+                    break
+                n += 1
+        # 还有得建 → 下一帧接着建（1ms 后；别用 0，免得饿死别的事件）
+        if (spread and getattr(self, "_fill_plan", None)
+                and len(self._bubbles) < cap):
+            if self._alive:
+                self.after(1, lambda: self._drain_fill(True))
 
     # ── 数据 / 筛选 ─────────────────────────────────────────────
     def refresh(self, state):
@@ -1875,12 +2620,37 @@ class BrainDrawerTab(ttk.Frame):
         #    下面冒出来 —— 就是那一「抽搐」（用户报的）。现在只摘掉真变了的那一个。
         self._sync(self._load_items())
 
+    # 轮播舞台一次最多铺多少个 —— 它不是「翻资料」的地方，够铺满屏幕就行。
+    # 🔴 列表窗口 / 搜索**不走这个上限**（见 `_list_query`）：那里是用户真去找东西
+    #    的地方，必须有办法翻到最早的那条（审查报告点出的「500 条限制隐藏旧数据」）。
+    STAGE_ROWS = 200
+
     def _rows(self):
-        """库里全部备忘 + 灵感（**原始行**，还没转成条目结构）。"""
-        rows = []
-        rows += _store.list_memos(500, kind=_store.KIND_MEMO)
-        rows += _store.list_ideas(None, 500)
-        return rows
+        """轮播舞台的候选行（**原始行**，有上限，够铺满舞台即可）。"""
+        return _store.query_items(limit=self.STAGE_ROWS)
+
+    @staticmethod
+    def _list_filter(group, sub, bucket):
+        """列表窗口的大类 / 子筛 → SQL 的 (kinds, statuses) 过滤条件。
+
+        🔴 把过滤**下推到 SQL**（而不是先捞固定窗口再在内存里筛）——
+           这样记录再多也能翻到最早那条（审查报告点出的「500 条隐藏旧数据」）。
+        「已整理」= 库里 done / decided 两种状态（见 `_SUB_MATCH`）。
+        """
+        kinds, statuses = None, None
+        if group == "todo":
+            kinds = [_store.KIND_MEMO]
+        elif group == "thought":
+            kinds = [_store.KIND_IDEA]
+        if sub:
+            kinds = ([_store.KIND_MEMO] if sub.startswith("memo")
+                     else [_store.KIND_IDEA])
+            statuses = list(_SUB_MATCH.get(sub, (sub,)))
+        elif bucket is not None:
+            kinds = ([_store.KIND_MEMO] if bucket.startswith("memo")
+                     else [_store.KIND_IDEA])
+            statuses = list(_SUB_MATCH.get(bucket, (bucket,)))
+        return kinds, statuses
 
     def _collect(self, rows, *, gate_show):
         """库记录 → 轮播 / 列表通用的条目结构。
@@ -1899,8 +2669,12 @@ class BrainDrawerTab(ttk.Frame):
                 continue
             # 🔴 「设置里允许展示哪几类」只对**轮播舞台**生效。以前它完全没被读，
             #    用户在配置中心关掉「已丢弃」，抽屉里照样满屏丢弃条目。
-            if gate_show and b not in self._show:
-                continue
+            # 🔴 decided 与 done 展示层已合并（用户 2026-10-12）→ 过闸时按
+            #    「已整理」一档判：勾了 done 两种都显示，都不勾两种都不显示。
+            if gate_show:
+                show_b = "done" if b == "decided" else b
+                if show_b not in self._show:
+                    continue
             content = _clean_text(r.get("content"))
             if not content:
                 continue
@@ -1925,23 +2699,36 @@ class BrainDrawerTab(ttk.Frame):
             out = [x for x in out if self._tag in x["tags"]]
         return out
 
-    def _list_items(self, bucket=None, query=None):
-        """列表窗口的条目：**不看展示范围**，按桶 / 关键词筛，时间倒序。
+    # 列表窗口一页取多少条（「加载更多」再取一页）。
+    LIST_PAGE = 200
 
+    def _list_items(self, group=None, sub=None, bucket=None, query=None,
+                    limit=None, offset=0):
+        """列表窗口的条目：**不看展示范围**，按大类 / 子筛 / 关键词筛，时间倒序。
+
+        `group` = 列表窗口顶上的两大类（待办 / 思绪，见 _GROUP_BUCKETS）；
+        `sub` = 打开后再按的子筛（未完成 / 已完成 / 未整理 / 已整理，码用桶名；
+        「已整理」同时收纳库里 done / decided 两种状态，见 _SUB_MATCH）。
         🔴 搜索要搜「全部」而不是「轮播正在展示的那几类」—— 用户找东西的时候
            不知道、也不关心某个类别有没有被展示范围关掉。
-        关键词命中范围：正文 + 标签 + 结论/备注，大小写不敏感。
+        🔴 **筛选下推到 SQL + offset 分页**（`store.query_items`）：以前是
+           「先捞 500 条固定窗口再在界面里筛」，超过 500 条后更早的数据
+           在列表 / 搜索里永远翻不到（审查报告点出的「500 条隐藏旧数据」）。
+        关键词命中范围：正文 + 标签 + 结论/备注 —— 由 SQL 的 LIKE 负责。
         """
-        out = self._collect(self._rows(), gate_show=False)
-        if bucket is not None:
-            out = [x for x in out if x["bucket"] == bucket]
-        if query:
-            q = query.strip().lower()
-            if q:
-                out = [x for x in out
-                       if q in " ".join([x["content"], x["note"]]
-                                        + x["tags"]).lower()]
+        kinds, statuses = self._list_filter(group, sub, bucket)
+        rows = _store.query_items(kinds=kinds, statuses=statuses, text=query,
+                                 limit=limit or self.LIST_PAGE, offset=offset)
+        out = self._collect(rows, gate_show=False)
+        if group is not None and not sub:
+            # 大类没有子筛时，SQL 只按 kind 粗筛；这里再按大类桶精确收一遍
+            out = [x for x in out if x["bucket"] in _GROUP_BUCKETS[group]]
         return out
+
+    def _list_total(self, group=None, sub=None, bucket=None, query=None):
+        """同条件下的**总条数**（列表窗口用它显示「共 N 条 / 还能加载更多」）。"""
+        kinds, statuses = self._list_filter(group, sub, bucket)
+        return _store.count_query_items(kinds=kinds, statuses=statuses, text=query)
 
     def _set_tag(self):
         v = self._tag_var.get()
@@ -2045,7 +2832,7 @@ class BrainDrawerTab(ttk.Frame):
         default_fmt = "zip" if has_pics else "md"
         try:
             fp = filedialog.asksaveasfilename(
-                parent=self.app.root, title="导出灵感与备忘",
+                parent=self.app.root, title="导出思绪与待办",
                 defaultextension="." + default_fmt, filetypes=fmts,
                 initialfile=_export.filename(default_fmt))
         except Exception:                                   # noqa: BLE001
@@ -2090,28 +2877,38 @@ class BrainDrawerTab(ttk.Frame):
         """
         L = self._L
         now = time.monotonic()
+        # 🔴 先挑条目：宽卡（span=2）占几条泳道由**这条有多长**决定，
+        #    所以只能拿到条目之后再定泳道。
+        it = self._pick()
+        if not it:
+            return False
+        # 长条目给两条泳道的宽度（见 WIDE_CHARS）—— 高度立刻塌下来，
+        # 观感从「一根又高又窄的柱子」变成「一张宽卡」。
+        span = self.WIDE_SPAN if len(it["content"]) > self.WIDE_CHARS else 1
         # 🔴 从下方补位时可以先挑泳道：判据便宜，而且够用（新气泡的起点在舞台
         #    下方，只要最低那个让出 MIN_GAP 就一定不撞）。
         #    `frac` 那条路**不能**在这儿定泳道 —— 它是往舞台中间插的，得先拿到
         #    气泡真实高度才能判重叠，见下面 y0 算完之后那段。
         if lane is None and frac is None:
-            lane = self._lane_ready(now)
+            lane = self._lane_ready(now, span)
             if lane is None:
                 return False
-        it = self._pick()
-        if not it:
+        # 宽卡不能跨出舞台右缘（最后一条泳道放不下 2 条宽）
+        if lane is not None and lane + span > L["lanes"]:
             return False
-        width = L["lane_w"]
+        width = L["lane_w"] * span + L["gap"] * (span - 1)
         w_int = int(width)
         inset = max(3, int(round(self.BUBBLE_R * self.INSET_RATIO)))
         # 🔴 正文折行宽度**从布局常量算**（见 ROW_PADX 那一带的说明）：
         #    气泡窗口被 canvas 钉成 `lane_w − 2·inset`，里面还要减掉 row 的
         #    左右内边距、左侧强调条、强调条与正文的间距。再留 2px 余量，
         #    防字体度量取整后仍然超出容器。
-        content_w = max(120, w_int - inset * 2 - self.ROW_PADX * 2
-                        - self.EDGE_W - self.EDGE_GAP - 2)
+        content_w = max(120, w_int - inset * 2 - self.ROW_PADX * 2 - 2)
 
-        bg, surf, border = self._c("bg"), self._c("light"), self._c("border")
+        # 气泡卡片用专属配色（见 bubble_palette）—— 比背景亮一档的纯白/抬升深面，
+        # 配状态色描边（accent，按条目桶色）+ 右下投影，让卡片「浮」在背景上。
+        bg = self._c("bg")
+        surf, _, shadow = bubble_palette(self.app.theme)
         # 圆角卡片 = 舞台 Canvas 上的圆角矩形（fill/outline 随 alpha 插值）
         # + 内容控件贴在其内、四周内缩 1px 露出边框和圆角。
         # Tk 控件本体是直角矩形，任何「控件自身当卡片」的画法都不可能圆角。
@@ -2120,11 +2917,10 @@ class BrainDrawerTab(ttk.Frame):
         row.pack(fill="both", expand=True)
         fade = [(frame, "bg", surf), (row, "bg", surf)]
 
+        # 状态色只画在圆角矩形的**边框**上（accent），不再用左侧强调条——
+        # 那根直角边块和圆角矩形「内角不一致」是用户报丑的根源。
         accent = _BUCKET_COLOR[it["bucket"]][
             1 if self.app.theme == THEME_DARK else 0]
-        edge = tk.Frame(row, bg=bg, width=self.EDGE_W)
-        edge.pack(side="left", fill="y", padx=(0, self.EDGE_GAP))
-        fade.append((edge, "bg", accent))
 
         body = tk.Frame(row, bg=bg)
         body.pack(side="left", fill="both", expand=True)
@@ -2148,7 +2944,8 @@ class BrainDrawerTab(ttk.Frame):
         #    （长路径那串没有空格也照样折）。早期误判成「Tk 只在空白处折」，
         #    加了个每 18 字硬插 \n 的函数，结果中文被断在句子中间
         #    （「我可怎／么话啊」），用户报「异常换行」。
-        txt = tk.Label(body, text=shown, justify="left", anchor="nw",
+        txt = tk.Label(body, text=_soft_wrap(shown, content_w, 10),
+                       justify="left", anchor="nw",
                        bg=bg, fg=bg,
                        wraplength=content_w,
                        font=_font(10))
@@ -2181,7 +2978,9 @@ class BrainDrawerTab(ttk.Frame):
         # 少一行自然就矮一行，不会白占位置。
         note_lbl = None
         if it.get("note"):
-            note_lbl = tk.Label(body, text="结论：" + it["note"],
+            note_lbl = tk.Label(body,
+                                text=_soft_wrap("结论：" + it["note"],
+                                                content_w, 9),
                                 justify="left", anchor="nw", bg=bg, fg=bg,
                                 wraplength=content_w,
                                 font=_font(9))
@@ -2221,10 +3020,10 @@ class BrainDrawerTab(ttk.Frame):
         # 🔴 泳道要**拿到真实高度之后**才能定 / 才能判重叠 —— 见函数开头。
         #    放不下就把刚建好的控件拆掉（否则 canvas 上会留一堆看不见的窗口）。
         if lane is None:
-            free = [ln for ln in range(L["lanes"])
-                    if self._lane_span(ln, now, y0, h)]
+            free = [ln for ln in range(L["lanes"] - span + 1)
+                    if self._lane_span(ln, now, y0, h, span)]
             lane = random.choice(free) if free else None
-        if lane is None or not self._lane_span(lane, now, y0, h):
+        if lane is None or not self._lane_span(lane, now, y0, h, span):
             try:
                 frame.destroy()
             except tk.TclError:
@@ -2243,22 +3042,34 @@ class BrainDrawerTab(ttk.Frame):
         # 横向漂移：大了才有「飘」的随机感，但要小于泳道间隙，
         # 否则气泡会横着探进隔壁泳道（实测会视觉重叠）。
         dx = random.uniform(-1.0, 1.0) * min(L["gap"] * 0.45, 11.0)
-        bg_id = round_rect(self.stage, x0 := self._lane_x(lane), y0,
+        # 投影：先画、落在卡片圆角矩形**之下**（canvas 后建的盖在先建的）。
+        # 偏移 BUBBLE_SHADOW_OFS，渐入时和卡片同步从底色插到投影色。
+        # 🔴 描边统一加粗到 BUBBLE_BORDER_W（用户 2026-10-12：「颜色边框加粗」）——
+        #    1px 在浅色壁纸上几乎看不见，气泡像贴着一条淡色边。投影保持 1px
+        #    （它是「一道边」，不是「一个框」，粗了会发脏）。
+        sx, sy = BUBBLE_SHADOW_OFS
+        shadow_id = round_rect(self.stage, (x0 := self._lane_x(lane)) + sx, y0 + sy,
+                              x0 + w_int + sx, y0 + h + sy,
+                              self.BUBBLE_R, fill=bg, outline=bg, width=1)
+        bg_id = round_rect(self.stage, x0, y0,
                            x0 + w_int, y0 + h,
-                           self.BUBBLE_R, fill=bg, outline=bg, width=1)
+                           self.BUBBLE_R, fill=bg, outline=accent,
+                           width=BUBBLE_BORDER_W)
         win = self.stage.create_window(x0 + inset, y0 + inset, window=frame,
                                        anchor="nw", width=w_int - inset * 2)
         # 🔴 立刻按位置把 alpha 算出来，别留 0 等 _tick 来纠正 —— 首屏摆好的
         #    气泡要马上可见，否则会看到「一片空白、过一会儿才慢慢冒出来」。
         a0 = self._alpha_at(y0, h)
         self._apply_alpha(bubbles_bg=bg_id, fade=fade,
-                          alpha=a0, bg=bg, surf=surf, border=border)
+                          alpha=a0, bg=bg, surf=surf, accent=accent,
+                          shadow_id=shadow_id, shadow=shadow)
         # 🔴 这里**不用**再 tag_raise 筛选条 / 遮罩带 —— 它们是舞台的**同级兄弟**
         #    控件（place + lift），层级天然在整块舞台之上，气泡建多少个都压不下去。
         #    （以前是 canvas window + tag_raise，而 tag_raise 对窗口 item 无效，
         #     气泡其实一直盖在筛选条上面。）
         b = dict(win=win, bg_id=bg_id, frame=frame, fade=fade, item=it,
-                 lane=lane, x0=x0, dx=dx, y_start=y_start, inset=inset,
+                 lane=lane, span=span, x0=x0, dx=dx, y_start=y_start, inset=inset,
+                 surf=surf, accent=accent, shadow=shadow, shadow_id=shadow_id,
                  # 🔴 圆角矩形是**多边形**，每帧只能用 move() 平移。
                  #    用 coords(bg_id, x1,y1,x2,y2) 会把它截断成 2 个点
                  #    （Tk 实测：40 点 → 2 点），圆角整个消失、只剩一条对角线
@@ -2276,11 +3087,14 @@ class BrainDrawerTab(ttk.Frame):
                             lambda e, x=it: self._open_modal(x))
         return True
 
-    def _apply_alpha(self, bubbles_bg, fade, alpha, bg, surf, border):
+    def _apply_alpha(self, bubbles_bg, fade, alpha, bg, surf, accent,
+                     shadow_id=None, shadow=None):
         """把一整套控件颜色插到 alpha（1=完全显现，0=融进底色）。
 
         bubbles_bg 是舞台 Canvas 上气泡的圆角矩形背景 id —— fill 从底色
-        插到卡片色、outline 从底色插到边框色，与内容控件同步渐隐。
+        插到卡片色、outline 从底色插到**状态色**（accent，按条目桶色），
+        与内容控件同步渐隐。
+        shadow_id 是卡片下方那块投影 —— 和卡片同步从底色插到投影色。
         """
         for w, prop, target in fade:
             try:
@@ -2291,7 +3105,13 @@ class BrainDrawerTab(ttk.Frame):
             try:
                 self.stage.itemconfigure(
                     bubbles_bg, fill=lerp_color(bg, surf, alpha),
-                    outline=lerp_color(bg, border, alpha))
+                    outline=lerp_color(bg, accent, alpha))
+            except tk.TclError:
+                pass
+        if shadow_id is not None and shadow is not None:
+            try:
+                c = lerp_color(bg, shadow, alpha)
+                self.stage.itemconfigure(shadow_id, fill=c, outline=c)
             except tk.TclError:
                 pass
 
@@ -2303,6 +3123,7 @@ class BrainDrawerTab(ttk.Frame):
         try:
             self.stage.delete(b["win"])
             self.stage.delete(b["bg_id"])
+            self.stage.delete(b["shadow_id"])
             b["frame"].destroy()
         except tk.TclError:
             pass
@@ -2330,15 +3151,13 @@ class BrainDrawerTab(ttk.Frame):
         delay = int(round(max(0.001, self._due - now) * 1000))
         self._tick_job = self.after(max(1, delay), self._tick)
 
-        if not self._running or self._paused_at is not None:
-            return
         # 🔴 不可见时**照样推进时间轴**，只跳过渲染。
         #    以前这里直接 `return`，最小化期间气泡既不过期、也不补位；再打开时
         #    所有气泡在同一帧集体过期被清空，补上来的新气泡还都在屏幕下方 ——
         #    表现就是「隔一会儿打开整屏没内容」（用户报的）。位置是按时间算的，
         #    所以后台跑完再切回来，画面直接就是稳态，不会跳。
         visible = bool(self.winfo_ismapped())
-        bg, surf, border = self._c("bg"), self._c("light"), self._c("border")
+        bg, surf = self._c("bg"), self._c("light")
         for b in list(self._bubbles):
             p = (now - b["t0"]) / b["dur"]
             if p >= 1.0:
@@ -2353,6 +3172,14 @@ class BrainDrawerTab(ttk.Frame):
             #    背景矩形却能画在小数上 —— 两者不一致时每帧会错开 1px，
             #    看着像卡片里的字在抖。对齐了就没有这个抖动。
             xi, yi = int(round(x)), int(round(y))
+            # 🔴 位置没变就**整帧跳过**（不 coords、不 move、不 repaint）：
+            #    60fps 下气泡常常还卡在同一整数像素上，每帧照搬一遍是无意义的
+            #    GDI 调用 —— 一屏十几个窗口、每个每帧一次 setwindowpos，
+            #    既是纯开销，也让子窗口在移动中更容易被 DWM 捕捉到「半合成」的
+            #    中间态（快速移动的文本窗口偶发花屏 / 彩边就是这么来的）。
+            if xi == b["bx"] and yi == b["by"]:
+                # alpha 仍按位置算（位置没变 → alpha 也没变，跳过即可）
+                continue
             try:
                 self.stage.coords(b["win"], xi + b["inset"], yi + b["inset"])
                 # 🔴 圆角矩形是**多边形**，只能 `move()` 平移。
@@ -2360,9 +3187,9 @@ class BrainDrawerTab(ttk.Frame):
                 #    （Tk 实测），圆角消失、只剩一条对角线残影从卡片左上角
                 #    露出来 —— 用户报的「两个角的不明像素点」。
                 ddx, ddy = xi - b["bx"], yi - b["by"]
-                if ddx or ddy:
-                    self.stage.move(b["bg_id"], ddx, ddy)
-                    b["bx"], b["by"] = xi, yi
+                self.stage.move(b["bg_id"], ddx, ddy)
+                self.stage.move(b["shadow_id"], ddx, ddy)
+                b["bx"], b["by"] = xi, yi
             except tk.TclError:
                 self._bubbles.remove(b)
                 continue
@@ -2370,22 +3197,15 @@ class BrainDrawerTab(ttk.Frame):
             alpha = self._alpha_at(y, b["h"])
             if abs(alpha - b["alpha"]) >= self.ALPHA_STEP:
                 b["alpha"] = alpha
-                self._apply_alpha(b["bg_id"], b["fade"], alpha, bg, surf, border)
-
-    def _toggle_pause(self):
-        if self._paused_at is None:
-            self._paused_at = time.monotonic()
-        else:
-            gap = time.monotonic() - self._paused_at
-            for b in self._bubbles:
-                b["t0"] += gap
-            self._paused_at = None
+                self._apply_alpha(b["bg_id"], b["fade"], alpha, bg, surf, b["accent"],
+                                  shadow_id=b["shadow_id"], shadow=b["shadow"])
 
     def _clear_stage(self):
         for b in list(self._bubbles):
             try:
                 self.stage.delete(b["win"])
                 self.stage.delete(b["bg_id"])
+                self.stage.delete(b["shadow_id"])
                 b["frame"].destroy()
             except tk.TclError:
                 pass
@@ -2512,8 +3332,8 @@ class BrainDrawerTab(ttk.Frame):
         self._modal_thumbs.clear()
         win = tk.Toplevel(self)
         self._modal = win
-        # 标题叫「思维卡片」：这是**一条**记录的全貌，不是整个抽屉（用户改的）。
-        win.title("思维卡片")
+        # 标题叫「思绪卡片」：这是**一条**记录的全貌，不是整个抽屉（用户改的）。
+        win.title("思绪卡片")
         win.configure(bg=self._c("bg"))
         win.transient(self.app.root)
         win.geometry("+%d+%d" % (self.app.root.winfo_rootx() + 120,
@@ -2531,12 +3351,28 @@ class BrainDrawerTab(ttk.Frame):
         #    后者才会拿到剩下的空间。
         PAD = 10               # 浮层四周留白
         CARD_INSET = 6         # 圆角底衬的内缩（r=16 → 至少 4.7px，见下）
-        bar_wrap = tk.Frame(win, bg=light)
-        bar_wrap.pack(side="bottom", fill="x", padx=PAD + CARD_INSET,
-                      pady=(0, PAD))
-        tk.Frame(bar_wrap, bg=self._c("border"), height=1).pack(fill="x")
+        BAR_R = 14             # 底部圆角面板的圆角半径
+        # 浮层上下两半拼成**一张**圆角卡：
+        #   · 上面 cv 的卡底只圆「顶边」两角（round_rect_top），底边是直线；
+        #   · 下面 bar_cv 的卡底只圆「底边」两角（round_rect_bottom），顶边是直线；
+        #   中间那段接缝是直线 → 看着就是同一张卡，不再是「上圆下直」。
+        #   两者宽度都 = cwc（在 _fit_card 里对齐），左右边缘自然齐平。
+        bar_cv = tk.Canvas(win, highlightthickness=0, bd=0, bg=self._c("bg"))
+        bar_cv.pack(side="bottom", fill="x", padx=PAD, pady=(0, PAD))
+        # 动作条内容住在 bar_wrap 里，bar_cv 只负责画底色 + 下圆角。
+        # 🔴 bar_wrap 是 Canvas 的子 Frame，必须用 create_window 挂进去才显示
+        #    —— 直接 pack 只排布它内部、它自己仍不可见（表现就是「按钮全没了」）。
+        bar_wrap = tk.Frame(bar_cv, bg=light, padx=16)
+        # 分隔线放进 bar_wrap，跟按钮共用同一套 padding：分隔线 pady=(0,10)、
+        # 按钮条 pady=(0,10) → 按钮上下间距对称，各 10px。
+        tk.Frame(bar_wrap, bg=self._c("border"), height=1).pack(
+            fill="x", pady=(0, 10))
+        # 先把窗口挂上（位置 / 尺寸留给 _fit_card 用 cwc 算），x 内缩 CARD_INSET
+        # 让按钮跟上面的卡片正文左对齐。
+        bar_win = bar_cv.create_window(CARD_INSET, 0, window=bar_wrap,
+                                       anchor="nw")
         cv = tk.Canvas(win, highlightthickness=0, bd=0, bg=self._c("bg"))
-        cv.pack(side="top", fill="both", expand=True, padx=PAD, pady=(PAD, 4))
+        cv.pack(side="top", fill="both", expand=True, padx=PAD, pady=(PAD, 0))
         card = tk.Frame(cv, bg=light, padx=22, pady=18)
         # 🔴 card 内部用 grid 不用 pack：编辑态要把中间的几块收起来，
         #    而 `grid_remove()` 会**记住位置**、`grid()` 一调就回原处；
@@ -2563,11 +3399,18 @@ class BrainDrawerTab(ttk.Frame):
         # ── 行 2：正文（只读 Label ↔ 编辑态换成可编辑框）────────────
         body_holder = tk.Frame(card, bg=light)
         body_holder.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        txt = tk.Label(body_holder, text=it["content"],
+        txt = tk.Label(body_holder, text=_soft_wrap(it["content"], 520, 11),
                        justify="left", anchor="nw", bg=light, fg=self._c("fg"),
                        wraplength=520, font=_font(11))
+        # 🔴 存原始正文：正文宽是**渲染后**由 `_fit_card` 按卡片实宽定的，比这里
+        #    的 520 宽不少。不重折的话文字只铺到 520px、右边留一大截空白
+        #    （用户报的「思绪卡片右边较大空隙」）。`_fit_card` 会拿这个原文重折。
+        txt._orig_text = it["content"]
         txt.pack(anchor="w")
-        editbox = scrolledtext.ScrolledText(body_holder, height=6, wrap="word",
+        # 编辑框拉高（用户 2026-10-12：编辑灵感时文本框太小）—— 6 行只够
+        # 瞥见两句话，长一点的灵感得反复在里面翻。12 行 ≈ 小半屏，
+        # 浮层本身高度封顶 + 正文区滚动，框大了也顶不穿屏幕。
+        editbox = scrolledtext.ScrolledText(body_holder, height=12, wrap="word",
                                            font=_font(11),
                                            bd=0, highlightthickness=1,
                                            highlightbackground=self._c("primary"),
@@ -2699,7 +3542,7 @@ class BrainDrawerTab(ttk.Frame):
 
         # ── 动作按钮（固定在窗口底部，不跟着正文滚 —— 见 bar_wrap 的说明）──
         bar = tk.Frame(bar_wrap, bg=light)
-        bar.pack(fill="x", pady=(10, 0))
+        bar.pack(fill="x", pady=(0, 10))
 
         # 图标只用基础几何符号：对勾 / 星 / 叉 / 左箭头在 Microsoft YaHei 里都有字形。
         # 🔴 同理别用彩色 emoji 当按钮字样 —— Win10 上可能根本画不出（当初 🫧 踩过）。
@@ -2717,27 +3560,11 @@ class BrainDrawerTab(ttk.Frame):
                 b.configure(state="disabled")
             return b
 
-        # 整条流程都摆出来，当前所在的那一站灰掉。
-        # 灵感：待处理 ⇄ 已处理 / 已决议 / 丢弃；备忘：待处理 ⇄ 已完成 / 丢弃。
-        if memo:
-            # 已完成时「完成」按钮改口径成「取消完成」（再点就是退回待处理）
-            done_label = ("← 取消完成" if st == _store.STATUS_DONE
-                          else "✓ 完成这条备忘")
-            plan = [
-                (done_label, "success", "done",
-                 st == _store.STATUS_DROPPED),
-                ("× 丢弃", "danger", "dropped",
-                 st == _store.STATUS_DROPPED),
-                ("← 恢复", "secondary", "open",
-                 st != _store.STATUS_DROPPED),
-            ]
-        else:
-            plan = [
-                ("✓ 已处理", "success", "done", st == _store.STATUS_DONE),
-                ("★ 已决议", "info", "decided", st == _store.STATUS_DECIDED),
-                ("× 丢弃", "danger", "dropped", st == _store.STATUS_DROPPED),
-                ("← 恢复待处理", "secondary", "open", st == _store.STATUS_OPEN),
-            ]
+        # 流程按钮：单按钮两态（完成 ⇄ 取消完成 / 整理 ⇄ 取消整理）+ 丢弃。
+        # 🔴 口径与列表窗口完全一致（同一份 `_flow_plan`）—— 待办（备忘）与
+        #    思绪（灵感）共用，避免两处规则漂移。
+        plan = _flow_plan(memo, st)
+
         def _apply(target):
             """动作按钮 = 「改状态」+「顺手把结论写进去」，照 web 版一次提交。"""
             note = None
@@ -2777,9 +3604,9 @@ class BrainDrawerTab(ttk.Frame):
                     imgs.grid_remove()
                 if banner_lbl is not None:
                     banner_lbl.grid_remove()
-                # 🔴 用 `before=cv` 放回原位：pack 是按调用顺序分配空间的，
-                #    直接 `pack()` 会让动作条排到滚动区**后面**，抢不到位置。
-                bar_wrap.pack_forget()
+                # 编辑态收起整条动作面板（bar_wrap 是 bar_cv 的子控件，
+                # 直接 hide 父级 bar_cv 即可；bar_wrap 自己没有独立 pack 位）。
+                bar_cv.pack_forget()
                 # 编辑态：按钮从「编辑」变「保存」，同时换成品牌色强调
                 edit_btn.set_text("保存")
                 edit_btn.configure(fg=self._c("primary"),
@@ -2799,8 +3626,7 @@ class BrainDrawerTab(ttk.Frame):
                     imgs.grid()
                 if banner_lbl is not None:
                     banner_lbl.grid()
-                bar_wrap.pack(side="bottom", fill="x", padx=PAD + CARD_INSET,
-                              pady=(0, PAD), before=cv)
+                bar_cv.pack(side="bottom", fill="x", padx=PAD, pady=(0, PAD))
                 edit_btn.set_text("编辑")
                 edit_btn.configure(fg=self._c("secondary"),
                                    fill=self._c("bg"),
@@ -2867,12 +3693,20 @@ class BrainDrawerTab(ttk.Frame):
             """卡片尺寸变了就重算：宽度跟着内容走，**高度封顶**、超出交给滚动。
 
             🔴 高度必须封顶 —— 否则长记录会把窗口顶穿屏幕（见 bar_wrap 的说明）。
+            🔴 宽度要**同时看正文和动作条**（用户 2026-10-12：短文本按钮展示不全）——
+               正文短时 card 很窄，但「✓ 已整理」这类按钮比它宽，卡片会被
+               按钮顶宽、圆角和内容对不上。取两者的较大值，谁宽谁说话。
             """
-            cwc = card.winfo_reqwidth() + CARD_INSET * 2
+            # 编辑态整条动作面板被收起（bar_cv 已 forget），对它不占高度。
+            bar_h = 0 if editing["on"] else bar_wrap.winfo_reqheight()
+            bar_w = 0 if editing["on"] else bar_wrap.winfo_reqwidth()
+            cwc = max(card.winfo_reqwidth(), bar_w) + CARD_INSET * 2
             chc = card.winfo_reqheight() + CARD_INSET * 2
-            bar_h = bar_wrap.winfo_reqheight()
+            # 底部面板比内容多留 BAR_R：那截是圆角收尾区（画的是 barbg 自己，
+            # 没内容），这样 bar_wrap 的直角底边落在圆角弧线以上，不会戳出卡外。
+            bar_total = bar_h + BAR_R
             avail = max(240, int(win.winfo_screenheight() * 0.82)
-                        - bar_h - PAD * 2 - 16)
+                        - bar_total - PAD * 2 - 16)
             cvh = min(chc, avail)
             # 🔴 窗口尺寸下限 —— 用户报的两条都靠它：
             #    · 宽度：card 是直角 Frame，窗口拖得比它窄时 canvas 直接被裁掉，
@@ -2881,23 +3715,47 @@ class BrainDrawerTab(ttk.Frame):
             #      窗口跟着缩一截，看着像换了个窗口。所以下限取「只读态量到的高度」，
             #      **只抬不降**。
             if not editing["on"]:
-                _floor["h"] = max(_floor["h"], cvh + bar_h + PAD * 2 + 4)
+                _floor["h"] = max(_floor["h"], cvh + bar_total + PAD * 2 + 4)
             try:
                 win.minsize(cwc + PAD * 2,
                             min(_floor["h"],
                                 int(win.winfo_screenheight() * 0.92)))
             except tk.TclError:
                 pass
-            if (_fit["w"], _fit["h"], _fit["ch"]) == (cwc, cvh, chc):
+            # 🔴 缓存键带上 bar_total：编辑态切换时 cwc/cvh/chc 可能都没变，
+            #    但 bar 占不占高度变了，不带上会跳过重算 → 动作条不回来。
+            if (_fit["w"], _fit["h"], _fit["ch"], _fit.get("bar", -1)) \
+                    == (cwc, cvh, chc, bar_total):
                 return
-            _fit.update(w=cwc, h=cvh, ch=chc)
+            _fit.update(w=cwc, h=cvh, ch=chc, bar=bar_total)
             cv.configure(width=cwc, height=cvh,
                          scrollregion=(0, 0, cwc, chc))
             cv.delete("cardbg")
-            round_rect(cv, 1, 1, cwc - 1, chc - 1, 16,
-                       fill=self._c("light"), outline=self._c("border"),
-                       width=1, tags="cardbg")
+            # 上卡只圆顶边两角，底边直线 —— 跟下面 bar_cv 的圆底边拼成一张卡。
+            round_rect_top(cv, 1, 1, cwc - 1, chc - 1, 16,
+                           fill=self._c("light"), outline=self._c("border"),
+                           width=1, tags="cardbg")
             cv.tag_lower("cardbg")
+            # 底部动作面板：画下圆角底，宽度与上面卡片同宽（左右齐平）。
+            bar_cv.configure(width=cwc, height=bar_total)
+            bar_cv.delete("barbg")
+            round_rect_bottom(bar_cv, 1, 1, cwc - 1, bar_total - 1, BAR_R,
+                              fill=self._c("light"), outline=self._c("border"),
+                              width=1, tags="barbg")
+            bar_cv.tag_lower("barbg")
+            # bar_wrap 放进 bar_cv 的窗口：宽 = 卡宽 - 两侧内缩，高 = 内容高。
+            bar_cv.itemconfigure(bar_win, width=cwc - 2 * CARD_INSET,
+                                 height=bar_h)
+            # 🔴 正文 wraplength 跟着卡宽走（不再是写死的 520）：减去卡片
+            #    内缩 + 卡片自身左右 padding，文字正好铺满、贴到右边。
+            # 🔴 还要**按新宽度重折**（`_soft_wrap`）—— 只改 wraplength 的话，
+            #    文字仍是按 520 折好的，Tk 不会重排既有 `\n`，右边留一大截空白
+            #    （用户报的「思绪卡片右边较大空隙」）。
+            _wl = max(200, cwc - CARD_INSET * 2 - 44)
+            _txt = _soft_wrap(getattr(txt, "_orig_text", txt.cget("text")), _wl, 11)
+            if _txt != txt.cget("text"):
+                txt.configure(text=_txt)
+            txt.configure(wraplength=_wl)
             cv.yview_moveto(0)          # 每次重算都回到顶部，别停在半路
             win.after_idle(_place_window)
 
@@ -2949,6 +3807,7 @@ class BrainDrawerTab(ttk.Frame):
         if self._modal is not None and self._modal.winfo_exists():
             self._modal.destroy()
         self.refresh(self.app.state)
+        self._refresh_open_list()
 
     def _delete(self, c):
         if not messagebox.askyesno("永久删除", "这条会永远消失，确定？"):
@@ -2958,6 +3817,20 @@ class BrainDrawerTab(ttk.Frame):
         if self._modal is not None and self._modal.winfo_exists():
             self._modal.destroy()
         self.refresh(self.app.state)
+        self._refresh_open_list()
+
+    def _refresh_open_list(self):
+        """列表窗口还开着的话就地重建 —— 卡片里改了状态 / 删了条目后保持一致。
+
+        🔴 从列表点开卡片**不再关列表**（用户 2026-10-12），所以卡片里的改动
+           必须回灌到列表，否则列表还停在旧数据上（点「取消完成」看着像没反应）。
+        """
+        if self._list is not None and self._list.winfo_exists() \
+                and self._list_rebuild is not None:
+            try:
+                self._list_rebuild()
+            except tk.TclError:
+                pass
 
     # ── 回收站（已丢弃）────────────────────────────────────────────
     def _dropped_items(self):
@@ -2999,6 +3872,12 @@ class BrainDrawerTab(ttk.Frame):
            就点不到了（回收站踩过）。
         🔴 滚轮绑 **Toplevel**（bindtags 会从子控件冒上来），别用 `bind_all` ——
            那会跟配置中心的滚轮抢。
+        🔴 **视口钳制**（用户 2026-10-12：列表「上滚空白、只显示一条」）：
+          内容比视口矮时，滚动区钳成视口本身 —— 否则 bbox 比视口高出一截，
+          滚轮能滚进一片啥都没有的空白，剩下的真内容被挤成「只显示一条」。
+          bbox 取不到（空 canvas）时不动滚动区，别把 None 传给 configure。
+        🔴 **滚轮双闸**：方向上已经没得滚了就 `break` 拦下来（yview 到头还继续
+          调 `yview_scroll` 会让位置漂），并且消费掉事件、不往父窗口窜。
         """
         body_wrap = tk.Frame(parent, bg=self._c("bg"))
         body_wrap.pack(side="top", fill="both", expand=True, padx=pad)
@@ -3009,12 +3888,33 @@ class BrainDrawerTab(ttk.Frame):
         cv.pack(side="left", fill="both", expand=True)
         inner = tk.Frame(cv, bg=self._c("bg"))
         wid = cv.create_window(0, 0, window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>",
-                lambda e: cv.itemconfigure(wid, width=e.width))
-        parent.bind("<MouseWheel>",
-                    lambda e: cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
+        def _sync(_e=None):
+            """内容 / 视口任一变化 → 重算条目宽 + 滚动区（钳到视口）。"""
+            cv.itemconfigure(wid, width=cv.winfo_width())
+            bb = cv.bbox("all")
+            if not bb:
+                return
+            top, bot = bb[1], bb[3]
+            vh = cv.winfo_height()
+            if bot - top <= vh:          # 内容不比视口高 → 不留可滚空白
+                cv.configure(scrollregion=(bb[0], 0, bb[2], max(bot, vh)))
+            else:
+                cv.configure(scrollregion=bb)
+
+        def _wheel(e):
+            """滚轮双闸：没得滚的方向直接拦 + break，不往父窗口窜。"""
+            top, bot = cv.yview()
+            if e.delta > 0 and top <= 0.0:
+                return "break"
+            if e.delta < 0 and bot >= 1.0:
+                return "break"
+            cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+            return "break"
+
+        inner.bind("<Configure>", _sync)
+        cv.bind("<Configure>", _sync)
+        parent.bind("<MouseWheel>", _wheel)
         return cv, inner
 
     # ── 搜索 / 分类列表 ──────────────────────────────────────────
@@ -3028,13 +3928,15 @@ class BrainDrawerTab(ttk.Frame):
         if not q:
             self.app.toast("先在搜索框里写点什么再搜", False)
             return
-        self._open_list(items=self._list_items(query=q), query=q)
+        self._open_list(query=q)
 
-    def _open_list(self, bucket=None, items=None, query=None):
+    def _open_list(self, group=None, bucket=None, query=None):
         """分类 / 搜索结果的**静态列表窗口**。
 
         🔴 为什么要有它：轮播是「等条目飘过来」，条目一多就只能干等。列表窗口是
-           「直接翻」—— 时间倒序、能滚、点一行就开那张思维卡片。
+           「直接翻」—— 时间倒序、能滚、点一行就开那张思绪卡片。
+        🔴 `group`（待办 / 思绪）打开后，顶上还有一行**子筛选**（未完成/已完成、
+           未整理/已整理）—— 用户 2026-10-12：「打开后再按…分类，列表就清楚很多」。
         🔴 和回收站共用 `_scroll_area` 那套骨架（顶部标题 / 中间可滚列表），
            但**不做勾选**：这里没有批量操作，点一行 = 打开卡片。
         🔴 同样**不放「关闭」**（窗口 X + Esc 就够，和浮层 / 回收站一条规矩）。
@@ -3042,30 +3944,44 @@ class BrainDrawerTab(ttk.Frame):
            不知道也不关心某类有没有被展示范围关掉。
         """
         _store.init()
-        if items is None:
-            items = self._list_items(bucket=bucket, query=query)
-        if bucket is not None:
-            title = f"{_BUCKET_LABEL[bucket]} · 列表"
-            sub = "按时间倒序 · 点一行打开思维卡片"
+        if group is not None:
+            title = f"{_GROUP_LABEL[group]} · 列表"
+            sub = "按时间倒序 · 点一行打开思绪卡片"
         elif query:
             title = f"搜索「{query}」"
-            sub = "命中正文 / 标签 / 结论 · 点一行打开思维卡片"
+            sub = "命中正文 / 标签 / 结论 · 点一行打开思绪卡片"
         else:
             title = "列表"
-            sub = "按时间倒序 · 点一行打开思维卡片"
+            sub = "按时间倒序 · 点一行打开思绪卡片"
 
+        # 🔴 同一个入口重复点 → **把已开的窗置顶**，不重开一个（用户 2026-10-12：
+        #    「打开待办页面后再点待办，不应该重新弹出，而是把当前待办窗口置顶」）。
+        #    换了入口（待办 → 思绪 / 另一次搜索）才重开。
+        key = (("group", group) if group is not None
+               else ("query", query) if query else ("bucket", bucket))
         if self._list is not None and self._list.winfo_exists():
+            if self._list_key == key:
+                try:
+                    self._list.deiconify()
+                    self._list.lift()
+                    self._list.focus_force()
+                except tk.TclError:
+                    pass
+                return
             self._list.destroy()
         win = tk.Toplevel(self)
         self._list = win
+        self._list_key = key
         win.title(title)
         win.configure(bg=self._c("bg"))
         win.transient(self.app.root)
         W = 680
         H = max(320, min(560, int(win.winfo_screenheight() * 0.72)))
-        win.geometry("%dx%d+%d+%d" % (
-            W, H, max(8, self.app.root.winfo_rootx() + 150),
-            max(8, self.app.root.winfo_rooty() + 110)))
+        # 🔴 位置必须过屏幕夹取：主窗贴右下角时 +150/+110 会把列表窗整个推出
+        #    屏幕，用户眼里只剩一条边（反馈单「只显示一条」）。
+        _x, _y = _clamp_win(win, self.app.root.winfo_rootx() + 150,
+                            self.app.root.winfo_rooty() + 110, W, H)
+        win.geometry("%dx%d+%d+%d" % (W, H, _x, _y))
         win.minsize(520, 300)
 
         PAD = 12
@@ -3076,60 +3992,173 @@ class BrainDrawerTab(ttk.Frame):
         head.pack(side="top", fill="x", pady=(0, 4))
         tk.Label(head, text=title, bg=self._c("bg"), fg=self._c("fg"),
                  font=_font(12, "bold")).pack(side="left")
-        tk.Label(head, text=f"共 {len(items)} 条 · {sub}", bg=self._c("bg"),
+        # 条数用 StringVar —— 点状态按钮重建列表时它要跟着变（见 _rebuild）。
+        count_var = tk.StringVar()
+        tk.Label(head, textvariable=count_var, bg=self._c("bg"),
                  fg=self._c("secondary"),
                  font=_font(9)).pack(side="left", padx=(10, 0))
+
+        # 子筛选行：大类（待办/思绪）打开时才有。[全部] + 该大类的两个子类。
+        # 🔴 sub_state 无条件定义 —— `_rebuild` 在搜索 / 兜底路径也要读它。
+        sub_state = {"v": None, "btns": []}
+        if group is not None:
+            # thought 组里 done/decided 展示同为「已整理」，子筛只留一个入口
+            if group == "thought":
+                subs = [("", "全部"), ("open", "未整理"), ("done", "已整理")]
+            else:
+                subs = [("", "全部"), ("memo", "未完成"), ("memo_done", "已完成")]
+            srow = tk.Frame(win, bg=self._c("bg"), padx=PAD)
+            srow.pack(side="top", fill="x", pady=(0, 4))
+
+            def _pick(v):
+                """点子筛：换筛选项 + 把「选中」框搬到点下的那个上。"""
+                sub_state["v"] = v or None
+                for code, sb in sub_state["btns"]:
+                    sb.set_selected((code or None) == sub_state["v"])
+                _rebuild()
+
+            for code, text in subs:
+                sb = RoundedButton(srow, text, lambda c=code: _pick(c),
+                                   kind="ghost", radius=9, padx=10, pady=4,
+                                   font=_font(9),
+                                   fg=self._c("secondary"),
+                                   fill=self._c("bg"), outline=self._c("border"),
+                                   hover_fill=self._c("active"),
+                                   hover_outline=self._c("primary"),
+                                   hover_fg=self._c("primary"),
+                                   selected_fg=self._c("primary"),
+                                   selected_fill=self._c("active"),
+                                   parent_bg=self._c("bg"))
+                sb.pack(side="left", padx=(0, 4))
+                sb.set_selected(not code)
+                sub_state["btns"].append((code, sb))
+
         cv, inner = self._scroll_area(win, PAD)
 
         def _close():
             self._list = None
+            self._list_key = None
+            self._list_rebuild = None
             try:
                 win.destroy()
             except tk.TclError:
                 pass
 
         def _open(it):
-            """开卡片前先收掉列表 —— 不然卡片关掉之后底下还压着一个窗口。"""
-            _close()
+            """开卡片 —— **列表留着**（用户 2026-10-12：在列表里打开卡片不该关列表）。
+
+            卡片改完状态后靠 `self._list_rebuild` 把列表刷新，所以关不关都不影响
+            数据一致性；留着反而能接着翻下一条。
+            """
             self._open_modal(it)
 
-        if not items:
-            tk.Label(inner, text="这里没有条目", bg=self._c("bg"),
-                     fg=self._c("secondary"),
-                     font=_font(10)).pack(pady=48)
-        for it in items:
+        def _row(it):
             memo = it["kind"] == _store.KIND_MEMO
+            st = it["status"]
             row = tk.Frame(inner, bg=light, padx=12, pady=9)
             row.pack(fill="x", pady=3)
+
+            # 左：文字（点开卡片）
+            left = tk.Frame(row, bg=light)
+            left.pack(side="left", fill="both", expand=True)
             accent = _BUCKET_COLOR[it["bucket"]][
                 1 if self.app.theme == THEME_DARK else 0]
-            tk.Label(row, text=_meta_text(it, memo), bg=light, fg=accent,
-                     font=_font(9, "bold")).pack(anchor="w")
+            meta = tk.Label(left, text=_meta_text(it, memo), bg=light, fg=accent,
+                            font=_font(9, "bold"))
+            meta.pack(anchor="w")
             summary = " ".join(it["content"].split())
             if len(summary) > 140:
                 summary = summary[:140] + "…"
-            tk.Label(row, text=summary, bg=light, fg=self._c("fg"),
-                     justify="left", anchor="w", wraplength=580,
-                     font=_font(10)).pack(anchor="w", pady=(3, 0))
+            body = tk.Label(left, text=_soft_wrap(summary, 440, 10), bg=light,
+                            fg=self._c("fg"),
+                            justify="left", anchor="w", wraplength=440,
+                            font=_font(10))
+            body.pack(anchor="w", pady=(3, 0))
+            note_lbl = None
             if it.get("note"):
-                note = " ".join(it["note"].split())
-                if len(note) > 120:
-                    note = note[:120] + "…"
-                tk.Label(row, text="结论：" + note, bg=light,
-                         fg=self._c("secondary"), justify="left", anchor="w",
-                         wraplength=580, font=_font(9)).pack(anchor="w",
-                                                             pady=(3, 0))
-            # 整行可点（含里面的 Label）—— 只绑 row 的话点在文字上没反应
-            for w in [row] + list(row.winfo_children()):
+                n = " ".join(it["note"].split())
+                if len(n) > 120:
+                    n = n[:120] + "…"
+                note_lbl = tk.Label(left, text=_soft_wrap("结论：" + n, 440, 9),
+                                    bg=light,
+                                    fg=self._c("secondary"), justify="left",
+                                    anchor="w", wraplength=440, font=_font(9))
+                note_lbl.pack(anchor="w", pady=(3, 0))
+            for w in [left, meta, body] + ([note_lbl] if note_lbl else []):
                 w.bind("<Button-1>", lambda e, x=it: _open(x))
                 try:
                     w.configure(cursor="hand2")
                 except tk.TclError:
                     pass
 
+            # 右：状态操作按钮（待办：完成 ⇄ 取消完成 + 丢弃；
+            #     思绪：整理 ⇄ 取消整理 + 丢弃）。同一套口径见 `_flow_plan`。
+            right = tk.Frame(row, bg=light)
+            right.pack(side="right", fill="y", padx=(10, 0))
+            plan = _flow_plan(memo, st)
+
+            def _act(target, iid=it["id"], mm=memo):
+                self._set_status([iid], target, memo=mm)
+                # 改完状态后重建本列表：当前站按钮变灰、或条目移出本桶而消失。
+                _rebuild()
+
+            for label, color, target, disabled in plan:
+                sb = RoundedButton(right, label, lambda t=target: _act(t),
+                                   kind="ghost", radius=9, padx=10, pady=4,
+                                   font=_font(9), fg=self._c(color),
+                                   fill=self._c("bg"), outline=self._c("border"),
+                                   hover_fill=self._c("active"),
+                                   hover_outline=self._c(color),
+                                   hover_fg=self._c(color),
+                                   disabled_fg=self._dim(),
+                                   parent_bg=light)
+                if disabled:
+                    sb.configure(state="disabled")
+                sb.pack(anchor="e", pady=(0, 3))
+
+        # 🔴 分页：一次取一页（LIST_PAGE 条），底部给「加载更多」。
+        #    记录再多也翻得到最早那条（审查报告点出的「500 条隐藏旧数据」）。
+        page = {"n": self.LIST_PAGE}
+
+        def _rebuild():
+            """重画列表 —— 筛选项 / 状态变了就回到第一页、并滚回顶部。"""
+            page["n"] = self.LIST_PAGE
+            _render(at_top=True)
+
+        def _render(at_top=False):
+            for w in inner.winfo_children():
+                w.destroy()
+            rows = self._list_items(group=group, sub=sub_state["v"],
+                                    bucket=bucket, query=query,
+                                    limit=page["n"])
+            for it in rows:
+                _row(it)
+            total = self._list_total(group=group, sub=sub_state["v"],
+                                     bucket=bucket, query=query)
+            shown = len(rows)
+            more = max(0, total - shown)
+            tail = f" · 还有 {more} 条" if more else ""
+            count_var.set(f"共 {total} 条 · 显示 {shown}{tail} · {sub}")
+            if not inner.winfo_children():
+                tk.Label(inner, text="这里没有条目", bg=self._c("bg"),
+                         fg=self._c("secondary"),
+                         font=_font(10)).pack(pady=48)
+            if more:
+                def _more():
+                    page["n"] += self.LIST_PAGE
+                    _render(at_top=False)      # 🔴 「加载更多」别把视图弹回顶部
+                self._ghost_btn(inner, f"加载更多（还有 {more} 条）", _more,
+                                padx=14, pady=6).pack(pady=12)
+            if at_top:
+                cv.yview_moveto(0)
+
+        # 登记重建回调：卡片里改了状态后 `_set_status` 会调它把本列表刷新
+        # （列表不再随着开卡片而关闭，见 `_open`）。
+        self._list_rebuild = _rebuild
+        _rebuild()
+
         win.protocol("WM_DELETE_WINDOW", _close)
         win.bind("<Escape>", lambda e: _close())
-        cv.yview_moveto(0)
 
     def _open_trash(self):
         """回收站：已丢弃条目的**静态列表**，勾出要永久删除的。
@@ -3154,8 +4183,8 @@ class BrainDrawerTab(ttk.Frame):
         win.transient(self.app.root)
         W = 680
         H = max(320, min(560, int(win.winfo_screenheight() * 0.72)))
-        x = max(8, self.app.root.winfo_rootx() + 150)
-        y = max(8, self.app.root.winfo_rooty() + 110)
+        x, y = _clamp_win(win, self.app.root.winfo_rootx() + 150,
+                          self.app.root.winfo_rooty() + 110, W, H)
         win.geometry("%dx%d+%d+%d" % (W, H, x, y))
         win.minsize(520, 300)
 
@@ -3231,7 +4260,8 @@ class BrainDrawerTab(ttk.Frame):
             summary = " ".join(it["content"].split())
             if len(summary) > 110:
                 summary = summary[:110] + "…"
-            tk.Label(mid, text=summary, bg=light, fg=self._c("fg"),
+            tk.Label(mid, text=_soft_wrap(summary, 440, 10), bg=light,
+                     fg=self._c("fg"),
                      justify="left", anchor="w", wraplength=440,
                      font=_font(10)).pack(anchor="w", pady=(3, 0))
 
@@ -3303,6 +4333,11 @@ class BrainDrawerTab(ttk.Frame):
             os.startfile(fp)
         except Exception:
             pass
+
+    # ── 列表行状态按钮 ─────────────────────────────────────────────
+    # 见 `_open_list` / `_open_trash`：每行右侧直接摆「已处理/已决议/丢弃/恢复」
+    # 这类状态操作按钮，点一下即改状态并重建本列表 —— 不再提供「打开/复制/打开
+    # 文件夹」那套外部处理按钮（用户明确要求去掉；要转外部看就点开思绪卡片）。
 
 def _gui_pid():
     """`gui.pid` 里记的进程号（0 = 没记）。"""
