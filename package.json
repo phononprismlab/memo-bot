@@ -4,6 +4,8 @@
   "private": true,
   "description": "memo-bot 的 Markdown → PNG 渲染链路（Node 侧）：用系统 Chrome 截图，规避 16384 像素回绕",
   "type": "module",
+  "author": "PrismaticLab",
+  "license": "MIT",
   "dependencies": {
     "playwright-core": "^1.63.0"
   }

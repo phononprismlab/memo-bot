@@ -1774,7 +1774,23 @@ def test_gui_update_check():
     #    （用户 2026-10-12：「思绪卡片打开后右边存在较大空隙」）。
     check("📐 思绪卡片正文按最终卡宽重折（右边不留空隙）",
           'txt._orig_text = it["content"]' in src
-          and '_soft_wrap(getattr(txt, "_orig_text"' in src)
+          and '_body_fit(getattr(txt, "_orig_text", ""), _wl)' in src
+          and "new = _soft_wrap(orig, avail, 11)" in src)
+    # 🔴 正文用**只读 Text** 而不是 Label（Label 天生选不中、复制不了）——
+    #    用户 2026-10-13：「卡片文字不可复制，我希望是能复制的，更符合记笔记
+    #    的使用习惯」。`state="disabled"` 只挡编辑、不挡选择与 Ctrl+C。
+    check("📐 思绪卡片正文是可拖选 / Ctrl+C 的只读 Text",
+          "tk.Text(body_box" in src
+          and "body_box.pack_propagate(False)" in src
+          and 'txt.configure(state="disabled")' in src
+          and "selectbackground=" in src)
+    # 🔴 Text 的 width/height 是字符/行单位、量不出像素 ⇒ 像素尺寸交给外层
+    #    body_box，卡片「宽度跟着正文走」的行为才不变。
+    check("📐 正文 Text 的像素尺寸由 _body_fit 定（Text 只认字符单位）",
+          "body_box.configure(width=max(1, w_max)," in src
+          and '_wfont.metrics("linespace")' in src)
+    check("📐 只读 Text 不吃滚轮（显式转发给卡片滚动）",
+          "def _wheel_on_body(e)" in src and 'txt.bind("<MouseWheel>"' in src)
 
 
 # ── [14] 回旋镖 + 导出 ──────────────────────────────────────────
@@ -2427,6 +2443,40 @@ def test_gui_source():
           and "def _on_focus_in(self, event)" in src
           and "event.widget is not self.app.root" in src
           and "def _check_db_changed(self)" in src)
+
+    # ⑩ 开机自启开关：**先认点击、再后台确认**（用户 2026-10-13：「按钮有点卡顿」）。
+    #    以前同步等 `autostart_set` 把 PowerShell 跑完（1~3 秒）再整页重画，
+    #    重画时读的还是旧 state ⇒ 开关先弹回去、确认完再翻过来 = 那个卡顿。
+    _as = src.split("def _autostart(self, on)", 1)[1].split("\n    def ", 1)[0]
+    _as_body = _as.split('"""', 2)[2]        # 跳过 docstring（里面提到了 refresh）
+    check("🖥 🔴 自启开关先认点击（同步拨 UI，不整页重画）",
+          "self._set_autostart_ui(on)" in _as
+          and "self.app.refresh()" not in _as_body)
+    check("🖥 🔴 自启开关丢后台线程跑（界面不冻）",
+          "threading.Thread(target=work, daemon=True).start()" in _as
+          and "self.cw.autostart_set(on)" in _as)
+    check("🖥 🔴 自启开关失败才回拨 + 通知",
+          "def _autostart_done(self, want, ok, msg)" in src
+          and "self._set_autostart_ui(not want)" in src
+          and 'self.app.toast(msg or "开机自启没设置成功", False)' in src)
+    check("🖥 自启开关连点有守卫（busy + pending，不并发跑 PowerShell）",
+          "self._autostart_busy = True" in _as
+          and "self._autostart_pending = on" in _as)
+    check("🖥 自启开关变量记在实例上（重画后仍够得着）",
+          "self._autostart_var = av" in src)
+
+    # ⑪ 导出诊断包（用户 2026-10-13）：后台打包 + 连点守卫 + 完成后回主线程。
+    _dg = src.split("def _export_diag(self)", 1)[1].split("\n    def ", 1)[0]
+    check("🖥 🔴 诊断包丢后台线程跑（读日志几秒，不能冻界面）",
+          "threading.Thread(target=work, daemon=True).start()" in _dg
+          and "_diag.export_bundle(state)" in _dg)
+    check("🖥 🔴 诊断包完成后经 after(0) 回主线程改文案（后台不碰 Tk）",
+          "self.app.root.after(0, lambda: self._diag_done(" in _dg)
+    check("🖥 诊断包连点有守卫（不并发往桌面写两个包）",
+          "if getattr(self, \"_diag_busy\", False):" in _dg
+          and "self._diag_busy = True" in _dg)
+    check("🖥 诊断包小字过 _soft_wrap（长路径没有空格，Tk 断不开）",
+          "lbl.configure(text=_soft_wrap(text, 520, 9))" in src)
 
     # ── 底部按钮行：思维流 + 两分类（待办/思绪，点击开列表窗口）+ 回收站 ──
     # 已丢弃**不进轮播舞台**（_collect 里跳过），也不做分类 chip ——
@@ -3131,6 +3181,112 @@ def test_review_hardening():
           "STAGE_ROWS" in _gsrc and "limit=self.STAGE_ROWS" in _gsrc)
 
 
+def test_diag_bundle():
+    """导出诊断包（用户 2026-10-13）：真跑一次打包，把隐私红线钉死。
+
+    这是**真跑**的测试（不是扫源码）：在临时数据目录里造一份假 `.env`、
+    假设置、一个真 SQLite 库（带一条待办）、一小一大两个日志，然后调
+    `diag.export_bundle()` 并逐项核对 zip 内容。
+    🔴 最要紧的一条：**用户的待办 / 凭据 / 自定义指令一个都不许进包** ——
+       这是这个功能唯一的风险面，必须每次跑测试都验一遍。
+    """
+    print("\n[27] 导出诊断包（隐私红线 + 日志截断）")
+    import zipfile
+    import diag
+
+    src = open(os.path.join(ROOT, "diag.py"), encoding="utf-8").read()
+
+    # ── ① 静态红线：打包名单里不能出现用户数据 ──
+    _names = src.split("LOG_NAMES = (", 1)[1].split(")", 1)[0]
+    check("🔴 日志名单里没有 memos.db / moyu-user.json",
+          "memos.db" not in _names and "moyu-user.json" not in _names)
+    check("🔴 凭据类键全部打码（SECRET/TOKEN/KEY/APPID/PASSWORD/OPENID/TARGETS）",
+          all(h in src for h in ("SECRET", "TOKEN", "KEY", "APPID",
+                                 "PASSWORD", "OPENID", "TARGETS")))
+    check("🔴 每个日志文件只带末尾 200KB", "LOG_TAIL = 200 * 1024" in src)
+    check("🔴 桌面目录走系统 API 拿（OneDrive 重定向 / 中文「桌面」都认）",
+          "SHGetFolderPathW" in src and "0x0010" in src)
+
+    # ── ② 真跑一次 ──
+    _env = os.path.join(_TMP_DATA, ".env")
+    _env_bak = None
+    if os.path.exists(_env):
+        with open(_env, encoding="utf-8") as f:
+            _env_bak = f.read()
+    _small = os.path.join(_TMP_DATA, "bot.out.log")
+    _big = os.path.join(_TMP_DATA, "botpy.log")
+    _out = tempfile.mkdtemp(prefix="memo_diag_test_")
+    _SECRET = "THIS_IS_THE_SECRET_VALUE"
+    try:
+        with open(_env, "w", encoding="utf-8") as f:
+            f.write("QQ_BOT_APPID=102000000\n"
+                    f"QQ_BOT_SECRET={_SECRET}\n"
+                    "QQ_PUSH_TARGETS=group:999\n"
+                    "MEMO_SEARCH_ROOT=C:/Users/Administrator/Desktop\n")
+        with open(_small, "w", encoding="utf-8") as f:
+            f.write("小日志：正常启动\n")
+        with open(_big, "w", encoding="utf-8") as f:
+            f.write("撑体积的日志行\n" * 40000)          # > 200KB
+        # 一条真实待办：拿它的正文当「有没有泄漏」的探针
+        import store as _st
+        _st.init()
+        _st.add_memo("g-d", "诊断群", "u-d", "d",
+                     "待办正文-绝不许进包-12345", kind="memo")
+
+        import config_core
+        state = config_core.full_state()
+        ok, msg, path = diag.export_bundle(state, out_dir=_out)
+        check("export_bundle 成功返回 zip 路径",
+              ok and path and os.path.isfile(path), f"{ok} / {msg}")
+        if not (ok and path and os.path.isfile(path)):
+            return
+
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            root = names[0].split("/")[0]
+            inner = sorted(n[len(root) + 1:] for n in names)
+            body = {n[len(root) + 1:]: z.read(n).decode("utf-8", "replace")
+                    for n in names}
+
+        check("包里有 说明 / 环境 / 配置摘要 / 日志",
+              all(x in inner for x in ("说明.txt", "环境.txt", "配置摘要.txt"))
+              and any(x.startswith("日志/") for x in inner), f"{inner}")
+
+        joined = "\n".join(names) + "\n" + "\n".join(body.values())
+        check("🔴 包内不含 memos.db", "memos.db" not in "\n".join(names))
+        check("🔴 包内不含 moyu-user.json / extensions",
+              "moyu-user.json" not in joined and "extensions" not in "\n".join(names))
+        check("🔴 包内不含待办正文明文",
+              "待办正文-绝不许进包-12345" not in joined)
+        check("🔴 包内不含 AppSecret 明文", _SECRET not in joined)
+        check("🔴 包内不含播报会话 ID 明文", "group:999" not in joined)
+        check("凭据显示成「已打码，N 字符」",
+              "已打码" in body.get("配置摘要.txt", ""))
+        check("非密配置仍然可见（留着才好排障）",
+              "C:/Users/Administrator/Desktop" in body.get("配置摘要.txt", ""))
+
+        bp = body.get("日志/botpy.log", "")
+        check("大日志被截断到 ~200KB 且带说明行",
+              "只带末尾 200 KB" in bp.splitlines()[0]
+              and len(bp.encode()) <= 210 * 1024, f"{len(bp.encode())} 字节")
+        check("小日志原样带出（没被截断）",
+              body.get("日志/bot.out.log", "").startswith("小日志"))
+        check("环境.txt 里有版本 / 系统 / Python / 依赖自检",
+              all(k in body.get("环境.txt", "")
+                  for k in ("版本", "操作系统", "Python", "依赖自检")))
+    finally:
+        if _env_bak is None:
+            for p in (_env, _small, _big):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        else:
+            with open(_env, "w", encoding="utf-8") as f:
+                f.write(_env_bak)
+        shutil.rmtree(_out, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -3167,6 +3323,7 @@ def main():
     test_gui_speed()
     test_gui_update_check()
     test_review_hardening()
+    test_diag_bundle()
     print("\n" + "=" * 60)
     if FAILS:
         print(f"❌ {len(FAILS)}/{TOTAL[0]} 项失败：")

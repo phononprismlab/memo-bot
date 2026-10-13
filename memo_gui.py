@@ -47,6 +47,7 @@ import export as _export       # 导出：与机器人「导出」指令、网�
 import settings as _settings   # 设置项：脑内抽屉的展示范围 / 回旋镖规则都在这
 import extmgr as _extmgr       # 自定义指令：扩展包的导入 / 列出 / 移除
 import botctl as _botctl       # 进程 / 计划任务查询（首屏靠它的非阻塞接口提速）
+import diag as _diag           # 诊断包：环境 + 配置摘要 + 日志尾巴打成一个 zip
 from paths import data_path, data_dir  # noqa: E402  （gui.pid 单实例锁 / 主题偏好落数据目录）
 
 # 单实例锁（和 hub.pid / bot.pid 一个套路）：第二次启动顶到前面，不各开一份
@@ -866,6 +867,14 @@ class ConfigCenter(ttk.Frame):
         # 检查更新区的**显示状态**：这一页会被重建（见 _render_runtime 的说明），
         # 重建后要按它回填，否则用户刚查出来的结果会被冲掉。
         self._upd_view = {"note": "", "dl_url": "", "dl_text": ""}
+        # 开机自启开关：乐观更新用（见 _autostart）——`_autostart_var` 指向当前
+        # 那个 Checkbutton 的变量（这一页会重画，重画时重新赋），忙 / 待补意图
+        # 用来兜住连点。
+        self._autostart_var = None
+        self._autostart_busy = False
+        self._autostart_pending = None
+        # 导出诊断包：打包在后台线程跑，忙的时候忽略再次点击（见 _export_diag）
+        self._diag_busy = False
         self._multi = {}          # (target, key) -> {choice: BooleanVar}
         self._push = {}           # (scope, oid) -> BooleanVar
         self._moyu_texts = {}
@@ -1396,6 +1405,9 @@ class ConfigCenter(ttk.Frame):
         #    老写法导致「明明开了却显示关闭」（用户 2026-10-12 报的）。
         #    计划任务状态是后台查的（1.2 秒），查完 `_poll_bot_status` 会重画这一栏。
         av = tk.BooleanVar(value=bool(bot.get("autostart")))
+        # 🔴 记到实例上：`_autostart` 要先认下点击、再后台确认，失败还得把开关
+        #    拨回来 —— 没有这个引用就够不着已经建好的那个 Checkbutton。
+        self._autostart_var = av
         ttk.Checkbutton(lf2, text="开机自动启动机器人", variable=av,
                         bootstyle="primary-round-toggle",
                         command=lambda v=av: self._autostart(v.get())).pack(anchor="w", pady=4)
@@ -1485,6 +1497,70 @@ class ConfigCenter(ttk.Frame):
         ttk.Label(lf4, text="国内网络 git 直连不稳定，可在你下载摸鱼bot的群内寻找最新群文件。",
                   bootstyle="secondary", wraplength=720,
                   font=_font(8)).pack(anchor="w", pady=(6, 0))
+
+        # ── 遇到问题：一键导出诊断包（用户 2026-10-13）──────────────
+        # 🔴 为什么放在「版本」这一区：用户遇到 bug 时最后一定是来这儿找
+        #    「我这版是不是旧的」，顺手就能看到「出问题该导什么」。
+        ttk.Label(lf4, text=_soft_wrap(
+            "遇到问题：点下面这个按钮，会在桌面生成一个「诊断包」—— 里面是版本、"
+            "运行环境和最近一段日志，不含你的待办 / 思绪 / 密钥。把它发给群主，"
+            "对方就能定位问题。", 720, 9),
+            bootstyle="secondary", wraplength=720,
+            font=_font(9)).pack(anchor="w", pady=(12, 0))
+        _diag_row = ttk.Frame(lf4, padding=(0, 6))
+        _diag_row.pack(anchor="w", fill="x")
+        self._ghost_btn(_diag_row, "导出诊断包",
+                        self._export_diag, padx=14, pady=5).pack(side="left")
+        self._diag_note = ttk.Label(_diag_row, text="", bootstyle="secondary",
+                                    font=_font(9), wraplength=520)
+        self._diag_note.pack(side="left", padx=(10, 0))
+
+    def _export_diag(self):
+        """导出诊断包（打包内容与隐私红线见 `diag.py`）。
+
+        🔴 打包要读日志尾部（单文件可能几十 MB），必须丢后台线程 —— 在按钮
+           回调里同步跑会把界面冻住好几秒；完成后 `after(0)` 回主线程改文案，
+           后台线程绝不碰 Tk。
+        🔴 连点守卫：打包期间再点直接忽略，免得同时往桌面写两个包。
+        """
+        if getattr(self, "_diag_busy", False):
+            return
+        self._diag_busy = True
+        self._set_diag_note("正在打包…")
+        state = self.state                        # 界面现成的那份，别再取一次
+
+        def work():
+            try:
+                ok, msg, path = _diag.export_bundle(state)
+            except Exception as e:               # noqa: BLE001
+                ok, msg, path = False, f"导出失败：{e}", None
+            try:
+                self.app.root.after(0, lambda: self._diag_done(ok, msg, path))
+            except tk.TclError:
+                pass                             # 窗口已经关了，别再碰 Tk
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_diag_note(self, text):
+        """改「导出诊断包」右边那行小字（控件可能已随整页重画销毁）。"""
+        lbl = getattr(self, "_diag_note", None)
+        if lbl is None:
+            return
+        try:
+            # 🔴 长路径里没有空格，Tk 的 wraplength 断不开 → 过一遍像素预折行
+            lbl.configure(text=_soft_wrap(text, 520, 9))
+        except tk.TclError:
+            pass
+
+    def _diag_done(self, ok, msg, path):
+        """后台打包回来了（`after` 送回主线程，这里可以安全碰 Tk）。"""
+        self._diag_busy = False
+        if ok and path:
+            self._set_diag_note(f"已生成 {os.path.basename(path)}，就在桌面 —— "
+                                "把它发给群主即可")
+        else:
+            self._set_diag_note(msg)
+        self.app.toast(msg, ok)
 
     def _check_update(self):
         """检查更新：查远端最新版本。
@@ -1730,9 +1806,71 @@ class ConfigCenter(ttk.Frame):
             self.app.refresh()
 
     def _autostart(self, on):
-        ok, msg = self.cw.autostart_set(bool(on))
-        self.app.toast(msg, ok)
-        self.app.refresh()
+        """开机自启开关：**先认点击、再后台确认**，真失败了才回拨 + 提示。
+
+        🔴 用户 2026-10-13 报「按钮有点卡顿」。以前是同步等 `autostart_set`
+           把 PowerShell 跑完（注册 / 删计划任务，1~3 秒），紧接着
+           `self.app.refresh()` 整页重画；重画时读的还是**旧** state，开关先
+           弹回去、等确认完再翻过来 —— 一来一回就是那个卡顿。
+        现在分三步：
+          ① 点下去立刻认（只拨这一个开关，不重画整页）；
+          ② 真正干活丢后台线程，界面不冻；
+          ③ 只有失败才回拨，并 toast 说清原因。
+        """
+        on = bool(on)
+        self._set_autostart_ui(on)               # ① 立刻认下这次点击
+        if self._autostart_busy:                 # 上一轮还没回来：记住最后意图
+            self._autostart_pending = on
+            return
+        self._autostart_busy = True
+
+        def work():
+            try:
+                ok, msg = self.cw.autostart_set(on)
+            except Exception as e:               # noqa: BLE001
+                ok, msg = False, f"设置开机自启失败：{e}"
+            try:
+                self.app.root.after(0, lambda: self._autostart_done(on, ok, msg))
+            except tk.TclError:
+                pass                             # 窗口已经关了，别再碰 Tk
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_autostart_ui(self, on):
+        """把开关拨到 `on`（同时改 state —— 之后整页重画也会是这个值）。"""
+        try:
+            self.state["bot"]["autostart"] = bool(on)
+        except (KeyError, TypeError):
+            pass
+        v = getattr(self, "_autostart_var", None)
+        if v is not None:
+            try:
+                v.set(bool(on))
+            except tk.TclError:
+                pass                             # 控件跟着重画销毁了，正常
+
+    def _autostart_done(self, want, ok, msg):
+        """后台确认回来了（`after` 送回主线程，这里可以安全碰 Tk）。"""
+        self._autostart_busy = False
+        pending = self._autostart_pending
+        self._autostart_pending = None
+
+        if ok:
+            self.app.toast(msg, True)
+            # 任务刚变过（`autostart_set` 已把状态缓存清掉），让那一栏自己补齐，
+            # 顺带把「计划任务 xxx」那行文字刷新 —— 非阻塞接口，不会卡。
+            self.app._poll_bot_status()
+        else:
+            # 🔴 失败：回拨 + 说清为什么，别把开关停在一个不成立的位置上。
+            self._set_autostart_ui(not want)
+            self.app.toast(msg or "开机自启没设置成功", False)
+
+        # 忙的时候用户又点过 → 以那一次为准，补跑。
+        # 🔴 判据要跟**后台真实做到的状态**比，不能跟 state 比 —— state 早被
+        #    第二次点击乐观更新过了，拿它比会误判成「已经一致」而漏掉补跑，
+        #    结果真实状态和界面显示分家。
+        if pending is not None and pending != (want if ok else (not want)):
+            self._autostart(pending)
 
     # ---- ⑧ 摸鱼库 ----
     def _render_moyu(self):
@@ -3507,17 +3645,32 @@ class BrainDrawerTab(ttk.Frame):
                                   font=_font(9))
             banner_lbl.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        # ── 行 2：正文（只读 Label ↔ 编辑态换成可编辑框）────────────
+        # ── 行 2：正文（只读 Text：能拖选 / Ctrl+C ↔ 编辑态换成编辑框）────
         body_holder = tk.Frame(card, bg=light)
         body_holder.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        txt = tk.Label(body_holder, text=_soft_wrap(it["content"], 520, 11),
-                       justify="left", anchor="nw", bg=light, fg=self._c("fg"),
-                       wraplength=520, font=_font(11))
+        # 🔴 正文用**只读 Text** 而不是 Label（用户 2026-10-13：卡片上的字选不中、
+        #    复制不了，不符合记笔记的习惯）。Label 天生不支持选择；Text 天然支持
+        #    拖选 + Ctrl+C，而 `state="disabled"` 只挡编辑、**不挡选择与复制**。
+        # 🔴 Text 的 `width` / `height` 单位是**字符 / 行**，量不出像素宽 ——
+        #    所以外面套一个固定像素尺寸的盒子（`pack_propagate(False)`），尺寸由
+        #    `_body_fit` 按折行结果算。这样「卡片宽度跟着正文走」的行为不变，
+        #    Text 只管显示和选择。
+        body_box = tk.Frame(body_holder, bg=light)
+        body_box.pack(anchor="nw")
+        body_box.pack_propagate(False)
+        txt = tk.Text(body_box, wrap="none", bd=0, highlightthickness=0,
+                      padx=0, pady=0, spacing1=0, spacing2=0, spacing3=0,
+                      bg=light, fg=self._c("fg"), font=_font(11),
+                      cursor="xterm", takefocus=0,
+                      selectbackground=self._c("primary"),
+                      selectforeground=self._c("light"))
         # 🔴 存原始正文：正文宽是**渲染后**由 `_fit_card` 按卡片实宽定的，比这里
         #    的 520 宽不少。不重折的话文字只铺到 520px、右边留一大截空白
         #    （用户报的「思绪卡片右边较大空隙」）。`_fit_card` 会拿这个原文重折。
         txt._orig_text = it["content"]
-        txt.pack(anchor="w")
+        txt.insert("1.0", _soft_wrap(it["content"], 520, 11))
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True)
         # 编辑框拉高（用户 2026-10-12：编辑灵感时文本框太小）—— 6 行只够
         # 瞥见两句话，长一点的灵感得反复在里面翻。12 行 ≈ 小半屏，
         # 浮层本身高度封顶 + 正文区滚动，框大了也顶不穿屏幕。
@@ -3705,7 +3858,7 @@ class BrainDrawerTab(ttk.Frame):
             if on:
                 editbox.delete("1.0", "end")
                 editbox.insert("1.0", it["content"])
-                txt.pack_forget()
+                body_box.pack_forget()      # 只读正文整盒收起（Text 是它的子控件）
                 editbox.pack(fill="x")
                 edit_hint.pack(anchor="w", pady=(6, 0))
                 tag_wrap.grid_remove()
@@ -3729,7 +3882,7 @@ class BrainDrawerTab(ttk.Frame):
             else:
                 editbox.pack_forget()
                 edit_hint.pack_forget()
-                txt.pack(anchor="w")
+                body_box.pack(anchor="nw")
                 tag_wrap.grid()
                 if note_wrap is not None:
                     note_wrap.grid()
@@ -3754,7 +3907,11 @@ class BrainDrawerTab(ttk.Frame):
                 if new and new != it["content"]:
                     _store.update_content(it["id"], new)
                     it["content"] = new
-                    txt.configure(text=new)
+                    txt._orig_text = new
+                    # 🔴 立刻按当前宽度重折：`_fit_card` 有缓存键，改完字如果卡片
+                    #    尺寸没变（比如只改了个错别字），它会直接 return，正文就
+                    #    还是旧的。
+                    _body_fit(new, _fit.get("wl", 520))
                     self.refresh(self.app.state)
                     self.app.toast("已保存", True)
                 set_edit_mode(False)
@@ -3799,6 +3956,31 @@ class BrainDrawerTab(ttk.Frame):
 
         _fit = {"w": 0, "h": 0, "ch": 0}
         _floor = {"h": 0}      # 窗口高度下限（只读态量到的），见 _fit_card
+        _wfont = _wrap_font(11)     # 正文的字体度量（量宽 / 行高都靠它）
+
+        def _body_fit(orig, avail):
+            """按可用像素宽重折正文 → 定 `body_box` 的尺寸 + Text 的显示行数。
+
+            🔴 必须**按新宽度重折**（`_soft_wrap`）—— 只改控件宽度的话，文字
+               仍是按 520 折好的，Tk 不会重排既有的 `\\n`，右边会留一大截空白
+               （用户报的「思绪卡片右边较大空隙」）。
+            🔴 Text 的 `width` / `height` 是字符 / 行单位、量不出像素 ⇒ 量宽交给
+               外层 `body_box`（固定像素 + `pack_propagate(False)`），Text 的
+               `height` 只负责「显示几行」。这样卡片宽度仍然跟着正文走。
+            🔴 写 Text 前要临时 `state="normal"`（disabled 下 `delete` / `insert`
+               会被忽略），写完立刻切回 —— 只读态才是用户看到的那一态。
+            """
+            new = _soft_wrap(orig, avail, 11)
+            if new != txt.get("1.0", "end-1c"):
+                txt.configure(state="normal")
+                txt.delete("1.0", "end")
+                txt.insert("1.0", new)
+                txt.configure(state="disabled")
+            lines = new.split("\n") if new else [""]
+            w_max = max((_wfont.measure(l) for l in lines), default=1)
+            body_box.configure(width=max(1, w_max),
+                               height=_wfont.metrics("linespace") * len(lines))
+            txt.configure(height=len(lines))
 
         def _fit_card(_e=None):
             """卡片尺寸变了就重算：宽度跟着内容走，**高度封顶**、超出交给滚动。
@@ -3863,10 +4045,8 @@ class BrainDrawerTab(ttk.Frame):
             #    文字仍是按 520 折好的，Tk 不会重排既有 `\n`，右边留一大截空白
             #    （用户报的「思绪卡片右边较大空隙」）。
             _wl = max(200, cwc - CARD_INSET * 2 - 44)
-            _txt = _soft_wrap(getattr(txt, "_orig_text", txt.cget("text")), _wl, 11)
-            if _txt != txt.cget("text"):
-                txt.configure(text=_txt)
-            txt.configure(wraplength=_wl)
+            _fit["wl"] = _wl        # 记下当前宽度：保存正文后按同一个宽度重折
+            _body_fit(getattr(txt, "_orig_text", ""), _wl)
             cv.yview_moveto(0)          # 每次重算都回到顶部，别停在半路
             win.after_idle(_place_window)
 
@@ -3901,6 +4081,12 @@ class BrainDrawerTab(ttk.Frame):
 
         card.bind("<Configure>", _fit_card)
         win.bind("<MouseWheel>", _on_wheel)
+        # 🔴 只读 Text 会把滚轮事件吃掉（Tk 给 Text 类绑了滚轮处理），鼠标停在
+        #    正文上时整张卡就滚不动了。这里显式接管、并 `break` 掉类绑定。
+        def _wheel_on_body(e):
+            _on_wheel(e)
+            return "break"
+        txt.bind("<MouseWheel>", _wheel_on_body)
         win.after(20, _fit_card)
 
     def _set_status(self, ids, status, memo, note=None):

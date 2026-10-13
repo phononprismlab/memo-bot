@@ -32,9 +32,14 @@ APP_FILES = [
     "push.py", "version.py",
     # 配置后端（原 config-web.py 的纯逻辑，网页 UI 下线后独立成此文件）
     "config_core.py",
+    # 诊断包：配置中心「⑩ 版本 → 导出诊断包」要 import 它，
+    # 漏了这行安装版点按钮会 ModuleNotFoundError（源码直跑看不出来）。
+    "diag.py",
     # 桌面版这条线（原生界面 + 进程/计划任务查询 + 自定义指令管理 + 单实例锁）
     "memo_gui.py", "botctl.py", "extmgr.py", "single_lock.py",
     "md2png.mjs", "moyu-data.json", "README.md", "安装指南.md", "功能清单.md",
+    # MIT 要求分发时随附许可声明，安装包里带一份
+    "LICENSE",
     ".env.example",
     "VERSION",
 ]

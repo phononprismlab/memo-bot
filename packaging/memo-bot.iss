@@ -3,7 +3,7 @@
 ; 产物：packaging\output\memo-bot-setup-v<版本>.exe
 
 #define MyAppName "memo-bot"
-#define MyAppPublisher "phononprismlab"
+#define MyAppPublisher "PrismaticLab"
 #define MyAppURL "https://github.com/phononprismlab/memo-bot"
 ; 🔴 所有路径都从**本 .iss 所在目录**推出去，不写死绝对路径 ——
 ;    这样仓库 clone 到任何地方都能编译（以前写死在工作区根，换台机器就废了）。
