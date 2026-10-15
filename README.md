@@ -88,6 +88,9 @@ python memo-launcher.py --gui     # 打开桌面窗口：配置中心 + 脑内�
 | `memo_gui.py` | 桌面窗口：配置中心 + 脑内抽屉 + 回收站（纯界面） |
 | `botctl.py` | 进程控制：启 / 停 / 重启 / 开机自启、`bot.pid` 判活 |
 | `single_lock.py` | OS 级命名互斥体，保证同时只有一个实例 |
+| `alerts.py` | 账号掉线告警：读 `bot.link` 链路心跳 + 只读探活判在线，走托盘气泡 / webhook 带外通知（`hub.py` 调它） |
+| `shortcut.py` | 任务栏图标：AUMID 常量唯一定义处 + 开机在开始菜单建带同一个 AUMID 的快捷方式（`hub.py` 调它） |
+| `pylnk3.py` | 写 Windows `.lnk` 的第三方纯 Python 模块（`shortcut.py` 用，随包分发） |
 
 **数据与配置**
 
@@ -255,7 +258,7 @@ python moyu.py 3                # 摸鱼库抽 3 条
 - **Bug / 功能建议**：[GitHub Issues](https://github.com/phononprismlab/memo-bot/issues)。写清重现步骤，再点一下「配置中心 → ⑩ 版本 → 导出诊断包」，把桌面生成的 zip 一起发来 —— 里面只有版本、运行环境、脱敏配置和最近一段日志，**不含**你的待办与密钥。
 - **人工帮助**：发邮件到 <prismaticlab@hotmail.com>。
 - **QQ 交流群**：**1129867238** —— 保姆级图文教程、安装包与常见问题答疑都在**群文件**里。
-- **仓库内另有**（面向普通用户，非开发文档）：[安装指南](安装指南.md) · [功能清单](功能清单.md)
+- **仓库内另有**（面向普通用户，非开发文档）：[安装指南](安装指南.md) · [功能清单](功能清单.md) · [更新日志](v0.3.2更新日志.md)
 
 ## License
 

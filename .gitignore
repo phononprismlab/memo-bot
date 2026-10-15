@@ -66,6 +66,12 @@ bot.out.log
 bot.out.log.*
 botpy.log
 *.log
+# 掉线告警（v0.3.2）：机器人写的链路心跳 + 管家写的告警状态。
+# 🔴 源码版 MEMO_DATA_DIR 没设 ⇒ data_path() 落到代码目录，这两个文件是
+#    **本机运行时产物**（装到用户机上落在 %LOCALAPPDATA%\memo-bot）。
+#    漏了这行会被 git 当成新文件跟踪，一提交就把本机状态带进仓库。
+bot.link
+alert.state
 # 真机验收探针（一次性的：假数据目录 + 临时脚本 + 截图，不进仓库）
 _probe/
 # brain-drawer.py 的生成物（按需要手动保留）

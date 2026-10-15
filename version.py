@@ -4,7 +4,7 @@
 打包脚本都用它。**改了版本号要同步改同目录的 `VERSION` 文件** —— 远端检测读的就是那个文件，
     `packaging/memo-bot.iss` 也是直接读它（所以安装包名字里的版本号不会跟代码脱节）。
 
-谁调用它：`memo_gui.py`（桌面版「⑩ 版本」页的版本号 + 「检查更新」按钮）、
+谁调用它：`memo_gui.py`（桌面版「版本与诊断」页的版本号 + 「检查更新」按钮）、
          `config_core.py`（把版本号塞进 `full_state()`）。
 
 🔴 远端地址走 jsdelivr，不走 raw.githubusercontent.com —— 后者在国内基本连不上（实测 curl exit 35）。
@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 REPO = "phononprismlab/memo-bot"
 RAW_URL = "https://cdn.jsdelivr.net/gh/{repo}@main/VERSION"
 # jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，HTTP 缓存 5 分钟，

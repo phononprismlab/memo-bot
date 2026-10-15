@@ -135,8 +135,12 @@ def _init_locked(con):
             created_at   TEXT,
             kind         TEXT DEFAULT 'memo',
             status       TEXT DEFAULT 'open',
+            prev_status  TEXT,
             note         TEXT,
-            processed_at TEXT
+            processed_at TEXT,
+            msg_idx      TEXT,
+            refers_to    TEXT,
+            quote_snapshot TEXT
         )"""
     )
     # 标签字典：有哪些标签、各是什么颜色。条目侧的标签名数组在 memos.tags 里。
@@ -155,6 +159,13 @@ def _init_locked(con):
     if "status" not in cols:
         con.execute("ALTER TABLE memos ADD COLUMN status TEXT DEFAULT 'open'")
         con.execute("UPDATE memos SET status='open' WHERE status IS NULL")
+    # ── 丢弃前的状态（v0.3.2 回收站「← 恢复」）────────────────────
+    # 干嘛的：丢弃不是删除 —— 记录还在表里，恢复时要回到**丢弃前那一刻**的状态
+    #         （已整理的思绪恢复后还是已整理，不是未整理）。只对
+    #         `status='dropped'` 的行有意义，其余行保持 NULL。
+    # 🔴 老库里已丢弃的行这一列是 NULL —— 恢复时兜底回 'open'（见 restore_items）。
+    if "prev_status" not in cols:
+        con.execute("ALTER TABLE memos ADD COLUMN prev_status TEXT")
     if "note" not in cols:
         con.execute("ALTER TABLE memos ADD COLUMN note TEXT")
     if "processed_at" not in cols:
@@ -170,13 +181,31 @@ def _init_locked(con):
         # 🔴 只存**路径**不存二进制 —— 库一直很轻，导出也干净。
         #    老行是 NULL，读的时候一律当空数组（见 _row_images）。
         con.execute("ALTER TABLE memos ADD COLUMN images TEXT")
+    # ── 引用消息（v0.3.2）─────────────────────────────────────────
+    # 干嘛的：QQ 里「引用一条 + 补一句」是最自然的说话方式，但机器人以前只看得到
+    #         补的那句 —— 主语丢了，事后翻出来不知道在说什么。这三列让引用能被
+    #         反查、能显示、能被跳转。详细口径见文件末尾「引用消息」一节。
+    if "msg_idx" not in cols:
+        # 这条记录对应的**平台消息索引**（= 事件里的消息 id）。别人引用它时，
+        # 靠这个反查「被引用的那条记录是哪一条」。老行 NULL = 反查不到，
+        # 退化成「只有平台给的那一层正文」（不报错）。
+        con.execute("ALTER TABLE memos ADD COLUMN msg_idx TEXT")
+    if "refers_to" not in cols:
+        # 引用来源的**记录 id**（不是消息 id）。只用于跳转和「源记录已更新」提示。
+        # 🔴 显示用的是 quote_snapshot，**不跟源记录变** —— 所以这一列坏了也不影响
+        #    引用块本身能不能显示。
+        con.execute("ALTER TABLE memos ADD COLUMN refers_to TEXT")
+    if "quote_snapshot" not in cols:
+        # 引用那一刻的文本快照。**卡片显示的就是它**。老行 NULL = 没引用。
+        con.execute("ALTER TABLE memos ADD COLUMN quote_snapshot TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_memos_msg_idx ON memos(msg_idx)")
     # 全新的库才塞示例（老库 fresh=False，一个字节都不动）
     if fresh and not os.environ.get("MEMO_NO_SEED"):
         _seed(con)
 
 
 def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_MEMO, tags=None,
-             images=None):
+             images=None, msg_idx=None, refers_to=None, quote_snapshot=None):
     memo_id = str(uuid4())
     created = datetime.now().isoformat(timespec="seconds")
     names = _clean_tags(tags)
@@ -188,19 +217,29 @@ def add_memo(group_id, group_name, sender_id, sender_name, content, kind=KIND_ME
         con.execute("BEGIN")
         con.execute(
             "INSERT INTO memos (id,group_id,group_name,sender_id,sender_name,"
-            "content,created_at,kind,tags,images) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "content,created_at,kind,tags,images,msg_idx,refers_to,quote_snapshot) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 memo_id, group_id, group_name, sender_id, sender_name, content,
                 created, kind,
                 json.dumps(names, ensure_ascii=False) if names else None,
                 json.dumps(pics, ensure_ascii=False) if pics else None,
+                _clean_opt(msg_idx), _clean_opt(refers_to), _clean_opt(quote_snapshot),
             ),
         )
         # 🔴 顺手把这些标签补进字典表 —— 否则打了个新标签，配置页的标签条里看不到
         if names:
             _tags_ensure(con, names)
     return {"id": memo_id, "content": content, "created_at": created, "kind": kind,
-            "tags": names, "images": pics}
+            "tags": names, "images": pics, "msg_idx": _clean_opt(msg_idx),
+            "refers_to": _clean_opt(refers_to),
+            "quote_snapshot": _clean_opt(quote_snapshot)}
+
+
+def _clean_opt(v):
+    """可空文本列的统一清洗：空串 / 纯空白 → None（别在库里留空串）。"""
+    s = str(v).strip() if v is not None else ""
+    return s or None
 
 
 # ── 图片：只存相对路径 ───────────────────────────────────────────
@@ -603,28 +642,156 @@ def find_idea(id_or_prefix):
     return _with_lists(dict(row)) if row else None
 
 
-def set_idea_status(ids, status, note=None):
-    """批量改灵感状态。ids 为完整 id 列表。返回实际改动条数。"""
+# ── 引用消息（v0.3.2）──────────────────────────────────────────────
+# 数据侧只做三件事：按平台消息索引反查记录（解析引用来源）、按 id 取一条
+# （跳转 / 判源变没变）、算「引用块现在该带什么标注」。
+# 解析平台事件、拼 `>` 引用块都在 bot.py —— 只有那一层看得见原始事件体。
+
+def find_by_msg_idx(msg_idx):
+    """按**平台消息索引**反查一条记录（别人引用它时用来确定引用来源）。
+
+    找不到返回 None —— 调用方按「退化成只有平台给的那一层正文」处理，
+    不报错、不阻断入库。
+    """
+    key = _clean_opt(msg_idx)
+    if not key:
+        return None
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM memos WHERE msg_idx=? ORDER BY created_at DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+    return _with_lists(dict(row)) if row else None
+
+
+def get_item(item_id):
+    """按 id 取一条记录（引用块跳转 / 判源变没变用）。
+
+    🔴 **不看 kind、也不看 status** —— 跳转要能摸到已丢弃的源（行还在库里）。
+    """
+    key = _clean_opt(item_id)
+    if not key:
+        return None
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM memos WHERE id=?", (key,)).fetchone()
+    return _with_lists(dict(row)) if row else None
+
+
+QUOTE_OK = ""                # 引用块照原样显示
+QUOTE_UPDATED = "updated"    # 源记录被改过 → 提示「源记录已更新」
+QUOTE_DELETED = "deleted"    # 源记录被删了 → 标注「引用的记录已删除」
+
+
+def quote_hint(item):
+    """引用块现在该带什么标注：QUOTE_OK / QUOTE_UPDATED / QUOTE_DELETED。
+
+    🔴 只判**源记录还在不在、正文还是不是当初那份**；引用块显示的文本一律取
+       `quote_snapshot`，**绝不回读源记录** —— 快照的语义就是不跟着变。
+    🔴 源被「丢弃」（dropped）**不算删** —— 行还在库里，随时能从回收站恢复。
+    """
+    if not item:
+        return QUOTE_OK
+    src_id = _clean_opt(item.get("refers_to"))
+    if not src_id:
+        return QUOTE_OK
+    src = get_item(src_id)
+    if src is None:
+        return QUOTE_DELETED
+    snap = item.get("quote_snapshot")
+    if snap and (src.get("content") or "") != snap:
+        return QUOTE_UPDATED
+    return QUOTE_OK
+
+
+def _apply_status(ids, status, kind, note=None):
+    """批量改状态（待办 / 灵感共用）。返回实际改动条数。
+
+    🔴 `kind` 过滤在 SQL 里 —— 传进来灵感 id 也不会被误改。
+    🔴 一个函数吃下「丢弃 / 恢复 / 普通改状态」三种走向：prev_status 的
+        读和写必须和 status 的写在**同一条 UPDATE** 里完成（按旧行取值），
+        拆成先 SELECT 再 UPDATE 会 race。
+
+    丢弃（目标 = dropped）：先把丢弃前的状态存进 prev_status。
+      🔴 **已经在 dropped 的不许覆盖 prev_status** —— 否则同一行连点两次
+         丢弃，第二次会把「恢复目标」写成 dropped，恢复就废了。
+    非丢弃（普通改状态，或从 dropped 转出来）：本来就在 dropped 的行按
+      `IFNULL(prev_status,'open')` 恢复、清空 prev_status；其余行照目标改。
+    """
     if not ids:
         return 0
     now = datetime.now().isoformat(timespec="seconds")
     con = sqlite3.connect(DB)
     n = 0
-    for i in ids:
-        if note is None:
-            cur = con.execute(
-                "UPDATE memos SET status=?, processed_at=? WHERE id=? AND kind=?",
-                (status, now, i, KIND_IDEA),
-            )
-        else:
-            cur = con.execute(
-                "UPDATE memos SET status=?, note=?, processed_at=? WHERE id=? AND kind=?",
-                (status, note, now, i, KIND_IDEA),
-            )
-        n += cur.rowcount
-    con.commit()
-    con.close()
+    try:
+        for i in ids:
+            if status == STATUS_DROPPED:
+                if note is None:
+                    cur = con.execute(
+                        "UPDATE memos SET prev_status = CASE"
+                        " WHEN IFNULL(status,'open')=? THEN prev_status"
+                        " ELSE IFNULL(status,'open') END,"
+                        " status=?, processed_at=? WHERE id=? AND kind=?",
+                        (STATUS_DROPPED, status, now, i, kind))
+                else:
+                    cur = con.execute(
+                        "UPDATE memos SET prev_status = CASE"
+                        " WHEN IFNULL(status,'open')=? THEN prev_status"
+                        " ELSE IFNULL(status,'open') END,"
+                        " status=?, note=?, processed_at=? WHERE id=? AND kind=?",
+                        (STATUS_DROPPED, status, note, now, i, kind))
+            else:
+                cur = con.execute(
+                    "UPDATE memos SET status = CASE"
+                    " WHEN IFNULL(status,'open')=? THEN IFNULL(prev_status,'open')"
+                    " ELSE ? END,"
+                    " prev_status = CASE"
+                    " WHEN IFNULL(status,'open')=? THEN NULL ELSE prev_status END,"
+                    " processed_at=? WHERE id=? AND kind=?",
+                    (STATUS_DROPPED, status, STATUS_DROPPED, now, i, kind))
+            n += cur.rowcount
+        con.commit()
+    finally:
+        con.close()
     return n
+
+
+def restore_items(ids):
+    """回收站的「← 恢复」：把已丢弃记录恢复成**丢弃前的状态**。
+
+    干嘛的：丢弃不是删除 —— 行还在表里，能从回收站捞回来。恢复到什么状态
+                逐行看自己的 `prev_status`（丢弃那一刻存下的）。
+    谁调用它：`memo_gui.BrainDrawerTab._restore`（回收站单行 / 批量选中共用）。
+
+    🔴 只动**当前状态是 dropped** 的行 —— 普通行传进来什么也不会发生，
+        不会把一条 open 的记录改来改去。
+    🔴 `prev_status` 是 NULL 的老行（丢的时候还没这一列）兜底回 'open'。
+    🔴 待办和灵感都能恢复：回收站里两类混着放，这里不按 kind 过滤。
+    返回实际恢复条数。
+    """
+    if not ids:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    con = sqlite3.connect(DB)
+    n = 0
+    try:
+        for i in ids:
+            cur = con.execute(
+                "UPDATE memos SET status=IFNULL(prev_status,'open'),"
+                " prev_status=NULL, processed_at=?"
+                " WHERE id=? AND IFNULL(status,'open')=?",
+                (now, i, STATUS_DROPPED))
+            n += cur.rowcount
+        con.commit()
+    finally:
+        con.close()
+    return n
+
+
+def set_idea_status(ids, status, note=None):
+    """批量改灵感状态。ids 为完整 id 列表。返回实际改动条数。"""
+    return _apply_status(ids, status, KIND_IDEA, note=note)
 
 
 # ── 待办：没完成 / 已完成 / 已丢弃 三态 ──────────────────────────
@@ -644,18 +811,7 @@ def set_memo_status(ids, status):
     """
     if not ids or status not in MEMO_STATUSES:
         return 0
-    now = datetime.now().isoformat(timespec="seconds")
-    con = sqlite3.connect(DB)
-    n = 0
-    for i in ids:
-        cur = con.execute(
-            "UPDATE memos SET status=?, processed_at=? WHERE id=? AND kind=?",
-            (status, now, i, KIND_MEMO),
-        )
-        n += cur.rowcount
-    con.commit()
-    con.close()
-    return n
+    return _apply_status(ids, status, KIND_MEMO)
 
 
 def set_memo_done(ids, done=True):

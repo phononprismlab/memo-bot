@@ -24,6 +24,20 @@
                      之后只发启动播报、待办 / 灵感回执可配
   [17] moyu.library   摸鱼库可配置：内置只读种子 + 数据目录用户库、保存 / 校验 / 恢复默认、
                      读坏回退内置、改库清空「抽过哪些」
+ [28] 引用消息       引用事件解析（botpy 不给这俩字段）、合并成 `>` 引用块、只引用不写正文
+                     也存、引用图片有回执、分叉 / 多层、快照不跟源变、删源仍显示原文
+ [29] 掉线告警       链路心跳判据（按真实心跳间隔算 + 宽限期）、首次/冷却/恢复状态机、
+                     不误报（进程刚起 / 接口改名 / 网络抖动 / 没配凭据）、托盘气泡与
+                     webhook 带外通知、webhook 挂了不影响告警、探活只读不产生 QQ 消息
+ [30] 保存更改不再丢  脏判据（改了又改回来不算脏）、按分区暂存（挂 App，换肤不丢）、
+                     页头共用保存按钮（没改灰着）、离开/关窗三选拦截、导航叹号、
+                     保存失败保留输入
+ [31] 任务栏图标      AUMID 常量三处（代码 / hub / 安装脚本）一字不差、管家开机
+                     幂等建开始菜单快捷方式、.lnk 读写回环（属性 5 = AUMID）、
+                     打包不漏文件
+ [32] 回收站恢复      prev_status 记丢弃前状态、二次丢弃不覆盖、恢复各回各的
+                     （done→done / decided→decided）、普通行无操作、老库补列
+                     兜底 open、恢复不打通知 / 不二次确认
 
 🔴 所有涉及落盘的用例都改写到临时目录，**不碰真实的 memos.db / moyu-recent.json / .env**。
 """
@@ -442,8 +456,8 @@ def test_bot():
           "_browse_into(self, txt)" in _gui_src
           and "txt.insert(\"end\"" in _gui_src)
 
-    check("help_text 指向配置中心「④ 发文件」",
-          "④ 发文件" in bot.help_text())
+    check("help_text 指向配置中心「发文件」",
+          "发文件" in bot.help_text() and "④" not in bot.help_text())
 
     check("help_text 含内置指令", "待办" in bot.help_text())
     check("help_text 追加了扩展帮助行",
@@ -569,7 +583,7 @@ def test_bot():
     check("bot.py 注册了 on_c2c_message_create", "on_c2c_message_create" in bot_src)
     check("bot.py 私聊走 SCOPE_C2C", "scope=SCOPE_C2C" in bot_src)
     check("self_test 落盘走临时库（不污染真实 memos.db）",
-          "selftest.db" in bot_src and "_store.DB = orig_db" in bot_src)
+          "selftest.db" in bot_src and "store.DB = orig_db" in bot_src)
 
     # 私聊落库字段（handle_event 是模块级函数，可直接端到端验证）
     import store as _store
@@ -1299,6 +1313,398 @@ def test_settings():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ── 引用消息合并（v0.3.2）────────────────────────────────────────
+def test_quote_merge():
+    print("\n[28] 引用消息合并（解析 / 合并 / 快照 / 分叉 / 多层 / 回执）")
+    import bot
+    import store
+
+    class Msg:
+        def __init__(self, content, mid, gid="G1", sid="M1"):
+            self.content, self.id, self.group_openid = content, mid, gid
+            self.author = SimpleNamespace(member_openid=sid, user_openid=sid)
+            self.attachments = []
+            self.replies = []
+
+        async def reply(self, content=None, msg_seq=1):
+            self.replies.append(content)
+
+    class Client:
+        async def send_file_to_chat(self, *a, **k):
+            raise AssertionError("本用例不应走到发文件分支")
+
+    tmp = tempfile.mkdtemp(prefix="quote_test_")
+    _env = {k: os.environ.get(k)
+            for k in ("MEMO_IGNORE", "MEMO_IGNORE_FILE", "MEMO_SETTINGS_FILE")}
+    _orig_db, _orig_last = store.DB, bot.LAST_MSG_FILE
+    os.environ["MEMO_IGNORE"] = ""
+    os.environ["MEMO_IGNORE_FILE"] = os.path.join(tmp, "ignore.json")
+    os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
+    store.DB = os.path.join(tmp, "t.db")
+    bot.LAST_MSG_FILE = os.path.join(tmp, "last.json")
+    bot._RAW_EVENTS.clear()
+    try:
+        store.init()
+        cli = Client()
+
+        def run(msg, mentioned=True, scope=bot.SCOPE_GROUP, quote=None):
+            if quote is not None:
+                bot._remember_raw(msg, quote)
+            asyncio.run(bot.route_message(cli, msg, mentioned, scope))
+
+        def q(text, idx, author="dominik"):
+            return {"message_type": 103,
+                    "msg_elements": [{"content": text, "msg_idx": idx,
+                                      "author": author}]}
+
+        # 1) 引用字段 botpy 不提供 → 只能从原始事件体里取（没接管的返回 None）
+        plain = Msg("普通消息", "M0")
+        bot._remember_raw(plain, {"message_type": 0, "msg_elements": []})
+        check("非引用消息 parse_quote → None", bot.parse_quote(plain) is None)
+        bare = Msg("没接管过", "M0b")
+        check("拿不到原始事件体时 parse_quote → None", bot.parse_quote(bare) is None)
+
+        # 2) 普通消息照旧落库，并记下平台消息索引
+        a = Msg("下周去杭州", "MID-A")
+        run(a)
+        ia = store.find_by_msg_idx("MID-A")
+        check("普通消息：正文不变 + 记下 msg_idx",
+              ia and ia["content"] == "下周去杭州" and ia["msg_idx"] == "MID-A")
+        check("普通消息：没有引用列", ia["refers_to"] is None
+              and ia["quote_snapshot"] is None)
+
+        # 3) 私聊引用文本 + 补正文 → 合并成一条（`>` 前缀）
+        b = Msg("改成下个月", "MID-B")
+        run(b, scope=bot.SCOPE_C2C, quote=q("下周去杭州", "MID-A"))
+        ib = store.find_by_msg_idx("MID-B")
+        check("私聊引用：合并成 `> 被引用` + 正文",
+              ib["content"] == "> 下周去杭州\n改成下个月", repr(ib["content"]))
+        check("私聊引用：快照 = 被引用正文", ib["quote_snapshot"] == "下周去杭州")
+        check("私聊引用：refers_to 指回源记录 id", ib["refers_to"] == ia["id"])
+
+        # 4) 群 @ 引用 → 同样合并（两条路径都要接）
+        g = Msg("订票", "MID-G")
+        run(g, quote=q("下周去杭州", "MID-A"))
+        ig = store.find_by_msg_idx("MID-G")
+        check("群 @ 引用：合并结果一致",
+              ig["content"] == "> 下周去杭州\n订票", repr(ig["content"]))
+
+        # 5) 分叉：b、c 同时引用 a → 各显示各的，互不影响
+        check("分叉：两条互不干扰",
+              ig["quote_snapshot"] == "下周去杭州" and ib["quote_snapshot"] == "下周去杭州"
+              and ig["id"] != ib["id"])
+
+        # 6) 多层：d 引用 b → 展开出 b 的完整内容（含 b 自己的引用块）
+        d = Msg("记得带伞", "MID-D")
+        run(d, quote=q("改成下个月", "MID-B"))
+        idd = store.find_by_msg_idx("MID-D")
+        check("多层：d 展开出两层",
+              idd["content"] == "> > 下周去杭州\n> 改成下个月\n记得带伞",
+              repr(idd["content"]))
+        check("多层：d 的快照 = b 的完整正文", idd["quote_snapshot"] == ib["content"])
+
+        # 7) 只引用、不写正文 → 也存（不再静默丢弃）
+        e = Msg("", "MID-E")
+        run(e, quote=q("下周去杭州", "MID-A"))
+        ie = store.find_by_msg_idx("MID-E")
+        check("只引用不写正文：照样存下来",
+              ie and ie["content"] == "> 下周去杭州", repr(ie and ie["content"]))
+
+        # 8) 引用图片 / 卡片 → 明确回执，不静默
+        f = Msg("", "MID-F")
+        run(f, quote=q("[图片]", "MID-Z"))
+        check("引用图片：不落库（读不出内容）", store.find_by_msg_idx("MID-F") is None)
+        check("引用图片：有明确回执", f.replies and "读不了" in f.replies[0],
+              f"got={f.replies}")
+        f2 = Msg("这张图不错", "MID-F2")
+        run(f2, quote=q("[卡片消息]", "MID-Z"))
+        check("引用卡片 + 有正文：正文照存、不带走引用块",
+              (store.find_by_msg_idx("MID-F2") or {}).get("content") == "这张图不错")
+
+        # 9) msg_idx 认不出 / 过期 → 退化成一层，不报错
+        h = Msg("补一句", "MID-H")
+        run(h, quote=q("找不到来源的正文", "MID-NOPE"))
+        ih = store.find_by_msg_idx("MID-H")
+        check("来源查不到：退化成一层正文，照常存",
+              ih["content"] == "> 找不到来源的正文\n补一句" and ih["refers_to"] is None,
+              repr(ih["content"]))
+
+        # 10) 引用块**不参与** #标签 切分（它是快照，原样保留）；
+        #     用户自己敲的那段里的 #标签 照常生效
+        k = Msg("补一句 #备注", "MID-K")
+        run(k, quote=q("参考配色 #设计", "MID-NOPE2"))
+        ik = store.find_by_msg_idx("MID-K")
+        check("引用块原样保留 + 正文里的 #标签 照常生效",
+              ik["tags"] == ["备注"] and "#设计" in ik["content"]
+              and "#备注" not in ik["content"],
+              f"tags={ik['tags']} content={ik['content']!r}")
+
+        # 11) 快照不跟源变 / 源已更新 / 源已删除
+        check("快照：源没变时不给提示",
+              store.quote_hint(store.get_item(ig["id"])) == store.QUOTE_OK)
+        store.update_content(ia["id"], "下周去上海")
+        check("快照：改掉源记录，引用块不变",
+              store.get_item(ib["id"])["content"] == "> 下周去杭州\n改成下个月")
+        check("快照：改掉源记录 → 提示「源已更新」",
+              store.quote_hint(store.get_item(ib["id"])) == store.QUOTE_UPDATED)
+        store.delete_items([ia["id"]])
+        check("删源：标注「引用的记录已删除」",
+              store.quote_hint(store.get_item(ib["id"])) == store.QUOTE_DELETED)
+        check("删源：仍显示当时引用的原文",
+              store.get_item(ib["id"])["content"] == "> 下周去杭州\n改成下个月")
+
+        # 12) 层数上限 + 防环兜底（超过 3 层折叠成「…还有 N 层」）
+        merged, block = bot.compose_quote("> > > 三层\n> > 二层\n> 一层", "尾巴")
+        check("引用块最多展开 3 层，更深折叠成「…还有 N 层」",
+              "还有 1 层" in block and "三层" not in block and merged.endswith("尾巴"),
+              repr(block))
+
+        # 13) 老库迁移：三列补齐、不重建库、存量行当没引用
+        con = sqlite3.connect(store.DB)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(memos)")]
+        con.close()
+        check("老库迁移：msg_idx / refers_to / quote_snapshot 三列补齐",
+              all(c in cols for c in ("msg_idx", "refers_to", "quote_snapshot")))
+        check("存量行（没引用）不会被算成「源已更新」",
+              store.quote_hint({"refers_to": None}) == store.QUOTE_OK)
+
+        # 14) 桌面端：条目结构必须**带着引用两列走**，而且只能有**一处**转换点
+        #     🔴 气泡卡 / 浮层上的「源记录已更新」是靠 `quote_hint(it)` 判的，而
+        #        `it` 由库行转来。以前 `_collect` 与 `_open_item_by_id` 各抄一份
+        #        键表、两处都漏了引用两列 ⇒ 提示永远不出现（用户 2026-10-15 报的）。
+        #        现在统一走 `_item_from_row`，所以这里锁的是「唯一转换点」这件事。
+        _g = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+        _ifr = _g.split("def _item_from_row(r):", 1)
+        _ifr_body = _ifr[1].split("\n    def ", 1)[0] if len(_ifr) > 1 else ""
+        check("🖥 🔴 条目结构有唯一转换点 _item_from_row，且透出引用两列",
+              '"refers_to": r.get("refers_to")' in _ifr_body
+              and '"quote_snapshot": r.get("quote_snapshot")' in _ifr_body)
+        _collect = _g.split("def _collect(self, rows, *, gate_show):", 1)
+        _collect_body = (_collect[1].split("\n    def ", 1)[0]
+                         if len(_collect) > 1 else "")
+        check("🖥 🔴 _collect 走唯一转换点（不再手抄键表）",
+              "self._item_from_row(r)" in _collect_body
+              and '"refers_to"' not in _collect_body)
+        _obid = _g.split("def _open_item_by_id(self, item_id):", 1)
+        _obid_body = _obid[1].split("\n    def ", 1)[0] if len(_obid) > 1 else ""
+        check("🖥 🔴 跳转浮层也走唯一转换点（源记录自己也引用时提示照常）",
+              "self._open_modal(self._item_from_row(row)" in _obid_body)
+        check("🖥 气泡卡按 quote_hint 决定是否显示提示",
+              "hint = _store.quote_hint(it)" in _g)
+        check("🖥 🔴 跳转绑定必须 return \"break\"（否则冒泡又被换回本条）",
+              re.search(r'self\._open_item_by_id\(_id\)\s*\n\s*return "break"', _g)
+              is not None)
+    finally:
+        bot._RAW_EVENTS.clear()
+        store.DB, bot.LAST_MSG_FILE = _orig_db, _orig_last
+        for k, v in _env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_account_alert():
+    """[29] 账号掉线告警（v0.3.2）。
+
+    覆盖四件事：**判据**（链路心跳多旧算掉线）、**状态机**（首次/冷却/恢复）、
+    **绝不误报**（进程刚起 / 接口改名 / 凭据没配都不算）、**带外**（托盘 + webhook，
+    且 webhook 挂了不影响告警）。
+    """
+    print("\n[29] 账号掉线告警（链路心跳 / 冷却 / 恢复 / 不误报 / 带外通知）")
+    import alerts
+    import bot
+    import settings
+
+    tmp = tempfile.mkdtemp(prefix="alert_test_")
+    _env = {k: os.environ.get(k) for k in ("MEMO_SETTINGS_FILE",)}
+    _orig_state = alerts.STATE_FILE
+    _orig_link = alerts.LINK_FILE
+    try:
+        os.environ["MEMO_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
+        # alerts 的路径在 import 时就定死了 → 这里显式改（单测跑在自己的临时目录里）
+        alerts.STATE_FILE = os.path.join(tmp, "alert.state")
+        alerts.LINK_FILE = os.path.join(tmp, "bot.link")
+        # bot.link 的路径由 bot 在 import 时从 alerts 拿 → 跟着一起改
+        bot.LINK_FILE = alerts.LINK_FILE
+
+        t0 = 1_700_000_000.0
+        OLD = t0 - 3600            # 进程一小时前起的（远在宽限期之外）
+
+        def link(**kw):
+            base = {"pid": 4242, "started_at": OLD, "ready_at": OLD,
+                    "ack_at": t0, "hb_interval": 30, "events": 3}
+            base.update(kw)
+            return base
+
+        class _Icon:                 # 记托盘气泡
+            def __init__(self):
+                self.notes = []
+
+            def notify(self, text, title):
+                self.notes.append((title, text))
+
+        # ── 1) 链路判据 ────────────────────────────────────────
+        st, _ = alerts.link_state(link(), t0)
+        check("链路健康 → ok", st == alerts.STATE_OK, st)
+        st, r = alerts.link_state(link(ack_at=t0 - 1000), t0)
+        check("1010 秒没收到心跳回执 → 掉线", st == alerts.STATE_OFFLINE, st)
+        st, _ = alerts.link_state(link(hb_interval=60, ack_at=t0 - 170), t0)
+        check("间隔 60s、只过了 170s → 还行（阈值按真实间隔算）",
+              st == alerts.STATE_OK, st)
+        st, _ = alerts.link_state(link(hb_interval=60, ack_at=t0 - 181), t0)
+        check("间隔 60s、过了 181s → 掉线", st == alerts.STATE_OFFLINE, st)
+        st, _ = alerts.link_state(link(ack_at=None), t0)
+        check("从没收到 ACK 但收到过消息 → 不算掉线", st == alerts.STATE_OK, st)
+        st, _ = alerts.link_state(link(ack_at=None, events=0), t0)
+        check("一个 ACK 都没有、一条消息也没有 → 掉线", st == alerts.STATE_OFFLINE, st)
+        st, _ = alerts.link_state({"pid": 1, "started_at": t0 - 5}, t0)
+        check("进程刚起 5 秒 → 宽限期内，不报警", st == alerts.STATE_OK, st)
+        st, _ = alerts.link_state(None, t0)
+        check("心跳文件都没有 → 掉线", st == alerts.STATE_OFFLINE, st)
+        st, r = alerts.link_state({"pid": 1, "started_at": 999}, t0)
+        check("心跳里没有启动时间 → 掉线", st == alerts.STATE_OFFLINE, st)
+        check("进程不在 → nobot（交给管家的进程看门狗，不重复告警）",
+              alerts.classify(now=t0, bot_alive=False,
+                              link=link())[0] == alerts.STATE_NOBOT)
+
+        # ── 2) 阈值必须按真实心跳间隔算，不能写死一个常数 ───────────
+        _src = open(os.path.join(ROOT, "alerts.py"), encoding="utf-8").read()
+        check("阈值用 hb_interval × 因子算，不写死",
+              "hb_interval" in _src and "LINK_STALE_FACTOR" in _src
+              and "max(hb * LINK_STALE_FACTOR, LINK_STALE_MIN)" in _src)
+        check("刚启动有宽限期（一上来就报警是噪声）",
+              "LINK_GRACE_SEC" in _src and "age < LINK_GRACE_SEC" in _src)
+
+        # ── 2b) webhook 的帮助文字要说清「这一行是干嘛的」（用户 2026-10-16）──
+        #     只写「填一个地址」用户不知道它解决什么问题：掉线时 QQ 通道本身
+        #     就是断的，托盘气泡又只有人坐在机器前才看得见。
+        _wh = settings.KEYS["alert_webhook"]["help"]
+        check("🔴 webhook 的帮助文字讲清了用途（不是「填一个地址」了事）",
+              "人不在" in _wh and "托盘气泡" in _wh and "留空" in _wh)
+
+        # ── 3) 状态机：首次 → 冷却静默 → 过冷却再提醒 → 恢复 → 稳定 ──
+        settings.set_value("alert_enabled", "开")
+        settings.set_value("alert_webhook", "")          # 本组不测 webhook 真发
+        icon = _Icon()
+        sent = []
+        alerts.notify_webhook = lambda url, payload, timeout=10: (
+            sent.append(payload) or (True, "ok"))
+
+        def step(off, alive=True, ln=None, probe=None, appid=None, secret=None):
+            return alerts.run_check(
+                now=t0 + off, bot_alive=alive,
+                link=(ln if ln is not None else link(ack_at=t0 + off)),
+                icon=icon, probe=probe, appid=appid, secret=secret,
+            )
+
+        r = step(0, ln=link(ack_at=t0 - 1000))
+        check("首次掉线 → 立刻告警（不受冷却限制）",
+              r["notified"] == "offline" and len(icon.notes) == 1, r)
+        check("告警走托盘气泡（带外）", "掉线" in icon.notes[0][0], icon.notes[0])
+        check("告警内容说了「进程还在」", "进程还在跑" in icon.notes[0][1],
+              icon.notes[0][1])
+        r = step(60, ln=link(ack_at=t0 - 1000))
+        check("同一场掉线、没过冷却 → 静默", r["notified"] is None)
+        r = step(31 * 60, ln=link(ack_at=t0 - 1000))
+        check("过 31 分钟 → 再提醒一次（默认冷却 30 分钟）",
+              r["notified"] == "offline" and len(icon.notes) == 2)
+        r = step(40 * 60)
+        check("恢复 → 立刻通知（好消息不受冷却限制）",
+              r["notified"] == "recovered" and "恢复" in icon.notes[-1][0])
+        r = step(45 * 60)
+        check("稳定运行 → 不发", r["notified"] is None)
+
+        # ── 4) 开关关掉 ⇒ 完全不判、不告警 ──────────────────────
+        settings.set_value("alert_enabled", "关")
+        before = len(icon.notes)
+        r = alerts.run_check(now=t0 + 46 * 60, bot_alive=True,
+                             link=link(ack_at=t0 + 46 * 60 - 1000), icon=icon)
+        check("开关关 ⇒ 一轮都不跑", r["enabled"] is False and r["state"] == "unknown")
+        check("开关关 ⇒ 不发通知", len(icon.notes) == before)
+        settings.set_value("alert_enabled", "开")
+
+        # ── 5) 绝不误报 ───────────────────────────────────────
+        n = len(icon.notes)
+        r = step(47 * 60, probe=lambda a, s, sb: ("unknown", "HTTP 404: not found"))
+        check("接口改名（4xx 未知）⇒ 不算掉线", r["notified"] is None)
+        r = step(48 * 60, probe=lambda a, s, sb: ("unknown", "timed out"))
+        check("网络抖动 ⇒ 不算掉线", r["notified"] is None)
+        r = step(49 * 60)
+        check("没配凭据 ⇒ 只信链路，不多问", r["cred_state"] == "unknown")
+        r = step(50 * 60, probe=lambda a, s, sb: ("bad", "HTTP 401"),
+                 appid="a", secret="s")
+        check("凭据明确失效（401）⇒ 补一脚告警", r["notified"] == "offline")
+        r = step(51 * 60, probe=lambda a, s, sb: ("ok", "摸鱼bot"),
+                 appid="a", secret="s")
+        check("凭据恢复 ⇒ 通知恢复了", r["notified"] == "recovered")
+        r = step(52 * 60, alive=False)
+        check("进程不在 ⇒ 不告警（不重复人家管家的活）", r["notified"] is None
+              and r["state"] == alerts.STATE_NOBOT)
+
+        # ── 6) webhook 挂了只写日志，不影响托盘告警 ─────────────
+        settings.set_value("alert_webhook", "http://127.0.0.1:9/x")
+        alerts.notify_webhook = lambda url, payload, timeout=10: (
+            (False, "Connection refused") if True else None)
+        n = len(icon.notes)
+        r = alerts.run_check(now=t0 + 100 * 60, bot_alive=True,
+                             link=link(ack_at=t0 + 100 * 60 - 1000), icon=icon)
+        check("webhook 挂了 ⇒ 托盘气泡照发、不抛异常",
+              r["notified"] == "offline" and len(icon.notes) == n + 1)
+        settings.set_value("alert_webhook", "")
+
+        # ── 7) 重启管家会清状态（否则会弹莫名其妙的「恢复了」）────
+        alerts.save_state({"state": alerts.STATE_OFFLINE})
+        alerts.reset_state()
+        check("管家重启 ⇒ 告警状态重置为 ok",
+              alerts.load_state()["state"] == alerts.STATE_OK)
+        alerts.reset_state()          # 再调一次也不该炸
+
+        # ── 8) 探活必须只读：不碰任何发送接口 ──────────────────
+        sf_src = open(os.path.join(ROOT, "send_file.py"), encoding="utf-8").read()
+        check("只读 GET 单独一个函数（和带重试的 POST 那条路分开）",
+              "def _get_json(" in sf_src and 'method="GET"' in sf_src)
+        _pb = sf_src.split("def probe_account(", 1)[1].split("\ndef ", 1)[0]
+        check("🔴 probe_account 只打 /users/@me，不碰任何 /v2/ 发送路径",
+              "/users/@me" in _pb and "/v2/" not in _pb, _pb[:200])
+        check("🔴 探活取 token 不重试（慢就是慢，别把看门狗卡住）",
+              "retries=0" in _pb)
+        check("发送类函数一个没少（探活是新增，没替换掉任何东西）",
+              all(name in sf_src for name in
+                  ("def send_text_message", "def send_images", "def send_file")))
+
+        # ── 9) hub 侧接线：探活跑在进程判活之后，且在开关后面 ───
+        hub_src = open(os.path.join(ROOT, "hub.py"), encoding="utf-8").read()
+        _loop = hub_src.split("while not _exit_requested.is_set():", 1)[1]
+        _loop = _loop.split("except KeyboardInterrupt", 1)[0]
+        check("🔴 探活排在进程判活之后（进程没了就不打 QQ 接口）",
+              _loop.index("_set_bot_state(True)") < _loop.index("_probe_account_once"))
+        check("探活间隔可配（读 settings）",
+              'settings.get("alert_probe_sec")' in hub_src)
+        check("探活异常不影响机器人（自己兜住）",
+              "掉线探活自己出错了" in hub_src)
+        check("托盘图标三态色（跑着/告警/停了）",
+              hub_src.count('_ICON_COLORS') >= 1
+              and '"alert": (217, 119, 6, 255)' in hub_src)
+        check("进程没跑时图标一律灰（盖住没清干净的告警色）",
+              'key = "running" if running else "stopped"' in hub_src)
+        check("托盘菜单有掉线提示行且只在掉线时显示",
+              "visible=lambda item: bool(s[\"alert\"])" in hub_src)
+        check("启动时重置告警状态（否则开机弹莫名其妙的「恢复了」）",
+              "alerts.reset_state()" in hub_src)
+        check("机器人停了要清告警图标", '_set_alert_state(False)' in hub_src)
+    finally:
+        alerts.STATE_FILE, alerts.LINK_FILE = _orig_state, _orig_link
+        bot.LINK_FILE = _orig_link
+        for k, v in _env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── [11] config_core（配置后端）─────────────────────────────────
 def _load_configcore():
     spec = importlib.util.spec_from_file_location(
@@ -1413,11 +1819,14 @@ def test_config_web():
         check("AppSecret 不回显（value 为空）", sec["value"] == "" and sec["set"] is True)
         check("字段带 target（env / settings 分流）",
               {f["target"] for f in fields} == {"env", "settings"})
-        check("settings 的十个键都在字段表里",
+        check("settings 的十四个键都在字段表里",
               {f["key"] for f in fields if f["target"] == "settings"}
               == {"startup_msg", "intro_msg", "memo_ack", "idea_ack",
                   "bubbles_show", "boomerang_days", "boomerang_scope",
-                  "image_collect", "image_alert_gb", "ui_font_scale"})
+                  "image_collect", "image_alert_gb", "ui_font_scale",
+                  "alert_enabled", "alert_probe_sec",
+                  "alert_cooldown_min", "alert_webhook"},
+              str(sorted(f["key"] for f in fields if f["target"] == "settings")))
         # 5b) 收图入口暂隐（用户要求）：两个键仍在字段表（setDirty 靠它们认键），
         #     但全部打 hidden —— 桌面端不再渲染收图区块；自绘函数与事件接线代码保留，
         #     入口恢复只差一行拼接。
@@ -1431,24 +1840,44 @@ def test_config_web():
               "self._render_self_drawn(f)" not in _g)
         check("桌面版收图自绘实现代码保留",
               "def _render_self_drawn" in _g)
+        # 5c) 掉线告警四个键（v0.3.2）：归「运行」组下的**独立一页**「掉线告警」。
+        #    以前（v0.3.2 第二节做完时）整体打 hidden 占位，等第三节把专属页建好——
+        #     现在页有了（`_render_alerts`），hidden 全部放开。
+        _alert_hid = {f["key"]: f for f in fields
+                     if f["key"] in ("alert_enabled", "alert_probe_sec",
+                                     "alert_cooldown_min", "alert_webhook")}
+        check("掉线告警四个键都在字段表里（保存靠它们认键）",
+              len(_alert_hid) == 4, str(sorted(_alert_hid)))
+        check("掉线告警四个键归 alerts 分区、且不再打 hidden",
+              all(f["group"] == "alerts" and not f.get("hidden")
+                  for f in _alert_hid.values()),
+              str({k: (f["group"], f.get("hidden")) for k, f in _alert_hid.items()}))
+        check("🖥 桌面版有独立的「掉线告警」页（渲染 + 路由）",
+              "def _render_alerts" in _g
+              and 'elif key == "alerts":\n                self._render_alerts()' in _g)
+        check("🖥 掉线告警页走通用字段 + 页头保存按钮（不另造一套表单）",
+              '_render_fields("alerts")' in _g
+              and '"alerts": ("保存更改", "fields")' in _g)
         # 「运行方式」「摸鱼库」两块不走字段表（前者是自绘面板、后者是整块 textarea），
-        # 所以字段表只覆盖 6 个分区。
-        check("字段表覆盖 6 个「有字段」的分区",
+        # 所以字段表只覆盖这些分区。
+        check("字段表覆盖 8 个「有字段」的分区",
               {f["group"] for f in fields}
-              == {"bot", "behavior", "msg", "files", "bubbles", "boomerang"},
+              == {"bot", "behavior", "msg", "files", "bubbles", "boomerang",
+                  "look", "alerts"},
               str(sorted({f["group"] for f in fields})))
-        check("GROUPS 共 10 个分区，第 10 个是版本（item19 拆出的独立页签）",
-              len(cw.GROUPS) == 10 and cw.GROUPS[-1][0] == "version",
+        check("GROUPS 共 12 个分区，最后一个是版本与诊断",
+              len(cw.GROUPS) == 12 and cw.GROUPS[-1][0] == "version",
               str([k for k, _, _ in cw.GROUPS]))
-        check("页签顺序 = GROUPS 顺序（版本在最后）",
+        check("页签顺序 = GROUPS 顺序（按导航分组重排过）",
               [g["key"] for g in [{"key": k} for k, _, _ in cw.GROUPS]]
-              == ["bot", "behavior", "msg", "files", "bubbles", "boomerang",
-                  "runtime", "moyu", "ext", "version"])
+              == ["bot", "behavior", "msg", "files", "ext", "moyu",
+                  "bubbles", "boomerang", "look", "runtime", "alerts", "version"])
 
         # 5b) 「界面字号」：桌面版和后端读的是**同一个设置键**，口径必须一致。
         fs = [f for f in fields if f["key"] == "ui_font_scale"][0]
-        check("界面字号归在「⑤ 脑内抽屉」",
-              fs["group"] == "bubbles" and fs["kind"] == "int")
+        check("🔴 界面字号归「外观」（v0.3.2 结构归位：它改整个桌面端，"
+              "跟抽屉里放哪几类无关）",
+              fs["group"] == "look" and fs["kind"] == "int")
         check("界面字号上下限透给界面（桌面 Spinbox 用）",
               fs["min"] == 80 and fs["max"] == 200)
         check("界面字号默认值 > 100（用户说字太小，默认就该大一档）",
@@ -1468,16 +1897,31 @@ def test_config_web():
         for _k in ("data_dir", "memos_db", "env", "settings"):
             check(f"paths 暴露 {_k}", bool(_st["paths"].get(_k)), str(_st["paths"].get(_k)))
 
-        # 8) 版本独立页签（item19）：从「⑦ 运行方式」拆出 —— 桌面端对齐
-        check("GROUPS 里有 version 分区（⑩ 版本）",
+        # 8) 版本独立页签（item19）：从「运行方式」拆出 —— 桌面端对齐。
+        #    v0.3.2 改名「版本与诊断」，并把依赖自检也收进这一页。
+        check("GROUPS 里有 version 分区（版本与诊断）",
               any(k == "version" for k, _t, _d in cw.GROUPS))
+        check("版本分区标题叫「版本与诊断」（诊断相关都在这一页）",
+              [t for k, t, _d in cw.GROUPS if k == "version"] == ["版本与诊断"])
+        check("🔴 标题里不写圈号（加页 / 插页不用重排编号）",
+              not any(t and t[0] in "①②③④⑤⑥⑦⑧⑨⑩" for _k, t, _d in cw.GROUPS),
+              str([t for _k, t, _d in cw.GROUPS]))
         check("桌面版有 _render_version（独立版本页签）",
               "def _render_version" in _g)
         check("桌面版 show_section 路由 version 到 _render_version",
-              'elif key == "version":\n            self._render_version()' in _g)
-        _rtd = _g.split("def _render_runtime", 1)[1]\
-                  .split("def _render_version", 1)[0]
-        check("桌面运行方式页已不含版本块（已拆出）", "版本" not in _rtd)
+              'elif key == "version":\n                self._render_version()' in _g)
+        # 🔴 只看 `_render_runtime` **自己**的函数体（到下一个 `def` 为止）——
+        #    用「到 _render_version 为止」当边界会把中间的 `_dep_box` 算进来，
+        #    而它文档串里为了说明「从运行方式搬来的」必然带「版本」两个字。
+        _rtd = _g.split("def _render_runtime", 1)[1].split(
+            "\n    def ", 1)[0]
+        check("桌面运行方式页已不含版本块、也不含依赖自检（都搬走了）",
+              "版本" not in _rtd and "依赖自检" not in _rtd, _rtd[:200])
+        check("🔴 依赖自检搬进「版本与诊断」页（诊断只此一处）",
+              "self._dep_box(self.scroll)" in _g)
+        check("依赖自检抽成了共用函数（不是复制两份）",
+              "def _dep_box(self, parent)" in _g
+              and _g.count('text="依赖自检"') == 1)
 
         # 8b) 一键安装缺失依赖（item17）：桌面端接了同一套
         check("桌面配置中心也接了一键安装",
@@ -1527,6 +1971,31 @@ def test_config_web():
         example = open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
         missing = [k for k in cw.ENV_SPEC if k not in example]
         check(".env.example 覆盖全部可配置键", not missing, f"缺={missing}")
+
+        # ── 8d) 配置中心结构归位（v0.3.2）：导航分组 + 去编号 ──────────
+        _st = cw.full_state()
+        _nav = _st["nav_groups"]
+        _nav_keys = [k for n in _nav for k in n["keys"]]
+        check("🔴 导航分组覆盖全部分区、一格不漏（漏了那页就点不到）",
+              sorted(_nav_keys) == sorted(k for k, _t, _d in cw.GROUPS),
+              f"nav={sorted(_nav_keys)} groups={sorted(k for k, _t, _d in cw.GROUPS)}")
+        check("🔴 导航分组顺序 = GROUPS 顺序（分组即分区顺序，不另排一套）",
+              _nav_keys == [k for k, _t, _d in cw.GROUPS])
+        check("导航分五组：连接 / 消息 / 内容 / 界面 / 运行（「群内能力」已并入消息）",
+              [n["name"] for n in _nav]
+              == ["连接", "消息", "内容", "界面", "运行"],
+              str([n["name"] for n in _nav]))
+        check("🔴 发文件 / 自定义指令 / 摸鱼库都归「消息」组（不再单独开一组）",
+              _nav[[n["name"] for n in _nav].index("消息")]["keys"]
+              == ["behavior", "msg", "files", "ext", "moyu"])
+        check("🔴 「运行方式」排在「掉线告警」前面",
+              _nav[[n["name"] for n in _nav].index("运行")]["keys"]
+              == ["runtime", "alerts", "version"])
+        check("🔴 界面自成一组（外观：颜色 + 字号，以前一个在导航底、"
+              "一个在脑内抽屉页）",
+              _nav[[n["name"] for n in _nav].index("界面")]["keys"] == ["look"])
+        check("🔴 掉线告警归「运行」组（和运行方式 / 版本与诊断在一处）",
+              "alerts" in _nav[[n["name"] for n in _nav].index("运行")]["keys"])
     finally:
         cw.ENV_PATH, cw.ENV_BAK = orig_env, orig_bak
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1719,7 +2188,10 @@ def test_gui_update_check():
         return
     src = open(p, encoding="utf-8").read()
     # 🔴 item19（2026-10-12）：版本块已从「运行方式」拆到独立页签 `_render_version`
-    _rt = src.split("def _render_runtime", 1)[1].split("def _render_version", 1)[0]
+    # 🔴 边界必须取「下一个函数」，不能取「到 _render_version 为止」——
+    #    中间现在夹着 `_dep_box`（依赖自检，v0.3.2 从运行方式搬到版本页），
+    #    它的文档串为了说明「搬来了」必然带「版本」两个字。
+    _rt = src.split("def _render_runtime", 1)[1].split("\n    def ", 1)[0]
     _rv = src.split("def _render_version", 1)[1]
     check("🔄 版本区块在独立页签 _render_version（不再塞运行方式）",
           'text="版本"' in _rv and '"检查更新"' in _rv
@@ -2506,8 +2978,17 @@ def test_gui_source():
     check("🖥 已整理子筛同时收纳 done / decided 两种库里状态",
           '_SUB_MATCH = {"done": ("done", "decided")}' in src)
     check("🖥 待办卡片删「← 恢复」（不可点击、冗余）；「✓ 完成这条待办」→「✓ 完成」",
-          '"← 恢复"' not in src and "✓ 完成这条待办" not in src
-          and '"✓ 完成"' in src)
+          "✓ 完成这条待办" not in src and '"✓ 完成"' in src)
+    # v0.3.2 第六节：「← 恢复」在回收站里做成了真按钮 —— 上面那条老断言（全文件
+    # 不许出现）随之改精确：它**只允许**出现在 `_open_trash` 里，浮层 / 分类列表
+    # 上依旧一个都没有（已丢弃条目在那些界面根本看不见）。
+    _trash_fn = next((n for n in ast.walk(ast.parse(src))
+                      if isinstance(n, ast.FunctionDef)
+                      and n.name == "_open_trash"), None)
+    _trash_seg = ast.get_source_segment(src, _trash_fn) if _trash_fn else ""
+    check("🖥 「← 恢复」只活在回收站（别的地方一个都没有）",
+          "← 恢复" in _trash_seg
+          and src.count("← 恢复") == _trash_seg.count("← 恢复"))
     check("🖥 灵感卡片删「★ 已决议」（done/decided 展示层合并）",
           '"★ 已决议", "info", "decided"' not in src
           and '"← 恢复待处理"' not in src
@@ -2594,12 +3075,16 @@ def test_gui_source():
           "def _on_wheel" in src and "self.canvas.winfo_ismapped()" in src)
     # ⑦ 顶部「化掉」不再靠实体遮罩带（用户 2026-10-12：「遮罩太硬…不能做渐变
     #    就去掉黄框内容」）—— Tk 没有真正的 alpha，实色遮罩带必然是硬边。
-    #    改成 `_alpha_at` **整卡均匀淡出**：顶边升进 TOP_FADE_H 就一起化掉，
-    #    不是被页签栏齐刷刷切断；也不会有「上半截先变灰」的缺口（那是按位置
-    #    分片渐变的锅）。
+    #    改成 `_alpha_at` **整卡均匀淡出**：不是被页签栏齐刷刷切断；也不会有
+    #    「上半截先变灰」的缺口（那是按位置分片渐变的锅）。
     check("🖥 顶部靠 _alpha_at 淡出（不再用实体遮罩带）",
           "def _alpha_at" in src and "TOP_FADE_H" in src
           and "fade_out" in src)
+    # 🔴 渐隐判据必须取**底边**（`y + h`）：整张卡共用一个 alpha，取顶边的话
+    #    一张 450px 的长卡在顶边贴住舞台上沿时整张只剩 10% 不透明，而它还有
+    #    88% 露在屏幕中间 ⇒ 中段凭空一大片空档（用户 2026-10-15 报的）。
+    check("🖥 顶部渐隐判据取底边（长卡不会整张变透明）",
+          "y + h + 8.0" in src and "(y + 8.0) / self.TOP_FADE_H" not in src)
     check("🖥 实体遮罩带已彻底移除（_mask / _paint_mask / _stipple 都没了）",
           "_mask" not in src and "def _paint_mask" not in src
           and "def _stipple" not in src and "TOP_MASK_H" not in src)
@@ -2651,11 +3136,27 @@ def test_gui_source():
     #     轻提示（主窗口底部居中、2.5s 自己消失），失败也不弹模态框。
     check("🖥 没有右下角系统通知（ToastNotification 已删）",
           "ToastNotification" not in src and "show_toast" not in src)
-    check("🖥 轻提示收敛成应用内文字（toast → 底部居中 Label）",
+    check("🖥 轻提示收敛成应用内文字（toast → 底部居中圆角条）",
           "def toast(self, msg, ok=True):" in src
           and 'lbl.place(relx=0.5, rely=1.0, anchor="s", y=-16)' in src
           and "self._toast_job = self.root.after(2500, _hide)" in src
           and "不弹模态框" in src)
+    # 🔴 `RoundedToast` 是 Canvas，本机 tkinter 把 `Canvas.lift = tkraise =
+    #    tag_raise`（抬**画布条目**，要求 tagOrId）⇒ `lbl.lift()` 抛
+    #    `wrong # args`，被 toast 外面那圈 `except Exception: pass` 吞掉，
+    #    后果是**这一条提示永远不消失**（`after(2500, _hide)` 没执行到）。
+    #    置顶必须走 `_raise_widget`（全局 `raise`）。
+    #    切法：正则取 `toast` 的函数体（到下一个同级 `def` / `class` 为止），
+    #    再**滤掉注释行** —— 注释里为了讲清原因会把 `lbl.lift()` 这个写法本身
+    #    写出来，整段匹配会把它当成真调用（第一版就是这么误报的）。
+    _tm = re.search(r"\n    def toast\(self, msg, ok=True\):.*?"
+                    r"(?=\n    def |\nclass |\Z)", src, re.S)
+    _toast_code = "\n".join(
+        l for l in (_tm.group(0) if _tm else "").splitlines()
+        if not l.lstrip().startswith("#"))
+    check("🖥 🔴 轻提示置顶走 _raise_widget（Canvas.lift 是抬条目，会抛且被吞）",
+          "_raise_widget(lbl)" in _toast_code
+          and "lbl.lift()" not in _toast_code)
 
     # ── 「界面字号」缩放（用户：字太小、要能自己调）──
     # 🔴 全应用字号必须都过 `_font()`。写死 `font=("Microsoft YaHei", 9)`
@@ -2834,25 +3335,88 @@ def test_gui_source():
     check("📐 底部变两行后，气泡条高按实际底栏高算（不写死 BAR_H）",
           "def _bar_h" in src and "L[\"h\"] - self._bar_h()" in src)
 
-    # ⑪ 「① 连接 QQ」页补「去 QQ 里开两个开关」提示（用户 2026-10-12：
+    # ⑪ 「连接 QQ」页补「去 QQ 里开两个开关」提示（用户 2026-10-12：
     #    连接 QQ 的步骤里少了「在群聊中使用，一定要开那两个开关」）——
     #    这两项在 QQ 那边管，配置中心碰不到；不开就收不到普通发言、也发不出
     #    播报，用户会以为「机器人坏了」。
     _bot_fn = src.split("    def _render_bot(self):")[1].split(
         "    def _group_switches_box(self):")[0]
-    check("⚙ 「① 连接 QQ」页渲染时挂上两个开关提示块",
+    check("⚙「连接 QQ」页渲染时挂上两个开关提示块",
           "self._group_switches_box()" in _bot_fn)
     _sw = src.split("    def _group_switches_box(self):")[1].split(
-        "    def _render_msg(self):")[0]
-    check("⚙ 提示块内容（两个开关 + 各带后果 + 验证提示）",
-          "要在群聊中使用机器人，你需要打开的开关" in _sw
-          and "机器人可获取的群聊消息范围" in _sw
+        "    def _toggle_manual(self):")[0]
+    _outside_fold = _sw.split("↓↓↓ 折叠区")[0]
+    check("⚙ 提示块内容一个字都没少（折叠只是藏起来）",
+          "机器人可获取的群聊消息范围" in _sw
           and "机器人主动在群聊内发言" in _sw
           and "获取群内全部消息" in _sw
           and "配置中心管不到它们" in _sw
           and "普通发言它收不到" in _sw
           and "上线播报发不出来" in _sw
           and "待办 测试" in _sw)
+    # 🔴 v0.3.2 结构归位：说明书折叠（这块展开有 252px，把整页顶到 632px、
+    #    超出 512px 预算 120px —— 用户要上下拉才看得全「保存凭据」）。
+    #    🔴 但**最要命的那句永远可见**：机器人分不清是谁说的，被折进去的话，
+    #       用户在多人群里用一次就会以为「这机器人记的东西全乱了」。
+    check("🔴 说明书可折叠、默认收起（整页才压得进一屏）",
+          "self._manual_body = ttk.Frame(lf)" in _sw
+          and "展开说明 ▸" in _sw
+          and "self._toggle_manual," in _sw)
+    check("🔴 折叠后「分不清是谁说的」仍常驻可见（不许被藏起来）",
+          "只适合单人活跃的群" in _outside_fold
+          and 'bootstyle="warning"' in _outside_fold
+          # 它必须 pack 到 lf（常驻容器）上，而不是折叠区里
+          and "ttk.Label(lf, text=_soft_wrap(_limit, 720, 9)," in _outside_fold)
+    _manual_only = _sw.split("↓↓↓ 折叠区")[1]
+    check("🔴 折叠区里装的是说明书正文（不是关键限制）",
+          "只适合单人活跃的群" not in _manual_only
+          and "机器人可获取的群聊消息范围" in _manual_only)
+    check("🔴 折叠区默认不收 pack（默认收起）",
+          "self._manual_body = ttk.Frame(lf)\n" in _sw
+          and "_manual_body.pack(" not in _manual_only)
+    check("🔴 展开后用 pack_forget / pack 切换，不销毁重建（内容不丢）",
+          "body.pack_forget()" in src and "body.pack(fill=\"x\", pady=(6, 0))" in src)
+
+    # ⑬ 配置中心结构归位（v0.3.2）：导航分组、外观页、扩展列表固定高度
+    _rf = src.split("    def refresh(self, state):")[1].split(
+        "    def _c(self, key):")[0]
+    check("🔴 导航按 nav_groups 分组渲染（不再是 12 个平铺按钮）",
+          'for grp in state.get("nav_groups") or []:' in _rf
+          and "grp[\"name\"]" in _rf
+          and "for k in grp[\"keys\"]:" in _rf)
+    check("🔴 主题切换搬进「外观」页（不再常驻导航底部）",
+          "self._build_theme_switch()" not in src
+          and "def _theme_buttons(self, parent):" in src
+          and "self._theme_buttons(lf)" in src)
+    _look = src.split("    def _render_look(self):")[1].split(
+        "    def _render_alerts(self):")[0]
+    check("🔴 外观页 = 颜色 + 界面字号（以前一个在导航底、一个在脑内抽屉页）",
+          "_theme_buttons(lf)" in _look and '_render_fields("look")' in _look)
+    check("🖥 show_section 把 look / alerts 路由到各自的渲染函数",
+          'elif key == "look":\n                self._render_look()' in src
+          and 'elif key == "alerts":\n                self._render_alerts()' in src)
+    # 已装扩展列表：固定视口 + 内部滚动（装再多这一页高度都不变）
+    check("🔴 扩展列表用 ScrolledFrame 固定高度（装得再多不撑长页面）",
+          "_EXT_LIST_MAX_H" in src
+          and "ScrolledFrame(lf, height=_EXT_LIST_MAX_H, auto_hide=True)" in src)
+    check("🔴 改框高前必须关容器的 grid_propagate（否则 height 选项静默无效）",
+          "self._ext_box.container.grid_propagate(False)" in src)
+    check("🔴 列表视口 = 这一页剩下的高度（装得少撑满窗口、装得多框内滚）",
+          "def _fit_ext_box(self):" in src
+          and "h = max(40, room)" in src)
+    check("🔴 目标高度只由「不含列表框」的固定部分算（不然 Configure 死循环卡死）",
+          "others = self.scroll.winfo_reqheight() - cur_h" in src
+          and "room = self.canvas.winfo_height() - others" in src
+          and "self._ext_h" in src)
+    check("🖥 切页排版落定 / 窗口尺寸变化后都会重算撑满高度",
+          "self._fit_ext_box()" in src
+          and src.count("self._fit_ext_box()") >= 4)   # 定义 + 绘制 + 交换 + 缩放
+    check("🖥 左侧导航顶部没有「分区」大标题（用户要求去掉）",
+          'text="分区"' not in src)
+    check("🖥 滚轮在内部滚动列表上时，外层页面不许跟着滚",
+          "isinstance(node, ScrolledFrame):" in src)
+    check("🖥 摸鱼库文本框 6 行 → 4 行（三分类 × 6 行时超屏 69px），并套圆角壳",
+          "RoundedArea(lf, value=" in src and "height=4, cc=self" in src)
 
     # ⑫ 列表滚动加固（用户 2026-10-12：待办等列表「上滚空白、只显示一条」）：
     #    · **视口钳制** —— 内容比视口矮时滚动区钳成视口本身。以前 bbox 比视口
@@ -3287,6 +3851,569 @@ def test_diag_bundle():
         shutil.rmtree(_out, ignore_errors=True)
 
 
+def test_dirty_tracking():
+    print("\n[30] 保存更改不再丢（脏判据 / 跨页暂存 / 离开与关窗拦截）")
+    src = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+
+    # ── 纯判据函数：从源码摘出来单测 ──
+    # memo_gui 依赖 tkinter / ttkbootstrap，测试环境里没有 —— 判据本身是纯函数
+    # （不碰任何控件），按 `_pid_alive` 的先例摘出来 exec 后直接跑。
+    tree = ast.parse(src)
+    # 🔴 共用一个命名空间：`_base_value` 体内要调 `as_set`，分开 exec 的话
+    #    函数的 __globals__ 找不到它（调用时才解析，不是编译时）。
+    ns = {"re": re}
+    for _name in ("_norm_val", "_pending_diff", "_pending_overlay",
+                  "_base_value", "as_set"):
+        _node = next((n for n in tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name == _name), None)
+        check(f"🖥 {_name} 存在（脏判据的纯函数入口）", _node is not None)
+        if _node is not None:
+            exec(ast.get_source_segment(src, _node), ns)
+    if "_pending_diff" not in ns or "_base_value" not in ns:
+        return
+    diff, overlay, base_value = (ns["_pending_diff"], ns["_pending_overlay"],
+                                 ns["_base_value"])
+
+    # 1) 没改 → 不脏（按钮灰着、点了没反应）
+    saved = {("env", "MEMO_TRIGGER"): "待办",
+             ("settings", "alert_enabled"): True,
+             ("env", "QQ_BOT_SECRET"): ""}
+    check("没改的时候不脏", diff(saved, dict(saved)) == [])
+    # 2) 改了没保存 → 脏
+    pend = dict(saved)
+    pend[("env", "MEMO_TRIGGER")] = "记一下"
+    check("改了没保存 → 脏", diff(saved, pend) == [("env", "MEMO_TRIGGER")])
+    # 3) 🔴 改了又改回来 → 不算脏（没有要保存的东西）
+    back = dict(saved)
+    back[("env", "MEMO_TRIGGER")] = "待办"
+    check("🔴 改了又改回来不算脏", diff(saved, back) == [])
+    # 4) bool 两种写法同一个值（True / "true"）
+    check("bool 两种写法判等",
+          diff({("settings", "k"): "true"}, {("settings", "k"): True}) == [])
+    # 5) 密钥留空 = 不改（和保存语义一致：write_env 跳过空密钥）
+    check("密钥留空不算脏（和保存语义一致）",
+          diff({("env", "QQ_BOT_SECRET"): ""}, {("env", "QQ_BOT_SECRET"): ""}) == [])
+    check("密钥填了值 → 脏",
+          diff({("env", "QQ_BOT_SECRET"): ""},
+               {("env", "QQ_BOT_SECRET"): "sec"}) == [("env", "QQ_BOT_SECRET")])
+    # 6) 多选（逗号串）
+    check("多选原样相等不算脏",
+          diff({("settings", "k"): "a,b"}, {("settings", "k"): "a,b"}) == [])
+    check("多选勾选变了 → 脏",
+          diff({("settings", "k"): "a,b"}, {("settings", "k"): "a"}) != [])
+    # 7) 摸鱼库（dict：逐行去空白、丢空行后比较）
+    g1 = {("__moyu__", "groups"): {"cat": ["x", "y"]}}
+    check("摸鱼库行尾空白不算脏（和保存同一套口径）",
+          diff(g1, {("__moyu__", "groups"): {"cat": ["x", " y "]}}) == [])
+    check("摸鱼库删了空行不算脏",
+          diff(g1, {("__moyu__", "groups"): {"cat": ["x", "y", ""]}}) == [])
+    check("摸鱼库改了行 → 脏",
+          diff(g1, {("__moyu__", "groups"): {"cat": ["x", "z"]}}) != [])
+    check("摸鱼库分类顺序不影响比较（按键排序归一）",
+          diff({("__moyu__", "groups"): {"a": ["1"], "b": ["2"]}},
+               {("__moyu__", "groups"): {"b": ["2"], "a": ["1"]}}) == [])
+    # 8) 暂存覆盖已保存值（切页回来的回填端）
+    check("暂存覆盖已保存值（跨页保留的读取端）",
+          overlay({"a": 1}, {"a": 2}) == {"a": 2}
+          and overlay({"a": 1}, None) == {"a": 1})
+
+    # 9) 🔴 基线换算：存储形态 → 控件读数形态（真机探针抓到的假脏）
+    #    env bool 没配时存空串、界面渲染成「未启用」—— 不换算一进页面就算脏，
+    #    离开时弹保存、按钮莫名其妙亮着（QQ_BOT_SANDBOX 实测）。
+    check("bool 空串基线换算成 false（探针实测：不然一进「连接 QQ」就假脏）",
+          base_value({"kind": "bool", "value": ""}) == "false")
+    check("bool 'true' 基线保持 true",
+          base_value({"kind": "bool", "value": "true"}) == "true")
+    check("bool  True  基线换算成 true", base_value({"kind": "bool", "value": True}) == "true")
+    check("paths 分号串基线换算成一行一个（和渲染出来的一致）",
+          base_value({"kind": "paths", "value": "C:/a;C:/b"}) == "C:/a\nC:/b")
+    check("paths 空值基线是空串",
+          base_value({"kind": "paths", "value": ""}) == "")
+    check("multi 基线按 choices 顺序拼（和控件读数同一顺序）",
+          base_value({"kind": "multi", "value": "a,b",
+                      "choices": ["b", "a", "c"]}) == "b,a")
+    check("multi list 值也认", base_value({"kind": "multi", "value": ["a", "b"],
+                                       "choices": ["a", "b", "c"]}) == "a,b")
+    check("int 空值基线按 0 算（界面 Spinbox 就是 0）",
+          base_value({"kind": "int", "value": ""}) == "0"
+          and base_value({"kind": "int", "value": 80}) == "80")
+    check("text 基线原样（不做任何换算）",
+          base_value({"kind": "text", "value": "x "}) == "x ")
+
+    # 10) 换算后：未动过的页面，读数 == 基线 → 一个都不脏（回归护栏）
+    _fake = [
+        {"target": "env", "key": "QQ_BOT_APPID", "kind": "text", "value": ""},
+        {"target": "env", "key": "QQ_BOT_SECRET", "kind": "secret", "value": ""},
+        {"target": "env", "key": "QQ_BOT_SANDBOX", "kind": "bool", "value": ""},
+        {"target": "env", "key": "MEMO_SEARCH_ROOT", "kind": "paths",
+         "value": "C:/a;C:/b"},
+        {"target": "settings", "key": "bubbles_show", "kind": "multi",
+         "value": "a,b", "choices": ["a", "b", "c"]},
+        {"target": "settings", "key": "alert_probe_sec", "kind": "int", "value": 120},
+    ]
+    _base = {(f["target"], f["key"]): base_value(f) for f in _fake}
+    # 控件「没被碰过」时的读数（按 _read_input 的口径手工构造）
+    _read = {("env", "QQ_BOT_APPID"): "",
+             ("env", "QQ_BOT_SECRET"): "",
+             ("env", "QQ_BOT_SANDBOX"): "false",
+             ("env", "MEMO_SEARCH_ROOT"): "C:/a\nC:/b",
+             ("settings", "bubbles_show"): "a,b",
+             ("settings", "alert_probe_sec"): "120"}
+    check("🔴 未动过的页面读数==基线（六种字段全不假脏）",
+          diff(_base, _read) == [], str(diff(_base, _read)))
+
+    # ── 源码护栏（v0.3.2 第四节）──
+    # 页头共用的保存按钮：一屏内、不用滚到底
+    check("🖥 保存按钮建在页头标题行右侧（不在可滚动内容区）",
+          'self.save_btn = self._solid_btn(head, "保存更改", self._on_header_save' in src
+          and 'self.save_btn.grid(row=0, column=1, sticky="e")' in src)
+    check("🖥 页头行内不混用几何管理器（标题 grid，按钮也必须 grid）",
+          'self.save_btn.pack(' not in src and 'self.save_btn.pack_forget(' not in src)
+    check("🖥 旧的内容区保存按钮已移除（_save_btn 不再存在）",
+          "def _save_btn" not in src and "self._save_btn()" not in src)
+    check("🖥 没改的时候按钮是灰的、点了没反应",
+          'self.save_btn.configure(state="disabled")' in src
+          and 'state="normal" if dirty else "disabled"' in src)
+    # 🔴 暂存必须挂 App：换肤 / 改字号会整窗重建 ConfigCenter
+    check("🔴 暂存与脏集合挂在 App 上（整窗重建也不丢）",
+          'self._pending = getattr(app, "_pending", None)' in src
+          and 'self._dirty_secs = getattr(app, "_dirty_secs", None)' in src)
+    check("🔴 换肤重建走 ask=False + 暂存兜底（换深浅色不丢填了一半的内容）",
+          src.count("show_section(keep, ask=False)") == 2)
+    # 渲染覆盖 + 单一读数口径
+    check("🖥 渲染取值走暂存覆盖（_disp_val：未保存改动优先）",
+          "def _disp_val(self, f):" in src
+          and 'return f.get("value") if got is None else got' in src)
+    check("🖥 保存读的是暂存（和脏判据同一套读数，不会对不上账）",
+          "def _read_input(var):" in src
+          and "self._sync_pending()\n        vals = self._pending.get(self.current) or {}" in src)
+    check("🖥 脏基线拍的是已保存值、且换算成控件读数形态（_base_value）",
+          "def _capture_base(self, key):" in src
+          and "def _base_value(f):" in src
+          and 'base[(f["target"], f["key"])] = _base_value(f)' in src)
+    check("🖥 离开前兜底同步（右键粘贴不触发键盘事件）",
+          src.count("self._sync_pending()") >= 4)
+    check("🔴 当前页实时比较优先于脏标记（改回来能判干净）",
+          "if sec == self.current:" in src)
+    # 页头按钮按分区换装
+    check("🖥 页头按钮按分区换文字/命令（_SEC_SAVE 一张表）",
+          '"bot": ("保存凭据", "fields")' in src
+          and '"moyu": ("保存摸鱼库", "moyu")' in src
+          and '"alerts": ("保存更改", "fields")' in src)
+    check("🖥 没有可保存内容的分区（运行/扩展/版本）直接藏按钮",
+          "if spec is None:\n            # grid_remove（不是 destroy）：记住 grid 配置，下次 pack 回来原位\n            self.save_btn.grid_remove()" in src)
+    check("🖥 渲染期间的初始赋值不算「用户改了」（_rendering 闸）",
+          "self._rendering = True" in src
+          and "if self._rendering:\n            return" in src)
+    # 离开拦截 / 关窗拦截
+    check("🖥 离开前拦一道：保存并切换 / 放弃更改 / 取消",
+          "def _guard_leave(self, next_key):" in src
+          and "保存并切换" in src and "放弃更改" in src)
+    check("🖥 关窗口同样问一道（保存并退出 / 放弃更改 / 取消）",
+          "def confirm_close(self):" in src
+          and "保存并退出" in src
+          and "if cc is not None and not cc.confirm_close():" in src)
+    check("🖥 内部路径（刷新/重建/后台轮询）不弹窗",
+          "self.show_section(self.current, ask=False)" in src
+          and 'show_section("runtime", ask=False)' in src)
+    check("🖥 对话框默认焦点给「保存并切换」（误触回车不丢东西）",
+          "save_btn.focus_set()" in src)
+    check("🖥 弹窗里没有「取消」按钮（和右上角 × 重复，用户要求删）",
+          '_ghost_btn(row, "取消"' not in src
+          and 'if w._text == "取消":' not in src)
+    check("🖥 自己关对话框 = 取消（× 的意思就是先别走）",
+          'self.protocol("WM_DELETE_WINDOW", lambda: self._done("cancel"))' in src)
+    # ── 用户 2026-10-16 报的 7 项 ────────────────────────────────
+    check("🔴 滚轮回调不能写 `self.root`（ConfigCenter 没这属性 ⇒ 整个窗口滚轮全废）",
+          "top = self.app.root" in src and "is not self.root" not in src)
+    check("🔴 导航刷新要连分组标题一起清（不然保存一次就多一套标题）",
+          "for w in self.nav.winfo_children():" in src
+          and "for b, _ in self._nav:" not in src)
+    check("🖥 左侧导航套可滚动容器（窗口矮时能滚，不逼用户去拉窗口）",
+          "self._nav_scroll = FitScrolledFrame(nav" in src
+          and "self.nav = self._nav_scroll" in src)
+    check("🔴 装得下时不许冒出滚动条（原版 auto_hide 是「一 hover 就显」）",
+          "class FitScrolledFrame(ScrolledFrame):" in src
+          and "def _needs_scroll(self):" in src
+          and "def _pointer_inside(self):" in src
+          and "if self._pointer_inside() and self._needs_scroll():" in src)
+    check("🖥 两个主入口页签改自绘圆角（不再用 ttk.Notebook）",
+          "def show_tab(self, key):" in src
+          and "ttk.Notebook(" not in src
+          and "w.grid_remove()" in src)
+    check("🖥 「发文件」的搜索根目录改成可增删列表（不再是多行文本框）",
+          "class _PathList(ttk.Frame):" in src
+          and "pl = _PathList(wrap, self, val, self._on_input)" in src
+          and "isinstance(var, _PathList)" in src)
+    check("🔴 颜色三选一：点选**立刻预览**，但落盘只走「保存更改」",
+          "def _pick_theme(self, mode):" in src
+          and 'self._pending.setdefault(self.current, {})[("ui", "theme")] = mode' in src
+          and "self.app.preview_theme(mode)" in src
+          and 'base[("ui", "theme")]' in src
+          and 'vals[("ui", "theme")]' in src)
+    check("🔴 只有 `set_theme_mode` 写盘；`preview_theme` 一个字都不写",
+          "def preview_theme(self, mode):" in src
+          and "def set_theme_mode(self, mode):" in src
+          and "save_ui_theme(" in src.split(
+              "    def set_theme_mode(self, mode):")[1].split(
+              "    def preview_theme(self, mode):")[0]
+          and "save_ui_theme(" not in src.split(
+              "    def preview_theme(self, mode):")[1].split(
+              "    def _rebuild_window(self):")[0])
+    check("🔴 预览没保存就离开 ⇒ 回退到已保存值（_reconcile_theme 挂在 show_section 末尾）",
+          "def _reconcile_theme(self):" in src
+          and "self._reconcile_theme()" in src
+          and 'want = getattr(self.app, "theme_mode", "system")' in src)
+    check("🔴 脏判据基线取**已保存**的 theme_mode，不是显示中的 theme_display",
+          'base[("ui", "theme")] = getattr(self.app, "theme_mode", "system")' in src
+          and "self.theme_display = self.theme_mode" in src)
+    check("🖥 单行输入框改圆角自绘（ttk.Entry 画不出圆角）",
+          "class RoundedEntry(tk.Canvas):" in src
+          and "ttk.Entry(" not in src
+          and src.count("RoundedEntry(wrap, textvariable=var") == 2)
+    check("🖥 多行输入框也套圆角壳（RoundedArea 里仍是真 ScrolledText）",
+          "class RoundedArea(tk.Canvas):" in src
+          and "cls = tk.Text if plain else scrolledtext.ScrolledText" in src
+          and "self._var_map[(target, key)] = ra.text" in src)
+    check("🖥 播报目标：开关与名字拆成两个控件（点名字不许切换）",
+          "ttk.Checkbutton(row, variable=v," in src
+          and "ttk.Checkbutton(row, text=name," not in src)
+    check("🔴 播报目标也走「保存更改」：进暂存 + 拍基线，不再勾了就写盘",
+          "def _push_picked(self):" in src
+          and "def _push_saved(self):" in src
+          and 'vals[("env", "QQ_PUSH_TARGETS")] = self._push_picked()' in src
+          and 'base[("env", "QQ_PUSH_TARGETS")] = self._push_saved()' in src
+          and "def _toggle_push" not in src)
+    check("🖥 次级按钮常态带淡描边 + 淡底（但仍弱于实心主按钮）",
+          "def _btn_line(self):" in src
+          and "outline=self._btn_line()," in src
+          and 'fill=self._c("inputbg"),' in src)
+    check("🖥 左侧导航缩进分两级（分组标题贴左、子项再缩进一级）",
+          'pack(anchor="w", padx=(10, 0),' in src
+          and 'kind="ghost", anchor="w", padx=24, pady=5, radius=10,' in src)
+    check("🔴 BrainDrawerTab 不许调 `self._ghost_btn`（只在 ConfigCenter 上，调了 AttributeError）",
+          "self._ghost_btn(" not in src.split(
+              "class BrainDrawerTab(ttk.Frame):")[1])
+    # ── 用户 2026-10-16 第二批 ──────────────────────────────────
+    check("🖥 「诊断包」是独立小块（和「版本」「依赖自检」平级，不再挂在版本里）",
+          'ttk.LabelFrame(self.scroll, text="诊断包", padding=8)' in src
+          and 'ttk.LabelFrame(parent, text="依赖自检", padding=8)' in src)
+    check("🖥 页签行下面留 15px 空隙（6px 用户嫌不够，2026-10-16）",
+          "tabbar = ttk.Frame(root, padding=(8, 2, 8, 15))" in src)
+    check("🖥 🔴 轻提示是圆角自绘（tk.Label 画不出圆角）",
+          "class RoundedToast(tk.Canvas):" in src
+          and "lbl = RoundedToast(self.root" in src
+          and "tk.Label(self.root, text=\"\", anchor=\"center\"" not in src
+          and "lbl.set_msg(msg," in src)
+    check("🖥 轻提示按文字量自己算尺寸（place 不给尺寸，Canvas 不随文字长）",
+          "def set_msg(self, text, fill, fg):" in src
+          and "f.measure(text) + self._padx * 2" in src
+          and "f.metrics(\"linespace\") + self._pady * 2" in src)
+    # ── 用户 2026-10-16 第四批 ──────────────────────────────────
+    # 回收站每行那个「选这条」的框：`bootstyle="primary"` 走 checkbutton 那套
+    # 资源，样式对（方框 + 对勾）但**画不出圆角**（用户「多选框也改成圆角」）。
+    # ⚠️ 也别换成 `*-round-toggle` —— 那是 iOS 拨杆，做多选没人看得懂。
+    check("🖥 回收站多选框改圆角自绘（ttk 的方框画不出圆角）",
+          "class RoundedCheck(tk.Canvas):" in src
+          and "RoundedCheck(row, variable=var" in src
+          and "ttk.Checkbutton(row, variable=var" not in src)
+    # 取 `RoundedCheck` 的函数体切片（到下一个顶层 `class` / 分隔注释为止）
+    _ck = re.search(r"\nclass RoundedCheck\(tk\.Canvas\):.*?"
+                    r"(?=\nclass |\n# ──|\Z)", src, re.S)
+    _ck_code = _ck.group(0) if _ck else ""
+    check("🖥 🔴 勾选框 `<Destroy>` 摘变量 trace（变量比控件活得久）",
+          "trace_remove" in _ck_code
+          and 'bind("<Destroy>"' in _ck_code
+          and "def _unhook(self):" in _ck_code)
+    # 🔴 只看 `_draw` 的函数体：类 docstring 里为了讲清原因把 `delete("all")`
+    #    这个写法本身写了出来，整段匹配会把它当成真调用（同 ⑩ / ⑪ 轮两次教训）。
+    _ck_draw = _ck_code.split("    def _draw(self):")[-1]
+    check("🖥 勾选框画布只删 bg / ink 两个 tag（不 delete(\"all\")）",
+          'delete("bg")' in _ck_draw and 'delete("ink")' in _ck_draw
+          and 'delete("all")' not in _ck_draw
+          and 'tags="bg"' in _ck_draw and 'tags="ink"' in _ck_draw)
+    check("🖥 勾选框未选中描边用次级按钮同款（border 太淡，深色下看不见）",
+          "lerp_color(self._c(\"border\"),\n"
+          "                                         self._c(\"secondary\"), 0.45)"
+          in src)
+    check("🖥 脑内抽屉的输入框也圆角（搜索 / 标签 / 编辑框 / 结论框）",
+          "qent = RoundedEntry(sbar" in src
+          and "entry = RoundedEntry(add" in src
+          and "edit_shell = RoundedArea(body_holder" in src
+          and "note_shell = RoundedArea(note_wrap" in src
+          and "note_shell.refit()" in src)
+    check("🖥 已装扩展列表也换成「装得下就不出滚动条」的容器",
+          "self._ext_box = FitScrolledFrame(lf" in src)
+    check("🖥 标签筛选下拉框也圆角（ttk.Combobox 画不出圆角）",
+          "class RoundedSelect(tk.Canvas):" in src
+          and "self._tag_cb = RoundedSelect(bar" in src
+          and "self._tag_cb.set_values([\"\"] + names)" in src
+          and 'self._tag_cb["values"]' not in src)
+    # 🔴 浮层**不许用 `tk.Menu`**：`tk_popup` 里有 `tkwait visibility`，探针实测
+    #    窗口不是前台时永不返回（`_probe/popup_min.py` / `popup_min2.py`），
+    #    真机上点一下就可能冻住界面。而且原生菜单是系统方角样式。
+    _sel = src.split("class RoundedSelect(tk.Canvas):")[1].split(
+        "\nclass RoundedArea(tk.Canvas):")[0]
+    _sel_code = "\n".join(ln for ln in _sel.splitlines()
+                          if not ln.strip().startswith("#"))
+    check("🖥 🔴 下拉浮层不用 tk.Menu（tk_popup 的 tkwait 会冻界面）",
+          "tk.Menu(" not in _sel_code and ".tk_popup(" not in _sel_code
+          and "overrideredirect(True)" in _sel_code
+          and "top.grab_set()" in _sel_code)
+    check("🖥 下拉浮层关闭时先解 grab 再销毁（挂着 grab 会吞整窗点击）",
+          "top.grab_release()" in _sel_code
+          and _sel_code.index("top.grab_release()")
+          < _sel_code.index("top.destroy()"))
+    # 🔴 浮层标签输入框的变量**不能**叫 `_tag_var`：那是底部筛选下拉框的变量，
+    #    同名的话每开一次卡片浮层就把它覆盖掉，之后点筛选下拉会拿浮层里的残留
+    #    输入去过滤（`_set_tag` 读的正是 `self._tag_var`）。
+    _taged = src.split("    def _build_tag_editor(self, parent, it):")[1].split(
+        "    def _open_item_by_id(self, item_id):")[0]
+    # 只看**代码行**：那段注释里为了讲清楚为什么改名，故意写了 `_tag_var`
+    _taged_code = "\n".join(ln for ln in _taged.splitlines()
+                            if not ln.strip().startswith("#"))
+    check("🖥 🔴 浮层标签输入框用独立变量（不覆盖筛选下拉的 _tag_var）",
+          "self._tag_edit_var" in _taged_code
+          and "self._tag_var" not in _taged_code)
+    check("🖥 `RoundedEntry.text` 是只读别名（调用方不用记 `_entry`）",
+          "    def text(self):\n        \"\"\"里面的真 `tk.Entry`" in src)
+    # ── 数字框（用户 2026-10-16「做，全部统一成圆角。包括探活间隔那里的箭头框」）
+    _sb = src.split("class RoundedSpinbox(tk.Canvas):")[1].split(
+        "\nclass RoundedSelect(tk.Canvas):")[0]
+    _sb_code = "\n".join(ln for ln in _sb.splitlines()
+                         if not ln.strip().startswith("#"))
+    check("🖥 数字框改圆角自绘（ttk.Spinbox 的边框和箭头都画不出圆角）",
+          "class RoundedSpinbox(tk.Canvas):" in src
+          and "ttk.Spinbox(" not in src
+          and "sb = RoundedSpinbox(wrap, textvariable=var" in src)
+    check("🖥 🔴 数字框的 `delete(\"all\")` 会连内嵌 Entry 的窗口项一起删掉",
+          'delete("all")' not in _sb_code
+          and 'delete("bg")' in _sb_code and 'delete("ink")' in _sb_code
+          and 'tags="bg"' in _sb_code)
+    check("🖥 🔴 数字框读数以变量为准（Entry 的 -textvariable 是下一拍才刷的）",
+          "def get(self):" in _sb_code
+          and "v = self._read_var()" in _sb_code
+          and _sb_code.index("v = self._read_var()")
+          < _sb_code.index("self._entry.get()"))
+    check("🖥 🔴 数字框销毁时摘掉变量 trace（变量比控件活得久）",
+          "def _unhook(self):" in _sb_code
+          and "trace_remove" in _sb_code
+          and 'self.bind("<Destroy>", lambda _e=None: self._unhook())' in src)
+    check("🖥 🔴 数字框交给脏判据的是壳不是 IntVar（框空着时 IntVar.get 会抛）",
+          "isinstance(var, RoundedSpinbox)" in src
+          and "self._var_map[(target, key)] = sb" in src)
+    check("🖥 按钮 hover 回调带默认参数（Tk 重建窗口时无参调用会刷一屏栈）",
+          "lambda e=None: self._set_hover(True)" in src
+          and "def _on_click(self, _e=None):" in src)
+    # 左侧叹号
+    check("🖥 有未保存改动的分区，导航上点叹号",
+          "def set_dirty(self, on):" in src
+          and 'text="!"' in src
+          and 'if g["key"] in self._dirty_secs:' in src)
+    # 保存后清脏 / 失败保留输入
+    _save = src.split("    def _on_save(self):")[1].split("    # ---- 连接 QQ")[0]
+    check("🖥 保存成功才清暂存（失败保留，不吞用户输入）",
+          "return False" in _save
+          and _save.index("return False") < _save.index("self._clear_dirty"))
+    check("🖥 摸鱼库保存失败不刷新（不然填的一半当场没了）",
+          "if ok:\n            # 🔴 成功才清暂存 + 刷新" in src)
+    check("🖥 摸鱼库文本框接上脏跟踪 + 暂存回填",
+          "groups = _pending_overlay(" in src
+          and 'vals[("__moyu__", "groups")]' in src
+          and 'base[("__moyu__", "groups")]' in src)
+    check("🖥 恢复内置 = 未保存改动作废（内容被已保存值取代）",
+          "if ok:\n            # 恢复内置 = 内容已被已保存值取代" in src)
+
+
+def test_taskbar_icon():
+    print("\n[31] 任务栏图标（AUMID 快捷方式 / 三处定义一致）")
+    # 任务栏图标按进程 AUMID 找：进程里 iconphoto 落不到任务栏；shell 发现
+    # 开始菜单有带**同一个 AUMID** 的快捷方式时，图标以它为准。真机验收见
+    # `_probe/taskbar_fix.py`（截图里任务栏按钮是金鱼）。
+    sc = open(os.path.join(ROOT, "shortcut.py"), encoding="utf-8").read()
+    gui = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    hub = open(os.path.join(ROOT, "hub.py"), encoding="utf-8").read()
+    iss = open(os.path.join(ROOT, "packaging", "memo-bot.iss"),
+               encoding="utf-8").read()
+
+    # 1) AUMID 常量只在 shortcut.py 定义一次（memo_gui / hub / 安装脚本都不许
+    #    再写第二个）—— 两处各写一份必然漂移
+    check("🖥 AUMID 常量只在 shortcut.py 定义一次",
+          'APP_USER_MODEL_ID = "PhononPrismLab.MoyuBot.Desktop"' in sc)
+    check("🖥 memo_gui 从 shortcut 导入，自己不再写死 AUMID",
+          "from shortcut import" in gui
+          or "import shortcut as _shortcut" in gui)
+    check("🖥 memo_gui 里没有第二个 AUMID 字面量",
+          "PhononPrismLab" not in gui)
+    check("🖥 hub 里没有第二个 AUMID 字面量",
+          "PhononPrismLab" not in hub)
+    # 2) 安装脚本的 [Icons] AppUserModelID 必须一字不差
+    check("🖥 安装脚本快捷方式带同一个 AUMID（与常量一致）",
+          'AppUserModelID: "{#AppUserModelID}"' in iss
+          and '#define AppUserModelID "PhononPrismLab.MoyuBot.Desktop"' in iss)
+    # 3) 管家开机幂等创建（常驻进程；改安装位置后重写也指向当前这一份）
+    check("🖥 管家启动时创建开始菜单快捷方式（幂等）",
+          "import shortcut" in hub and "shortcut.ensure()" in hub)
+    # 4) 快捷方式的规格：pythonw + launcher --hub + 金鱼图标 + 同 AUMID
+    check("🖥 快捷方式指向统一启动器 --hub（和安装版同一入口）",
+          '"memo-launcher.py"' in sc and " --hub" in sc)
+    check("🖥 图标用品牌金鱼（assets/icons 唯一来源）",
+          'os.path.join(_app_dir(), "assets", "icons", "installer.ico")' in sc)
+    check("🖥 AUMID 写进 .lnk 的 PropertyStore（PKEY_AppUserModel_ID）",
+          "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F9" in sc
+          and "ExtraData_PropertyStoreDataBlock" in sc)
+    check("🖥 创建失败只记日志（任务栏图标退化而已，管家照样起）",
+          "except Exception as e:" in sc
+          and "log.warning(" in sc and "return None" in sc)
+    # 5) 打包不能漏（漏了安装版起管家才 ModuleNotFoundError，源码直跑看不出来）
+    bd = open(os.path.join(ROOT, "packaging", "_build_dist.py"),
+              encoding="utf-8").read()
+    check("📦 APP_FILES 含 shortcut.py 与随包依赖 pylnk3.py",
+          '"shortcut.py"' in bd and '"pylnk3.py"' in bd)
+    check("📦 仓库根有 pylnk3.py（shortcut.py 写 .lnk 用它）",
+          os.path.isfile(os.path.join(ROOT, "pylnk3.py")))
+
+    # 6) 功能性：真建一个 .lnk 再读回（pylnk3 与 shortcut 都不依赖 tkinter）
+    try:
+        import tempfile
+
+        import pylnk3
+        import shortcut as _sc
+        with tempfile.TemporaryDirectory() as td:
+            lnk = _sc._build_lnk()
+            p = os.path.join(td, "t.lnk")
+            lnk.save(p)
+            check("🧪 .lnk 能写出来（字节数 > 0）", os.path.getsize(p) > 0)
+            with open(p, "rb") as f:
+                back = pylnk3.Lnk(f)
+            aumid = None
+            for b in back.extra_data.blocks:
+                if hasattr(b, "stores"):
+                    for s in b.stores:
+                        for pid, val in s.properties:
+                            if pid == 5 and val.type == 0x1F:
+                                raw = val.value
+                                n = int.from_bytes(raw[:4], "little")
+                                aumid = raw[4:4 + 2 * n].decode(
+                                    "utf-16-le", "ignore").rstrip("\x00")
+            check("🧪 读回来的 AUMID 与常量一致", aumid == _sc.APP_USER_MODEL_ID)
+            # shell_item_id_list 指向 pythonw（for_file 的本地链接分支）
+            check("🧪 目标是 pythonw.exe（不是 python.exe）",
+                  back.link_flags.HasIconLocation
+                  and "pythonw" in str(back.shell_item_id_list).lower().replace(
+                      "\\", "/"))
+    except Exception as e:                          # noqa: BLE001
+        check(f"🧪 .lnk 读写回环（异常：{e}）", False)
+
+
+def test_trash_restore():
+    print("\n[32] 回收站「← 恢复」（prev_status / 转出恢复 / 二次丢弃保护）")
+    import store as _store
+
+    orig_db = _store.DB
+    tmpdir = tempfile.mkdtemp(prefix="restore_test_")
+    try:
+        _store.DB = os.path.join(tmpdir, "t.db")
+        _store.init()
+
+        def _row(i):
+            con = sqlite3.connect(_store.DB)
+            r = con.execute("SELECT status, prev_status FROM memos WHERE id=?",
+                            (i,)).fetchone()
+            con.close()
+            return r
+
+        # 四种丢弃前状态：待办未完成 / 待办已完成 / 灵感未整理 / 灵感已决议
+        m_open = _store.add_memo("g", "g", "u", "u", "待办未完成丢",
+                                 kind=_store.KIND_MEMO)["id"]
+        m_done = _store.add_memo("g", "g", "u", "u", "待办已完成丢",
+                                 kind=_store.KIND_MEMO)["id"]
+        i_open = _store.add_memo("g", "g", "u", "u", "灵感未整理丢",
+                                 kind=_store.KIND_IDEA)["id"]
+        i_dec = _store.add_memo("g", "g", "u", "u", "灵感已决议丢",
+                                kind=_store.KIND_IDEA)["id"]
+        plain = _store.add_memo("g", "g", "u", "u", "没丢过的普通行",
+                                kind=_store.KIND_MEMO)["id"]
+        _store.set_memo_status([m_done], _store.STATUS_DONE)
+        _store.set_idea_status([i_dec], _store.STATUS_DECIDED)
+
+        # 1) 转入 dropped：prev_status = 丢弃前那一刻的状态（IFNULL 兜底 open）
+        _store.set_memo_status([m_open, m_done], _store.STATUS_DROPPED)
+        _store.set_idea_status([i_open, i_dec], _store.STATUS_DROPPED)
+        check("丢弃时记下丢弃前状态（done→prev=done）",
+              _row(m_done) == ("dropped", "done"), f"got={_row(m_done)}")
+        check("丢弃时记下丢弃前状态（decided→prev=decided）",
+              _row(i_dec) == ("dropped", "decided"), f"got={_row(i_dec)}")
+        check("丢弃时 open 也记（prev=open）",
+              _row(m_open) == ("dropped", "open"), f"got={_row(m_open)}")
+
+        # 2) 🔴 二次丢弃不许覆盖 prev_status（否则恢复目标变 dropped，恢复就废了）
+        _store.set_memo_status([m_open], _store.STATUS_DROPPED)
+        check("🔴 已在 dropped 再丢一次，prev_status 不被覆盖",
+              _row(m_open) == ("dropped", "open"), f"got={_row(m_open)}")
+
+        # 3) 恢复：各回各的状态、prev 清空；普通行不受影响
+        n = _store.restore_items([m_open, m_done, i_open, i_dec, plain])
+        check("恢复只数 dropped 行（普通行不动）", n == 4, f"got={n}")
+        check("恢复回到当次丢弃前状态（done）",
+              _row(m_done) == ("done", None), f"got={_row(m_done)}")
+        check("恢复回到当次丢弃前状态（open）",
+              _row(m_open) == ("open", None), f"got={_row(m_open)}")
+        check("灵感也恢复（decided）",
+              _row(i_dec) == ("decided", None), f"got={_row(i_dec)}")
+        check("普通行恢复调用 = 无操作", _row(plain) == ("open", None))
+
+        # 4) 再丢再恢复：回到**当次**丢弃前的状态，不滚成一团
+        _store.set_memo_status([m_done], _store.STATUS_OPEN)
+        _store.set_memo_status([m_done], _store.STATUS_DROPPED)
+        _store.restore_items([m_done])
+        check("再丢再恢复 → 当次丢弃前的状态（open，不是上一次的 done）",
+              _row(m_done) == ("open", None), f"got={_row(m_done)}")
+
+        # 5) 普通改状态不碰 prev_status（cur≠dropped 的分支）
+        _store.set_memo_status([plain], _store.STATUS_DONE)
+        check("普通完成不写 prev_status", _row(plain) == ("done", None))
+
+        # 6) 老库（没有 prev_status 列）自动补列 + 存量已丢弃兜底恢复成 open
+        old = os.path.join(tmpdir, "old")
+        os.makedirs(old)
+        con = sqlite3.connect(os.path.join(old, "memos.db"))
+        con.execute("CREATE TABLE memos (id TEXT PRIMARY KEY, content TEXT,"
+                    " kind TEXT, status TEXT)")
+        con.execute("INSERT INTO memos VALUES ('x1','老库已丢弃','memo','dropped')")
+        con.commit()
+        con.close()
+        _store.DB = os.path.join(old, "memos.db")
+        _store.init()
+        cols = [r[1] for r in sqlite3.connect(_store.DB)
+                .execute("PRAGMA table_info(memos)")]
+        check("老库自动补 prev_status 列（不重建库）", "prev_status" in cols)
+        n = _store.restore_items(["x1"])
+        check("存量已丢弃记录恢复兜底回 open（prev 是 NULL）",
+              n == 1 and _row("x1") == ("open", None), f"got={_row('x1')}")
+    finally:
+        _store.DB = orig_db
+
+    # ── GUI 护栏（源码级）────────────────────────────────────────
+    src = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    _fn = next((n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == "_open_trash"), None)
+    seg = ast.get_source_segment(src, _fn) if _fn else ""
+    check("🖥 回收站有 _restore（和 _purge 并列）",
+          "def _restore(ids):" in seg and "_store.restore_items(ids)" in seg)
+    check("🖥 恢复不二次确认（可逆操作，别学删除）",
+          "messagebox.askyesno" not in seg.split("def _restore")[1].split("def ")[0])
+    check("🖥 恢复不打通知（回列表本身就是反馈，同 _set_status）",
+          "self.app.toast" not in seg.split("def _restore")[1].split("def ")[0])
+    check("🖥 行内「← 恢复」在「删除」左边（危险操作最右）",
+          'RoundedButton(row, "← 恢复"' in seg
+          and seg.index('RoundedButton(row, "删除"') < seg.index('RoundedButton(row, "← 恢复"'))
+    check("🖥 底部「← 恢复选中（N）」与「永久删除选中（N）」并排",
+          '"← 恢复选中（0）"' in seg and '"永久删除选中（0）"' in seg)
+    check("🖥 恢复后同样 _rebuild + refresh（条目立刻回舞台）",
+          seg.count("_rebuild()") >= 2 and "self.refresh(self.app.state)" in seg)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -3308,6 +4435,11 @@ def main():
     test_ext_manager()
     test_ignore()
     test_route()
+    test_quote_merge()
+    test_account_alert()
+    test_dirty_tracking()
+    test_taskbar_icon()
+    test_trash_restore()
     test_settings()
     test_config_web()
     test_console_encoding()

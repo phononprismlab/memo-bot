@@ -79,11 +79,15 @@ Source: "{#RepoDir}\assets\icons\*.ico"; DestDir: "{app}\icons"; Flags: ignoreve
 ; 图标按美术给的映射：配置中心=笔记本锦鲤 / 脑内抽屉=纸箱锦鲤 / 卸载=垃圾桶锦鲤
 ; 🔴 三合一后只有一个「摸鱼bot」入口（管家 hub.py）：它常驻后台、带托盘图标，
 ;    配置中心 / 脑内抽屉 / 机器人都从它的托盘菜单进。不再各放一个快捷方式。
-Name: "{group}\摸鱼bot"; Filename: "{app}\py\pythonw.exe"; Parameters: """{app}\app\memo-launcher.py"" --hub"; WorkingDir: "{app}\app"; IconFilename: "{app}\icons\installer.ico"; Comment: "常驻后台，托盘里开配置中心 / 脑内抽屉 / 机器人"
+; 🔴 AppUserModelID 与 shortcut.py 的 APP_USER_MODEL_ID 一字不差（改动要同步）——
+;    任务栏图标按 AUMID 认：进程里的 iconphoto 落不到任务栏，shell 发现开始菜单
+;    有带同一个 AUMID 的快捷方式时，任务栏 / 固定按钮的图标就以它为准（金鱼）。
+#define AppUserModelID "PhononPrismLab.MoyuBot.Desktop"
+Name: "{group}\摸鱼bot"; Filename: "{app}\py\pythonw.exe"; Parameters: """{app}\app\memo-launcher.py"" --hub"; WorkingDir: "{app}\app"; IconFilename: "{app}\icons\installer.ico"; AppUserModelID: "{#AppUserModelID}"; Comment: "常驻后台，托盘里开配置中心 / 脑内抽屉 / 机器人"
 Name: "{group}\使用说明"; Filename: "{app}\app\README.md"; IconFilename: "{app}\icons\installer.ico"
 Name: "{group}\卸载 memo-bot"; Filename: "{uninstallexe}"; IconFilename: "{app}\icons\uninstall.ico"
 ; 桌面也放一份 —— 天天要碰的入口，藏在开始菜单里太深
-Name: "{autodesktop}\摸鱼bot"; Filename: "{app}\py\pythonw.exe"; Parameters: """{app}\app\memo-launcher.py"" --hub"; WorkingDir: "{app}\app"; IconFilename: "{app}\icons\installer.ico"; Comment: "常驻后台，托盘里开配置中心 / 脑内抽屉 / 机器人"
+Name: "{autodesktop}\摸鱼bot"; Filename: "{app}\py\pythonw.exe"; Parameters: """{app}\app\memo-launcher.py"" --hub"; WorkingDir: "{app}\app"; IconFilename: "{app}\icons\installer.ico"; AppUserModelID: "{#AppUserModelID}"; Comment: "常驻后台，托盘里开配置中心 / 脑内抽屉 / 机器人"
 
 [Run]
 Filename: "{app}\py\pythonw.exe"; Parameters: """{app}\app\memo-launcher.py"" --hub"; Description: "现在打开摸鱼bot"; Flags: postinstall nowait skipifsilent

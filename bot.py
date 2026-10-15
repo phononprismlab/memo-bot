@@ -5,6 +5,8 @@
   - 群消息与私聊消息都进 `route_message()`，依次过：
     忽略表 → 「设置」指令 → 扩展指令 → 内置指令（待办 / 查待办 / 查灵感 / 你好 /
     发文件 / 摸鱼 / 回旋镖 / 导出 / 帮助）→ 都没命中就兜底**静默收作灵感**；
+  - **引用消息**（`message_type=103`）：被引用那条的正文会以 `>` 前缀并进同一条记录
+    （见下面「引用消息」一节）。只引用不写正文**也会存**，不再静默丢弃；
   - 数据落 `store.py`（SQLite）；发文件走 `send_file.py`（纯 HTTP，不占长连接）；
   - 配置读两处：`settings.py`（本机设置，可网页改）+ `.env`（凭据 / 路径）。
   - 上线播报：**第一次**连上发「功能介绍」（`intro_msg`），之后每次只发「启动播报」
@@ -37,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from types import SimpleNamespace
@@ -65,6 +68,7 @@ from store import (
     pick_boomerang,
     count_boomerang,
 )
+import store as _store
 import moyu
 import extensions as _ext
 import ignore as _ignore
@@ -132,6 +136,9 @@ def release_pid_lock():
                 os.remove(PID_FILE)
     except (OSError, ValueError):
         pass
+    # 🔴 心跳文件跟着 pid 一起收 —— 管家拿它判「链路还活着」，
+    #    留一份上一任的旧心跳会让它在进程刚重启的窗口里误判。
+    link_clear()
 
 
 
@@ -376,7 +383,7 @@ HELP_BASE = (
     "查待办 —— 看最近 10 条待办\n"
     "查灵感 —— 看还没处理的灵感\n"
     "搜索灵感 <关键词> —— 在灵感里搜（正文 / 标签 / 结论都算）\n"
-    "发文件 <关键词> —— 在配置中心「④ 发文件」设的目录里搜文件、渲染成图片发出\n"
+    "发文件 <关键词> —— 在配置中心「发文件」设的目录里搜文件、渲染成图片发出\n"
     "摸鱼 [1~5|放松|冷知识|全部] —— 随机来一条，歇一下\n"
     "回旋镖 [天数] —— 把 N 天前（默认 3 天）记过的旧账翻一条回来\n"
     "导出 [格式] —— 把全部待办 + 灵感导成一个文件发给你（格式 md / txt / json / zip）\n"
@@ -647,7 +654,7 @@ def idea_search_text(q, limit=10):
 # ── 「发文件」：搜索文件根目录 + 交互式选择 ────────────────────────
 # 🔴 搜索根默认是你的用户主目录（~）；用环境变量 MEMO_SEARCH_ROOT 改成任意目录
 #    （比如只搜某个项目文件夹）。**支持多个目录**（分号或换行分隔），配置中心
-#    「④ 发文件」里一行一个。注意：这是「发文件」功能的检索范围，
+#    「发文件」里一行一个。注意：这是「发文件」功能的检索范围，
 #    不要指向含凭据 / 私密文件的目录。
 # 🔴 同目录文件在搜索里加权（同分时优先）；用 MEMO_WORKSPACE_ROOT 覆盖。
 WORKSPACE_ROOT = os.getenv("MEMO_WORKSPACE_ROOT") or HERE
@@ -689,7 +696,7 @@ def search_scope_text(limit=120):
     """「没找到文件」回执里附的搜索范围说明（多个根用顿号连；过长截断）。
 
     默认根是用户主目录也照样显示 —— 用户得知道「刚才到底搜了哪儿」，
-    才好判断是该换个关键词，还是去配置中心「④ 发文件」加目录。
+    才好判断是该换个关键词，还是去配置中心「发文件」加目录。
     """
     s = "、".join(_prune_roots(SEARCH_ROOTS))
     return s if len(s) <= limit else s[: limit - 1] + "…"
@@ -997,6 +1004,278 @@ def setup_file_logging(path):
 
 
 # ── 路由：@ / 全量 / 私聊 共用 ────────────────────────────────────
+# ── 链路心跳（v0.3.2 掉线告警）────────────────────────────────────
+# 干嘛的：给管家（hub.py）一个**只有本进程能给出**的信号 ——
+#         「我和 QQ 网关之间的链路还活着吗」。管家自己查不到这个：
+#         它只能看进程在不在，看不了 WS。
+#
+# 🔴 为什么必须是「网关心跳 ACK」而不是「进程还活着」：
+#    botpy 的 `BotWebSocket._send_heart()` **只发心跳、从不看回执** ——
+#    `WS_HEARTBEAT_ACK`（op=11）在 `_is_system_event()` 里直接 `return True`，
+#    什么都不记。所以 TCP 半开（对端没了、本地还觉得连着）时，心跳一直往
+#    虚空里发、一条回执都收不到，botpy **永远发现不了**，也不会重连。
+#    用户看到的就是「进程活着、连接也连着，但发消息机器人没反应」。
+#    ⇒ 唯一可靠的判据是**记录最近一次收到 ACK 的时刻**，让管家看它有多旧。
+# 🔴 `LINK_FILE` 从 `alerts` 导入（不在这里另写一个）—— 文件的**读方 / 判旧逻辑 /
+#    阈值**都在那边；两处各定义一次，改一处忘一处就漂移，现象是「改了间隔却不生效」。
+from alerts import LINK_FILE  # noqa: E402  （掉线告警：链路心跳文件的路径）
+
+_link = {
+    "pid": os.getpid(),
+    "started_at": time.time(),
+    "ready_at": None,           # 收到 READY 的时刻
+    "ack_at": None,             # 最近一次收到网关心跳 ACK 的时刻
+    "hb_interval": None,        # 网关在 HELLO 里给的心跳间隔（秒）
+    "events": 0,                # 收到过多少条业务事件
+}
+_link_lock = threading.Lock()
+
+
+def link_mark(what, **fields):
+    """记一笔链路状态并落盘。
+
+    `what` ∈ `"ready"`（上线）/ `"ack"`（网关心跳回执）/ `"event"`（收到业务消息）。
+    谁调用它：`on_ready` / 网关补丁 / `route_message`。
+    """
+    now = time.time()
+    with _link_lock:
+        if what == "ready":
+            _link["ready_at"] = now
+            # 重连后 ACK 时刻要清零，否则拿上一次连接的旧时刻当「还活着」
+            _link["ack_at"] = None
+        elif what == "ack":
+            _link["ack_at"] = now
+        elif what == "event":
+            _link["events"] = _link.get("events", 0) + 1
+        _link.update(fields)
+        snap = dict(_link)
+    snap["updated_at"] = now
+    tmp = LINK_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        os.replace(tmp, LINK_FILE)          # 🔴 原子替换：管家随时在读，别让它读到半截
+    except OSError:
+        pass
+    return snap
+
+
+def link_clear():
+    """进程退出时删掉 `bot.link` —— 免得管家拿一份**上一任**的旧心跳当现状。"""
+    try:
+        os.remove(LINK_FILE)
+    except OSError:
+        pass
+
+
+def install_gateway_heartbeat():
+    """给 botpy 的网关补上**心跳回执记录**（它自己一个字节都不记）。
+
+    必须在建立连接**之前**调用。谁调用它：`main()`，挨着另外两个 install。
+    🔴 只加「记一笔」，不改 botpy 的任何行为 —— 不发额外请求、不动重连逻辑。
+    """
+    try:
+        from botpy.gateway import BotWebSocket
+    except Exception as e:                      # noqa: BLE001
+        print("[warn] 接管网关心跳失败（import）:", e, flush=True)
+        return False
+    if getattr(BotWebSocket, "_memo_heartbeat_patched", False):
+        return True
+
+    orig_system = BotWebSocket._is_system_event
+    orig_heart = BotWebSocket._send_heart
+
+    async def _is_system_event(self, message_event, ws):
+        # op=11 = Heartbeat ACK —— 这一条就是「链路真的通」的凭据
+        if message_event.get("op") == BotWebSocket.WS_HEARTBEAT_ACK:
+            link_mark("ack")
+        return await orig_system(self, message_event, ws)
+
+    async def _send_heart(self, interval):
+        # 心跳间隔由网关在 HELLO 里下发；记下来，「多久没 ACK 才算死」要按它算
+        link_mark("hb", hb_interval=interval)
+        return await orig_heart(self, interval)
+
+    BotWebSocket._is_system_event = _is_system_event
+    BotWebSocket._send_heart = _send_heart
+    BotWebSocket._memo_heartbeat_patched = True
+    return True
+
+
+# ── 引用消息（v0.3.2）──────────────────────────────────────────────
+# 干嘛的：QQ 里「引用一条 + 补一句」是最自然的说话方式，但机器人以前只看得到补的
+#         那句 —— 主语丢了。这一段负责把引用解析出来、合并进同一条记录。
+#
+# 🔴 第一道坎：botpy **根本不给**引用字段。
+#    `botpy.message.BaseMessage.__slots__` 里没有 `message_type` / `msg_elements`，
+#    `botpy/types/gateway.py` 的 `MessagePayload` 也没声明这两个字段 ⇒ 引用消息在
+#    botpy 里被**整个丢掉**，`message.msg_elements` 直接 AttributeError。
+#    所以下面包一层 `BaseMessage.__init__`，把**原始事件体**按「平台消息 id」留一份。
+#    🔴 键用平台消息 id（不是 `id(obj)`）—— 后者在对象回收后会被复用，迟早串味。
+_RAW_EVENTS = {}
+_RAW_EVENTS_MAX = 64            # 只留最近这些条；路由层同一拍就取走，够用
+
+QUOTE_MSG_TYPE = 103            # QQ 事件里「引用消息」的 message_type
+QUOTE_LAYERS_MAX = 3            # 引用块最多展开几层，更深的折叠成「…还有 N 层」
+QUOTE_UNREADABLE_HINT = "（引用的内容读不了：不是文字，机器人只能看到你补的这一句）"
+# 平台字段名官方给的是 content / author；「索引」字段各版本叫法不一，按候选表逐个试。
+# 🔴 认不出就退化成「只有平台给的那一层」，不报错、不阻断入库（见 compose_quote）。
+_QUOTE_TEXT_KEYS = ("content", "text")
+_QUOTE_AUTHOR_KEYS = ("author", "sender", "user", "nickname", "nick", "username")
+_QUOTE_IDX_KEYS = ("msg_idx", "message_idx", "msg_id", "message_id", "idx", "id")
+_QUOTE_AUTHOR_SUBKEYS = ("nickname", "nick", "username", "member_openid",
+                         "user_openid", "id")
+# 平台把读不出文字的内容写成 `[图片]` / `[卡片消息]` 这类占位符 —— 那不是真正文。
+_PLACEHOLDER_RE = re.compile(r"^[\[\(【（][^\]\)】）]{0,12}[\]\)】）]$")
+
+
+def install_raw_event_capture():
+    """让 botpy 把**原始事件体**留一份（引用消息只在里面）。
+
+    必须在建立连接**之前**调用 —— 它替换的是 `BaseMessage.__init__`。
+    谁调用它：`main()`，紧挨着 `install_group_message_parser()`。
+    """
+    try:
+        from botpy.message import BaseMessage
+    except Exception as e:                      # noqa: BLE001
+        print("[warn] 接管原始事件体失败（import）:", e, flush=True)
+        return False
+    if getattr(BaseMessage, "_memo_raw_patched", False):
+        return True
+    orig_init = BaseMessage.__init__
+
+    def __init__(self, api, event_id, data):
+        orig_init(self, api, event_id, data)
+        _remember_raw(self, data)
+
+    BaseMessage.__init__ = __init__
+    BaseMessage._memo_raw_patched = True
+    print("[init] 已接管原始事件体（引用消息解析用）", flush=True)
+    return True
+
+
+def _remember_raw(msg, data):
+    """把原始事件体按平台消息 id 记下来。记不上也不能影响收消息。"""
+    mid = getattr(msg, "id", None)
+    if not mid or not isinstance(data, dict):
+        return
+    try:
+        _RAW_EVENTS[mid] = data
+        while len(_RAW_EVENTS) > _RAW_EVENTS_MAX:
+            _RAW_EVENTS.pop(next(iter(_RAW_EVENTS)))
+    except Exception:                           # noqa: BLE001
+        pass
+
+
+def raw_event(msg):
+    """取这条消息的原始事件体（拿不到返回 {}）。"""
+    mid = getattr(msg, "id", None)
+    return (_RAW_EVENTS.get(mid) or {}) if mid else {}
+
+
+def _first_str(d, keys):
+    """从 dict 里按候选键取第一个非空字符串；值是 dict 时再往里挖一层。"""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            for kk in _QUOTE_AUTHOR_SUBKEYS:
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv.strip():
+                    return vv.strip()
+    return ""
+
+
+def parse_quote(msg):
+    """把消息里的「引用」解析出来。
+
+    返回 None（不是引用消息）或 dict：
+      text     被引用正文（读不出来就是 ""）
+      author   被引用者（拿不到就是 ""）
+      msg_idx  被引用消息在平台侧的索引（认不出就是 ""）
+      media    True = 被引用的是图片 / 卡片这类**读不出文字**的内容
+    """
+    data = raw_event(msg)
+    try:
+        mtype = int(data.get("message_type") or 0)
+    except (TypeError, ValueError):
+        mtype = 0
+    els = data.get("msg_elements")
+    if mtype != QUOTE_MSG_TYPE or not isinstance(els, (list, tuple)) or not els:
+        return None
+    first = els[0] if isinstance(els[0], dict) else {}
+    text = _first_str(first, _QUOTE_TEXT_KEYS)
+    if text and _PLACEHOLDER_RE.match(text):
+        text = ""                       # `[图片]` 这种占位符不算读到了正文
+    return {
+        "text": text,
+        "author": _first_str(first, _QUOTE_AUTHOR_KEYS),
+        "msg_idx": _first_str(first, _QUOTE_IDX_KEYS),
+        "media": not text,
+    }
+
+
+def _quote_lines(text):
+    """把一段文本切成 `(层号, 正文)` 列表 —— 先剥掉原来的 `>` 标记，再重新分层。
+
+    🔴 剥掉再重加是刻意的：快照本身可能是别的记录的正文（已经带 `>` 了），
+       直接拼会出现 `> > > >` 越滚越长。
+    """
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        lvl = 0
+        while ln.startswith(">"):
+            lvl += 1
+            ln = ln[1:].strip()
+        if ln:
+            out.append((lvl, ln))
+    return out
+
+
+def compose_quote(snapshot, body, layers=QUOTE_LAYERS_MAX):
+    """把引用块拼到正文前面，返回 `(完整正文, 引用块)`。
+
+    形态（Markdown 引用块，深一层多一个 `>`）::
+
+        > 下周去杭州
+        > > 改成下个月
+        记得带伞
+
+    🔴 快照里的每一行**整体下沉一层**（+1）—— 因为它是「被引用者自己的内容」。
+    🔴 最多展开 `layers` 层，更深的折叠成 `…还有 N 层`。这同时就是**防环兜底**：
+       引用只能指向过去（不会成环），但万一以后加了「改引用来源」，深度上限也
+       保证它不会无限套下去。
+    """
+    lines = [(lvl + 1, t) for lvl, t in _quote_lines(snapshot)]
+    if not lines:
+        return body or "", ""
+    kept = [(lvl, t) for lvl, t in lines if lvl <= layers]
+    folded = len(lines) - len(kept)
+    block = "\n".join("> " * lvl + t for lvl, t in kept)
+    if folded:
+        block += "\n" + "> " * layers + f"…还有 {folded} 层"
+    return ((block + "\n" + body) if body else block), block
+
+
+def resolve_quote_snapshot(quote):
+    """确定引用块的**快照文本**和**引用来源记录 id**，返回 `(snapshot, refers_to)`。
+
+    🔴 平台只给**一层**：c 引用 b 时，平台给的是 b 的正文，**不含 b 自己的引用块**。
+       所以「多层」要靠记录自己驮着 —— 能按 `msg_idx` 反查到来源记录，就直接用
+       它的 `content`（那里面已经有它自己的引用块了）。
+    🔴 反查不到（引用的是机器人的回复 / 指令消息 / `msg_idx` 过期）⇒ 退化成
+       「只有平台给的那一层正文」，照常存、照常显示，**不报错**。
+    """
+    if not quote:
+        return "", None
+    src = _store.find_by_msg_idx(quote.get("msg_idx")) if quote.get("msg_idx") else None
+    if src is not None:
+        return (src.get("content") or ""), src.get("id")
+    return (quote.get("text") or ""), None
+
+
 async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     """@ / 全量 / 私聊 共用路由。mentioned=False 时只认明确指令，避免误触。
 
@@ -1005,7 +1284,9 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     """
     t = chat_target(message, scope)
     gid, mid = t["key"], (getattr(message, "id", "") or "")
-    # 记下这个会话（群 / 私聊都记）—— 配置中心「① 连接 QQ」据此列出
+    # 链路心跳：收到业务事件 = 链路真的通（比网关心跳 ACK 更硬的证据）。
+    link_mark("event")
+    # 记下这个会话（群 / 私聊都记）—— 配置中心「连接 QQ」页据此列出
     # 「机器人在哪些会话里活动过」，用户点着勾选就决定播报发到哪（见 push.py）。
     # 🔴 不传名字：平台侧根本拿不到 —— 群名接口要白名单，私聊没有查用户信息的接口。
     #    `botpy.message.GroupMessage.__slots__` 里连 `group_name` 都没有，
@@ -1022,6 +1303,22 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         # 留原始内容便于排查 @ 占位符的真实编码
         print(f"[@消息] scope={scope} raw={raw!r} -> text={text!r}", flush=True)
 
+    # 引用消息：`message_type=103`，被引用正文在原始事件体的 `msg_elements[0]`。
+    # 🔴 这里**只解析、不合成** —— 合成放在 `_store_media` 里做，因为「要入库的正文」
+    #    只有那一个地方用得上。下面所有指令闸门一律看**用户自己敲的 text**：
+    #    引用不该让「发文件 xxx」这类指令失灵，也不该让被引用内容触发指令。
+    quote = parse_quote(message)
+    if quote is not None:
+        # 留原始字段便于核实平台真实字段名（索引字段官方没写明，见 parse_quote）
+        print(f"[引用] scope={scope} idx={quote['msg_idx']!r} media={quote['media']} "
+              f"text={quote['text'][:120]!r}", flush=True)
+        if not quote["msg_idx"]:
+            # 🔴 索引字段**没认出来**（候选表全不中）⇒ 把原始元素整个打出来。
+            #    这是唯一能在真机上核实「平台到底把这个索引叫什么」的手段 ——
+            #    拿到这行日志就能回 `_QUOTE_IDX_KEYS` 里补一个候选键。
+            _els = raw_event(message).get("msg_elements") or [{}]
+            print(f"[引用·原始元素] {_els[0]!r}", flush=True)
+
     # 0) 忽略表：先放行「忽略」指令本身（否则指令会被自己的规则吃掉），
     #    再对普通消息做闸门 —— 命中即整条跳过（不收灵感、不响应、**也不收图**）。
     #    同群有别的机器人时，靠这个避免互相收集 / 循环响应。
@@ -1031,7 +1328,9 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     # ⚠️ 但纯图片消息 `text` 是空的，而忽略表按文本匹配 —— 空文本匹配不到任何规则，
     #    所以这里先判「有没有图」，有图就继续往下走（不能因为没文本就 return）。
     urls = image_urls(message)
-    if not text and not urls:
+    # 🔴 `quote is None` 也要放行：**只引用、不写正文**的消息 text 是空的，
+    #    以前直接在这里 return ⇒ 用户以为机器人坏了（v0.3.2 修的就是这个）。
+    if not text and not urls and quote is None:
         return
 
     if text and _ignore.is_command(text):
@@ -1063,7 +1362,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     # 🔴 从这里往下全是**看文本**的分支。纯图片消息（text 为空）要直接跳到兜底收图，
     #    否则 `FILE_SEND_RE.match("")` 这类空串匹配会莫名其妙命中。
     if not text:
-        return await _store_media(message, t, scope, urls, "", mentioned)
+        return await _store_media(message, t, scope, urls, "", mentioned, quote=quote)
 
     # 1) 发文件：搜工作区 → 唯一直接发 / 多个列出来问
     bare_cmds = BARE_FILE_CMDS if mentioned else {"发文件", "找文件", "发送文件"}
@@ -1077,7 +1376,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         #    卡死几十秒 —— 期间收不到任何消息、心跳也停摆。
         matches = await asyncio.to_thread(search_files, q)
         if not matches:
-            # 把实际搜索范围回给用户：根可能是好几个（配置中心「④ 发文件」），
+            # 把实际搜索范围回给用户：根可能是好几个（配置中心「发文件」），
             # 不说清楚「搜了哪儿」，用户只会反复换关键词干着急。
             await message.reply(
                 content=f"（没找到含「{q}」的文件 —— 只搜这些目录："
@@ -1213,7 +1512,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
     #             没配回执就回「没认出来」，免得「@ 了却没反应」分不清是没识别还是挂了
     #   非 @ 群消息：静默落灵感，不把群聊变成机器人频道
     if scope == SCOPE_C2C:
-        await _store_media(message, t, scope, urls, text.strip(), mentioned)
+        await _store_media(message, t, scope, urls, text.strip(), mentioned, quote=quote)
         return
     if mentioned:
         # 🔴 以前这里**只收图、正文直接丢**，回一句「没认出来」—— 于是「灵感回执」
@@ -1221,7 +1520,7 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         #    私聊那条路会回执，群里这条路根本不走 idea_ack）。
         #    现在统一走 `_store_media`（正文 + 图一起收，并按需回执），
         #    没配回执时再补一句「没认出来」，行为与以前一致、但不再丢正文。
-        await _store_media(message, t, scope, urls, text.strip(), mentioned)
+        await _store_media(message, t, scope, urls, text.strip(), mentioned, quote=quote)
         if not (_settings.get("idea_ack") or "").strip():
             print(f"[未识别] @消息 text={text!r}", flush=True)
             await message.reply(
@@ -1230,30 +1529,54 @@ async def route_message(client, message, mentioned, scope=SCOPE_GROUP):
         return
 
     # 5) 非 @ 的普通文本 → 自动收作「灵感」（静默，不打扰群）
-    await _store_media(message, t, scope, urls, text.strip(), mentioned)
+    await _store_media(message, t, scope, urls, text.strip(), mentioned, quote=quote)
 
 
-async def _store_media(message, t, scope, urls, text, mentioned):
-    """兜底入库：把这条消息（文本 + 图）收作灵感。
+async def _store_media(message, t, scope, urls, text, mentioned, quote=None):
+    """兜底入库：把这条消息（文本 + 图 + 引用）收作灵感。
 
     🔴 纯图片消息的 `content` 是空的 —— 但**不能丢**（用户发图就是想存），
        给一个占位文本 `[图片]` / `[图片 ×3]`，否则抽屉里是一条空白卡片。
+    🔴 **引用在这里合成**（不是在上层）：`_store_media` 是唯一的入库口，
+       放在这儿两条调用路径自动都覆盖到。
     """
     pics = await collect_images_async(message, scope)
     body = text
-    if not body:
+    refers_to = quote_snapshot = None
+    if quote is not None:
+        snapshot, refers_to = resolve_quote_snapshot(quote)
+        if snapshot:
+            quote_snapshot = snapshot
+        else:
+            # 被引用的是图片 / 卡片：读不出文字。**明说**，不装没看见。
+            try:
+                await message.reply(content=QUOTE_UNREADABLE_HINT, msg_seq=1)
+            except Exception as e:                  # noqa: BLE001  回执失败不影响入库
+                print(f"[引用·回执失败] {type(e).__name__}: {e}", flush=True)
+            refers_to = None
+    # 🔴 `quote_snapshot` 也算「有内容」—— **只引用、不写正文**时 body 是空的，
+    #    但它必须存下来（v0.3.2 修的就是「只引用一条消息，机器人完全没反应」）。
+    if not body and not quote_snapshot:
         if not pics:
-            return                                  # 没文本也没图 → 确实没东西可存
+            return                                  # 没文本也没图也没引用 → 确实没东西可存
         body = f"[图片 ×{len(pics)}]" if len(pics) > 1 else "[图片]"
-    if not text and not pics:
-        return
-    # 「# 标签」：正文按约定切给标签列（词边界之外的 # 不当标签，见 split_tags）
+    # 「# 标签」：正文按约定切给标签列（词边界之外的 # 不当标签，见 split_tags）。
+    # 🔴 **只切用户自己敲的那一段，引用块不参与** —— 标签区是从 `#` 一路吃到
+    #    下一个 `#` 或**全文末尾**的，要是把引用块也算进去，引用内容末尾一个 `#`
+    #    就会把后面的正文一起吞成标签名。引用块是快照，原样保留才对。
     body, tags = split_tags(body)
+    if quote_snapshot:
+        # 引用块拼在**标签切分之后** —— 顺序反了会把引用块里的 # 也切走
+        body, _block = compose_quote(quote_snapshot, body)
     idea = add_memo(t["store_id"], t["store_name"], t["sender_id"], "",
-                    body, kind=KIND_IDEA, images=pics, tags=tags or None)
+                    body, kind=KIND_IDEA, images=pics, tags=tags or None,
+                    # 这条消息在平台侧的索引 —— 别人引用它时靠这个反查
+                    msg_idx=(getattr(message, "id", "") or ""),
+                    refers_to=refers_to, quote_snapshot=quote_snapshot)
     tag = "灵感·私聊" if scope == SCOPE_C2C else "灵感"
     print(f"[{tag}] {t['key']} -> {idea['content']}"
-          f"{f'（+{len(pics)} 图）' if pics else ''}", flush=True)
+          f"{f'（+{len(pics)} 图）' if pics else ''}"
+          f"{'（引用）' if quote_snapshot else ''}", flush=True)
     if scope == SCOPE_C2C or mentioned:
         idea_ack = (_settings.get("idea_ack") or "").strip()   # 留空 = 静默收下
         if idea_ack:
@@ -1293,10 +1616,20 @@ def main():
         sys.exit(1)
 
     install_group_message_parser()
+    # 🔴 必须在建连**之前** —— 引用消息的 message_type / msg_elements 只存在于
+    #    原始事件体里，botpy 不会往消息对象上放（见 install_raw_event_capture）。
+    install_raw_event_capture()
+    # 🔴 同样必须在建连之前 —— 它给网关补的是「心跳回执记录」（见上面那一节）。
+    install_gateway_heartbeat()
+    # 起手先落一次心跳：管家在 bot 刚起来、还没收到 READY 时就能看到 pid 对上了，
+    # 从而走「宽限期」而不是「链路已死」。
+    link_mark("start")
 
     class MemoClient(Client):
         async def on_ready(self):
             print(f"[botpy] 已上线：{self.robot.name}", flush=True)
+            # 链路心跳：管家靠 `bot.link` 判「进程活着但账号掉线」（见那一节）
+            link_mark("ready")
             # 播报（主动推送：群内需开启「机器人主动发言」；私聊无需开关）
             # 🔴 目标由用户自己在配置中心勾选（`.env` 的 `QQ_PUSH_TARGETS`，
             #    格式 `group:<id>;c2c:<id>`，见 push.py）—— 群和私聊平级，

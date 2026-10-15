@@ -311,7 +311,7 @@ def autostart_set(on):
 def autostart_state():
     """开机自启是否已开 —— 计划任务**存在且可用**（ready / running）才算开。
 
-    托盘菜单的「开机自启：开/关」和配置中心「⑦ 运行方式」的自启勾选框
+    托盘菜单的「开机自启：开/关」和配置中心「运行方式」的自启勾选框
     都读它来显示当前状态、再调 `autostart_set` 翻转。
 
     🔴 **不能 `force=True`** —— 那会同步起一次 PowerShell（1.2 秒），

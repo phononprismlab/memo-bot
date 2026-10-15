@@ -34,6 +34,7 @@ import atexit
 import os
 import subprocess
 import sys
+import threading
 import time
 
 for _stream in (sys.stdout, sys.stderr):
@@ -47,8 +48,12 @@ sys.path.insert(0, HERE)
 
 from paths import data_path  # noqa: E402  （数据目录：pid 等可写文件落哪）
 
+import alerts  # noqa: E402  （v0.3.2 掉线告警：探活 / 判据 / 带外通知）
 import botctl  # noqa: E402  （机器人进程控制：start/stop/restart，配置中心与管家共用）
+import push  # noqa: E402  （只为 `push._get` 读 .env：进程不自己 load_dotenv）
+import settings  # noqa: E402  （探活间隔 / 冷却 / webhook 都在这里）
 import single_lock  # noqa: E402  （OS 级单实例锁）
+import shortcut  # noqa: E402  （任务栏图标：开始菜单快捷方式带同一个 AUMID）
 
 LAUNCHER = os.path.join(HERE, "memo-launcher.py")
 HUB_PID_FILE = data_path("hub.pid")
@@ -203,18 +208,46 @@ _exit_confirming = threading.Event()          # 确认框已弹出（防连点�
 _tray_state = {                               # 主循环写、托盘菜单读的共享状态
     "bot_running": False,
     "autostart": False,
+    # 🔴 「账号掉线」告警：进程还在跑、但收不到消息。和 bot_running 是**两件事** ——
+    #    前者亮青绿、这个亮琥珀，用户一眼能分「机器人没开」和「机器人开了但账号掉了」。
+    "alert": False,
+}
+
+# 托盘图标的三个状态色。🔴 琥珀色是**新加的第三态**（v0.3.2 掉线告警）：
+# 青绿 = 正常跑，灰 = 被用户停了 / 进程不在，琥珀 = 进程在但账号掉线。
+# 琥珀特意避开红 —— 这时候进程还活着、机器人只是「说不了话」，
+# 用红色会让用户以为整个东西崩了（灭火和降级的区别）。
+_ICON_COLORS = {
+    "alert": (217, 119, 6, 255),       # #d97706 琥珀
+    "running": (15, 143, 133, 255),    # #0f8f85 品牌青绿
+    "stopped": (122, 138, 147, 255),   # 静默灰
 }
 
 
-def _make_icon(running):
-    """画一个托盘图标（泡泡母题）：跑着=品牌青绿，掉了=静默灰。"""
+def _make_icon(running, alert=False):
+    """画一个托盘图标（泡泡母题）：跑着=品牌青绿，告警中=琥珀，停了=静默灰。"""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    main = (15, 143, 133, 255) if running else (122, 138, 147, 255)   # #0f8f85 / 灰
+    # 🔴 层层相扣：进程没跑 ⇒ 一律灰（哪怕上一轮告警状态没被清干净也盖住）。
+    #    琥珀只属于「进程在、账号掉线」这一种情况。
+    key = "running" if running else "stopped"
+    if alert and running:
+        key = "alert"
+    main = _ICON_COLORS[key]
     d.ellipse([6, 6, size - 6, size - 6], fill=main)                  # 泡泡主体
     d.ellipse([18, 18, 31, 31], fill=(255, 255, 255, 230))             # 高光小白点
     return img
+
+
+def _refresh_icon():
+    """按共享状态重画托盘图标（颜色 = 跑没跑 × 告警中没告警）。"""
+    if _tray is None:
+        return
+    try:
+        _tray.icon = _make_icon(_tray_state["bot_running"], _tray_state["alert"])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _set_bot_state(running):
@@ -222,11 +255,16 @@ def _set_bot_state(running):
     if _tray_state["bot_running"] == running:
         return
     _tray_state["bot_running"] = running
-    if _tray is not None:
-        try:
-            _tray.icon = _make_icon(running)
-        except Exception:  # noqa: BLE001
-            pass
+    _refresh_icon()
+
+
+def _set_alert_state(alert):
+    """「账号掉线」状态变了：换图标色（琥珀），并给托盘菜单一个可见标记。"""
+    alert = bool(alert)
+    if _tray_state["alert"] == alert:
+        return
+    _tray_state["alert"] = alert
+    _refresh_icon()
 
 
 def _act_open_gui(icon, item):
@@ -250,16 +288,20 @@ def _launch_gui():
 def _act_bot_start(icon, item):
     botctl.bot_start()
     _set_bot_state(botctl.bot_running())
+    # 刚起，链路还没握上手 —— 先按「没告警」画，探活自己会改
+    _set_alert_state(False)
 
 
 def _act_bot_stop(icon, item):
     botctl.bot_stop()
-    _set_bot_state(botctl.bot_running())
+    _set_bot_state(False)
+    _set_alert_state(False)      # 进程都没了，谈不上「账号掉线」
 
 
 def _act_bot_restart(icon, item):
     botctl.bot_restart()
     _set_bot_state(botctl.bot_running())
+    _set_alert_state(False)
 
 
 def _act_toggle_autostart(icon, item):
@@ -391,6 +433,14 @@ def _build_menu():
                 pystray.MenuItem("重启", _act_bot_restart),
             ),
         ),
+        # 「账号掉线」提示行：**只在真的掉线时才显示**（`visible`）—— 图标已经
+        # 变成琥珀色了，这一行告诉用户「我盯着呢，是账号掉了」。不可点（enabled=False）。
+        pystray.MenuItem(
+            lambda item: "⚠ 账号掉线了 —— 点「打开摸鱼bot」看看",
+            None,
+            visible=lambda item: bool(s["alert"]),
+            enabled=lambda item: False,
+        ),
         pystray.MenuItem(
             lambda item: "开机自启：开" if s["autostart"] else "开机自启：关",
             _act_toggle_autostart,
@@ -424,6 +474,45 @@ def _sleep_or_exit(sec):
         sec -= step
 
 
+# ── 掉线探活（v0.3.2）────────────────────────────────────────────
+# 干嘛的：每一轮主循环问一句「账号还在不在」。这一层**只调度**，
+#         判断 / 冷却 / 发通知都归 `alerts`。
+_alert_next_at = 0.0            # 下一次探活的时刻（0 = 还没探过，先探一次）
+
+
+def _alert_credentials():
+    """从 `.env` 取探活凭据（管家进程自己**不** load_dotenv，照 push 的办法读）。"""
+    appid = push._get("QQ_BOT_APPID")
+    secret = push._get("QQ_BOT_SECRET") or push._get("QQ_BOT_TOKEN")
+    sandbox = (push._get("QQ_SANDBOX") or "").strip().lower() in ("1", "true", "yes")
+    return appid, secret, sandbox
+
+
+def _probe_account_once(now):
+    """跑一轮掉线探活，按需告警 + 换托盘图标。**任何异常都不许影响机器人。**"""
+    try:
+        interval = float(settings.get("alert_probe_sec") or 120)
+    except (TypeError, ValueError):
+        interval = 120.0
+    interval = max(30.0, interval)          # 别让配置写得太小变成打 QQ 接口
+    global _alert_next_at
+    _alert_next_at = now + interval
+    # 进程不在 ⇒ 交给下面那段自动重启，这一轮什么都不判
+    if not botctl.bot_running():
+        return
+    appid, secret, sandbox = _alert_credentials()
+    try:
+        r = alerts.run_check(
+            now=now, bot_alive=True, icon=_tray,
+            appid=appid or None, secret=secret or None, sandbox=sandbox,
+        )
+    except Exception as e:                          # noqa: BLE001
+        print(f"[管家] 掉线探活自己出错了（不影响机器人）："
+              f"{type(e).__name__}: {e}", flush=True)
+        return
+    _set_alert_state(r.get("state") == alerts.STATE_OFFLINE)
+
+
 # ── 主流程 ──────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="摸鱼bot 管家（桌面窗口 + 机器人）")
@@ -440,6 +529,9 @@ def main():
 
     # 1) 桌面窗口（webui 已退役：配置中心和脑内抽屉都在这个原生窗口里）。
     #    --no-browser = 开机自启后台模式：只留托盘，窗口从托盘菜单开。
+    # 任务栏图标：开始菜单放一个带**同一个 AUMID** 的快捷方式，Windows 就会
+    # 从它取任务栏图标（金鱼）—— 进程里的 iconphoto 落不到任务栏。幂等。
+    shortcut.ensure()
     children = []
     if not args.no_browser:
         gui = Child("摸鱼bot 窗口", ["--gui"], "hub-gui.log")
@@ -461,6 +553,9 @@ def main():
 
     # 3) 起托盘（独立线程跑 pystray 消息循环；没装 pystray 就静默跳过）
     _start_tray()
+    # 掉线告警：开机先清掉上一轮的状态（见 `reset_state` 的说明 ——
+    # 不然等新链路握手成功，会弹一条莫名其妙的「恢复了」）。
+    alerts.reset_state()
 
     # 4) 常驻 —— 盯着机器人；崩了自动拉起（最多 3 次，防抖动死循环）。
     #    桌面窗口被用户关掉不算事（托盘菜单随时再开），管家不跟着退。
@@ -474,18 +569,28 @@ def main():
                 if c.proc and c.proc.poll() is not None:
                     print(f"[管家] {c.name} 已关闭（用户关窗口属正常）。", flush=True)
                     c.proc = None
-            if bot_wanted:
-                if botctl.bot_running():
-                    _set_bot_state(True)
+            if bot_wanted and botctl.bot_running():
+                _set_bot_state(True)
+                # 掉线探活（v0.3.2）：进程确认活着，到了间隔才问「账号还在不在」。
+                # 🔴 放在这里而不是循环开头：进程都停了就不必再打 QQ 接口了
+                #    （`_probe_account_once` 里也有一道同样的闸，双保险）。
+                _now = time.time()
+                if _now >= _alert_next_at:
+                    _probe_account_once(_now)
+            elif bot_wanted:
+                _set_bot_state(False)
+                # 机器人进程没了 ⇒ 没有「账号掉线」可言，图标回到灰色
+                _set_alert_state(False)
+                if bot_restarts < 3:
+                    bot_restarts += 1
+                    ok, msg = botctl.bot_start()
+                    print(f"[管家] 机器人掉了，重启（第 {bot_restarts} 次）：{msg}", flush=True)
                 else:
-                    _set_bot_state(False)
-                    if bot_restarts < 3:
-                        bot_restarts += 1
-                        ok, msg = botctl.bot_start()
-                        print(f"[管家] 机器人掉了，重启（第 {bot_restarts} 次）：{msg}", flush=True)
-                    else:
-                        print("[管家] ⚠ 机器人反复退出，不再自动重启（看 bot.out.log）", flush=True)
-                        bot_wanted = False     # 停掉自动重启，避免空转
+                    print("[管家] ⚠ 机器人反复退出，不再自动重启（看 bot.out.log）", flush=True)
+                    bot_wanted = False     # 停掉自动重启，避免空转
+            elif _tray_state["alert"]:
+                # 进程被用户主动停了（`bot_wanted=False` 后又不会自动探活）—— 手动清一次
+                _set_alert_state(False)
     except KeyboardInterrupt:
         print("\n[管家] 收到 Ctrl+C，正在收尾…", flush=True)
     finally:

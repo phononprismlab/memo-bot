@@ -233,6 +233,69 @@ def get_access_token(appid, secret):
     return data["access_token"]
 
 
+# ── 只读 GET（掉线告警的探活用）────────────────────────────────────
+# 🔴 放在本文件的理由只有一个：**免代理的 `_OPENER` 只此一份**。
+#    机器上留着指向本机、但已关掉的代理时（Clash / 抓包工具 / IDE 调试代理都这么干），
+#    `urllib` 默认走系统代理 ⇒ 全变成 `WinError 10061` —— 上面那段注释已经踩过两次。
+#    把这个坑的知识复制到第二个模块里，迟早有一份忘了改。
+def _get_json(url, headers=None, timeout=15):
+    """GET JSON。只读，不重试 —— 失败抛 RuntimeError（调用方自己决定轻重）。"""
+    try:
+        req = urllib.request.Request(url, method="GET", headers=dict(headers or {}))
+        with _OPENER.open(req, timeout=timeout) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {e.code}: {detail}") from None
+    except Exception as e:  # noqa: BLE001  URLError / socket timeout / JSON 解析失败
+        raise RuntimeError(f"{type(e).__name__}: {e}") from None
+
+
+def probe_account(appid, secret, sandbox=False, timeout=8):
+    """只读探活：凭据还有没有效、机器人还在不在。
+
+    返回 `(state, detail)`，state ∈ `"ok"` / `"bad"` / `"unknown"`。
+
+    🔴 **必须只读**：这里一个字都不能发出去。账号掉线时机器人本来就用不了 QQ，
+       探活要是产生消息，等于拿垃圾信息轰炸用户。`GET /users/@me`（获取机器人信息）
+       没有任何副作用。
+    🔴 **不会误报**：接口被改名 / 升级时返回的是 4xx（不是 401/403），那说明是我们
+       这边的代码旧了，不是账号掉了 ⇒ 归 `"unknown"`，绝不当成掉线告警。
+    🔴 网络抖动也归 `"unknown"` —— 「账号掉线」由链路心跳判，那里更准；
+       这里只在「凭据明确失效」时补一脚。
+    🔴 取 token **不重试**（发送那条路会重试）：探活是周期性任务，慢就是慢，
+       压着重试会把 「3 次 × timeout」 串成「看门狗被卡住半分钟」。
+       ⇒ 两次请求最坏 `2 × timeout`，默认 8 秒封顶。
+    """
+    try:
+        got = _post_json(TOKEN_URL, {"appId": appid, "clientSecret": secret},
+                         timeout=timeout, retries=0)
+        if "access_token" not in got:
+            return "bad", "取 access_token 失败：返回里没有 access_token"
+        token = got["access_token"]
+    except Exception as e:                          # noqa: BLE001
+        text = str(e)
+        state = "bad" if ("HTTP 401" in text or "HTTP 403" in text
+                          or "access_token" in text) else "unknown"
+        return state, f"取 access_token 失败（检查 AppID/AppSecret）：{text}"
+    base = API_SANDBOX if sandbox else API_PROD
+    try:
+        data = _get_json(f"{base}/users/@me",
+                         {"Authorization": f"QQBot {token}",
+                          "X-Union-Appid": appid},
+                         timeout=timeout)
+    except Exception as e:                          # noqa: BLE001
+        text = str(e)
+        if text.startswith("HTTP 401") or text.startswith("HTTP 403"):
+            return "bad", text
+        # 接口改名 / 限流 / 网络抖动都归这里：不告警，只让调用方记日志
+        return "unknown", text
+    name = (data.get("username") or data.get("nickname")
+            or data.get("name") or "")
+    return "ok", name
+
+
 def send_file(file_path, openid, caption, file_type, sandbox, appid, secret, msg_id=None,
               seq_base=1, scope=SCOPE_GROUP):
     """发送一个文件到群（scope='group'）或单聊（scope='c2c'）。"""

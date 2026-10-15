@@ -48,7 +48,7 @@ _SCOPE_ALIASES = {"decided": "done",          # 2026-10-12 分类合并
 
 # ── 可设置的键 ───────────────────────────────────────────────────
 # kind: text（一行文本，留空 = 关掉该功能）/ area（多行文本，换行有意义）/
-#       multi（多选，值是一组 code）/ int（整数）
+#       multi（多选，值是一组 code）/ int（整数）/ bool（开 / 关）
 KEYS = {
     "startup_msg": {
         "label": "启动播报",
@@ -170,6 +170,48 @@ KEYS = {
         "help": "图片占用超过这个 GB 数时，往播报目标发一条提醒（默认 5）；填 0 = 不报警。"
                 "占用回落到阈值以下的下一次超标才会再提醒一次，不会刷屏。",
     },
+    # ── 掉线告警（v0.3.2）─────────────────────────────────────────
+    # 🔴 这四条是**唯一**一组「机器人自己发不出去消息」时的设置 ——
+    #    账号掉线时 QQ 通道不可用，告警只能走**带外**（托盘气泡 / webhook）。
+    "alert_enabled": {
+        "label": "掉线告警",
+        "kind": "bool",
+        "default": True,
+        "help": "机器人进程还在、但账号已经掉线（收不到消息）时，用系统托盘气泡提醒你。"
+                "默认开。关掉 = 完全不探活。",
+    },
+    "alert_probe_sec": {
+        "label": "探活间隔（秒）",
+        "kind": "int",
+        "default": 120,
+        "min": 30,
+        "max": 3600,
+        "help": "多久检查一次账号还在不在线（默认 120 秒）。调小 = 发现更快，"
+                "但会更频繁地请求 QQ 接口；最小 30 秒。",
+    },
+    "alert_cooldown_min": {
+        "label": "告警冷却（分钟）",
+        "kind": "int",
+        "default": 30,
+        "min": 1,
+        "max": 1440,
+        "help": "同一场掉线最多隔多久提醒一次（默认 30 分钟），防止刷屏。"
+                "恢复正常时会立刻发一条，不受冷却限制。",
+    },
+    "alert_webhook": {
+        "label": "告警 webhook 地址",
+        "kind": "text",
+        "default": "",
+        # 🔴 留空 = 只用托盘气泡（零配置可用）；填了就在发托盘气泡的同时 POST 一条 JSON。
+        #    发不出去**只写日志**，绝不影响机器人本身。
+        # 🔴 help 要说清「这一行是干嘛的」（用户 2026-10-16）：光写「填一个地址」
+        #    用户不知道它解决什么问题 —— 掉线时 QQ 通道本身就是断的，托盘气泡
+        #    又只有人坐在机器前才看得见，这一行是给「人不在电脑前」留的逃生口。
+        "help": "机器人掉线时，除了弹系统托盘气泡，还可以往这个网址发一条提醒 —— 人不在"
+                "电脑前也能在手机 / 群里收到（托盘气泡只有你正坐在机器前才看得到）。"
+                "填一个 http(s) 开头的网址，掉线和恢复各发一条 JSON；留空 = 只用托盘气泡，"
+                "什么都不用配。",
+    },
 }
 
 CMD_WORDS = ("设置", "配置")
@@ -237,6 +279,25 @@ def _to_code(key, token):
     return None
 
 
+# bool 键：人从群里发的、网页传的、代码里传的三种来源都认。
+# 🔴 中文口语和符号都要收 —— 用户在群里发「设置 掉线告警 开」是很自然的写法；
+#    认不出时**报错**而不是猜（猜错会让用户以为设置生效了）。
+_BOOL_TRUE = {"1", "true", "yes", "y", "on", "开", "开启", "打开", "启用", "是", "√", "✓"}
+_BOOL_FALSE = {"0", "false", "no", "n", "off", "关", "关闭", "关掉", "禁用", "否", "不", "×", "x", "✗"}
+
+
+def _to_bool(raw):
+    """任意来源 → (True/False, err)。"""
+    if isinstance(raw, bool):
+        return raw, None
+    s = str(raw if raw is not None else "").strip().lower()
+    if s in _BOOL_TRUE:
+        return True, None
+    if s in _BOOL_FALSE:
+        return False, None
+    return None, f"要填「开」或「关」（现在是「{raw}」）"
+
+
 def normalize(key, raw):
     """把外部传进来的值转成规范形式 → (value, err)。err 非空表示不合法。"""
     if key not in KEYS:
@@ -244,6 +305,8 @@ def normalize(key, raw):
     cfg = KEYS[key]
     if cfg["kind"] in ("text", "area"):
         return str(raw if raw is not None else "").strip(), None
+    if cfg["kind"] == "bool":
+        return _to_bool(raw)
     if cfg["kind"] == "int":
         s = str(raw if raw is not None else "").strip()
         try:

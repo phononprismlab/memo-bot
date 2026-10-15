@@ -33,6 +33,7 @@ import tkinter.scrolledtext as scrolledtext
 import webbrowser
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
+from ttkbootstrap.widgets import ScrolledFrame   # 固定高度 + 内部滚动的容器
 
 # 把脚本所在目录钉进 sys.path / 工作目录，本地模块（store / media / config_core）才能稳定导入。
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,10 +49,20 @@ import settings as _settings   # 设置项：脑内抽屉的展示范围 / 回�
 import extmgr as _extmgr       # 自定义指令：扩展包的导入 / 列出 / 移除
 import botctl as _botctl       # 进程 / 计划任务查询（首屏靠它的非阻塞接口提速）
 import diag as _diag           # 诊断包：环境 + 配置摘要 + 日志尾巴打成一个 zip
+import shortcut as _shortcut   # 任务栏图标：AUMID 常量唯一定义处 + 开始菜单快捷方式
+APP_USER_MODEL_ID = _shortcut.APP_USER_MODEL_ID
 from paths import data_path, data_dir  # noqa: E402  （gui.pid 单实例锁 / 主题偏好落数据目录）
 
 # 单实例锁（和 hub.pid / bot.pid 一个套路）：第二次启动顶到前面，不各开一份
 _GUI_PID_FILE = data_path("gui.pid")
+
+# 「自定义指令」页已装扩展列表的**初始 / 兜底**视口高度（v0.3.2）。
+# 🔴 它不再当上限用：实际高度由 `_fit_ext_box()` 按「视口高 − 这一页其余部分」
+#    现算（装得少就撑满窗口，装得多就在框内滚、页面高度不变）。
+#    这个数只在**还没排版出来、量不到视口**时兜底，以及构造时给个初始值。
+#    240 的来历：整页预算 = 512px（窗口高 720 − 208px 固定开销），
+#    上面「导入一个指令包」那块约 130px、计数行约 20px。
+_EXT_LIST_MAX_H = 240
 
 
 # ── 界面字号缩放 ─────────────────────────────────────────────────
@@ -95,12 +106,14 @@ def _raise_widget(w):
     """把控件提到同级控件的栈顶 —— **对 Canvas 控件必须走这里**。
 
     干嘛的：需要「盖在舞台上面」的同级兄弟控件（例如底部的筛选条）建好后置顶。
-    谁调用它：目前没有调用点（顶部遮罩带已弃用，见 BrainDrawerTab 的说明）；
-            留着是给以后新增浮层用的工具。
+    谁调用它：`App.toast`（`RoundedToast` 是 Canvas，`.lift()` 会抛 —— 见下）。
     🔴 本机打包的 tkinter 把 `Canvas.lift = tkraise = tag_raise`（画布**条目**
         升降，要求 tagOrId）—— 对 Canvas 控件调 `.lift()` / `.tkraise()` 会抛
         `wrong # args: should be … raise tagOrId ?aboveThis?`，抽屉一 build 就
         炸（真机探针实测）。全局 `raise` 对任何控件类型都对。
+        ⚠️ 这个异常如果落在一个 `try/except` 里，会被**静默吞掉**：2026-10-16
+        `App.toast` 就是这么中的 —— `lbl.lift()` 抛了，后面那行
+        `after(2500, _hide)` 没执行到，提示条从此不再自动消失。
     """
     w.tk.call("raise", str(w))
 
@@ -178,18 +191,21 @@ def save_ui_theme(mode):
         pass
 
 
-def win_app_id(appid="PhononPrismLab.MoyuBot.Desktop"):
+def win_app_id(appid=None):
     """Windows：给当前进程登记一个独立的 AppUserModelID。
 
     🔴 不登记的话任务栏会按宿主进程（pythonw.exe）分组，并显示 Tk 自带的
     羽毛图标 —— `iconbitmap` / `iconphoto` 只在窗口标题栏生效，落不到任务栏。
     必须在**创建任何窗口之前**调用。
+    🔴 默认值不写字面量：ID 只在 `shortcut.APP_USER_MODEL_ID` 定义一次
+        （快捷方式、这里、安装脚本三处必须一字不差）。
     """
     if os.name != "nt":
         return
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            appid or APP_USER_MODEL_ID)
     except Exception:
         pass
 
@@ -268,6 +284,108 @@ def as_set(value):
     if isinstance(value, (list, tuple, set)):
         return set(str(x) for x in value)
     return set(x for x in str(value).replace(" ", "").split(",") if x)
+
+
+# ── 未保存改动跟踪（v0.3.2 第四节「保存更改」不再丢）──────────────────
+# 判据只有一个来源：页面里的「脏判定」「按钮灰亮」「左侧叹号」「离开拦截」
+# 全部问这几个纯函数。改动跨页保留的载体是 `App._pending`（按分区暂存）——
+# 挂 App 上而不是 ConfigCenter 上：换肤 / 改字号会整窗重建，挂控件树旁边
+# 一重建就丢（验收：换深浅色不丢填了一半的内容）。
+def _norm_val(v):
+    """归一化后再比大小。
+
+    🔴 改了又改回来**不算脏** —— 值和已保存状态一致，就没有要保存的东西：
+       按钮不用亮、离开不拦。bool 两种写法（True / "true"）也要认成同一个值。
+    谁调用它：`_pending_diff`。
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, dict):
+        # 摸鱼库：{分类: [行]} —— 按键排序后逐类归一，免得字典顺序影响比较
+        return ";".join(f"{k}={_norm_val(val)}" for k, val in sorted(v.items()))
+    if isinstance(v, (list, tuple)):
+        # 和保存时同一套口径：逐行去空白、丢空行
+        return "\n".join(str(x).strip() for x in v if str(x).strip())
+    if v is None:
+        return ""
+    return str(v)
+
+
+def _pending_diff(saved, pending):
+    """挑出「改了还没保存」的键（值 ≠ 已保存值）。
+
+    干嘛的：脏判据的唯一入口。保存按钮灰/亮、左侧分区叹号、离开前拦不拦，
+                问的都是它。改了又改回来（值回到已保存状态）返回空 —— 没有
+                要保存的东西。
+    谁调用它：`ConfigCenter._is_dirty`。
+    """
+    out = []
+    for k, v in (pending or {}).items():
+        if k not in (saved or {}):
+            out.append(k)
+        elif _norm_val(saved[k]) != _norm_val(v):
+            out.append(k)
+    return out
+
+
+def _pending_overlay(saved, pending):
+    """显示值 = 已保存值，再把未保存改动盖上去。
+
+    干嘛的：改动跨页保留的读取端。切页会销毁控件，再回来时按这个回填 ——
+                改了一半的内容不会因为绕了一圈就没了。
+    谁调用它：`ConfigCenter._render_moyu`（摸鱼库文本）等渲染入口。
+    """
+    out = dict(saved or {})
+    out.update(pending or {})
+    return out
+
+
+def _read_input(var):
+    """从控件读原始值（和保存时同一套口径）。
+
+    干嘛的：暂存、脏判据、保存三处必须读出一模一样的结果，否则会出现
+                「按钮说没改、一保存却有改动」这种对不上的账。
+    谁调用它：`ConfigCenter._sync_pending`。
+    """
+    if isinstance(var, _PathList):
+        return var.get()
+    if isinstance(var, RoundedSpinbox):
+        # 🔴 数字框要读它自己的 `get()`：框被清空 / 敲到一半时 `IntVar.get()`
+        #    会抛 TclError，而这里是在变量 trace 里调的 ⇒ 异常被 Tk 吞掉、
+        #    值静默不进暂存。`get()` 兜底成「上一次的合法值」。
+        return var.get()
+    if isinstance(var, tk.BooleanVar):
+        return "true" if var.get() else "false"
+    if isinstance(var, scrolledtext.ScrolledText):
+        return var.get("1.0", "end").strip()
+    v = var.get()
+    return v if isinstance(v, str) else str(v)
+
+
+def _base_value(f):
+    """把字段的**已存储值**换算成「控件读出来会长什么样」。
+
+    🔴 脏判据比的是同一套读数，而存储形态和显示形态不是一回事：
+       · env 的 bool 没配时存的是空串，界面上是「未启用」（读出来 "false"）
+       · 多目录在 .env 里是分号串，界面上是一行一个
+       · 多选存的是 list / 逗号串，读出来是按 choices 顺序的逗号串
+       · int 存 "" 时界面按 0 渲染
+       不换算的话，这些页一进来就是「脏」的 —— 按钮莫名其妙亮着、离开还
+       弹保存（真机探针实测：`QQ_BOT_SANDBOX` 空串 vs "false"）。
+    谁调用它：`ConfigCenter._capture_base`。
+    """
+    kind, val = f.get("kind"), f.get("value")
+    if kind == "bool":
+        return "true" if str(val) not in ("", "false", "False", "0") else "false"
+    if kind == "paths":
+        return "\n".join(p.strip() for p in
+                         re.split(r"[;\n]", str(val or "")) if p.strip())
+    if kind == "multi":
+        cur = as_set(val)
+        return ",".join(c for c in (f.get("choices") or []) if c in cur)
+    if kind == "int":
+        return str(int(val or 0))
+    return val
 
 
 def lerp_color(c1, c2, t):
@@ -359,6 +477,804 @@ def round_rect_top(cv, x1, y1, x2, y2, r=12, **kw):
     return cv.create_polygon(pts, smooth=False, **kw)
 
 
+class RoundedEntry(tk.Canvas):
+    """圆角单行输入框。
+
+    干嘛的：`ttk.Entry` 的边框是 ttk element 拼的，**画不出圆角**（和页签同一个
+               原因），而配置中心别的控件都是圆角 —— 方角输入框夹在中间很突兀
+               （用户 2026-10-16 反馈「把这种文本框都做成圆角的」）。
+               做法：Canvas 上画一个圆角矩形当底 + 描边，把一个 `tk.Entry`
+               （bd=0、highlightthickness=0）用 `create_window` 嵌进去。
+    谁调用它：`ConfigCenter._render_one_field`（kind 为 text / secret）。
+    🔴 值仍然走 `textvariable`：调用方自己把那个 `StringVar` 收进 `_var_map`
+       并接 trace，本控件**不参与脏判据**，只负责「长得像圆角输入框」。
+    🔴 聚焦时描边换成品牌色 —— 系统焦点环是画在 ttk.Entry 上的，嵌进 Canvas
+       之后就看不见了，不给一点反馈用户会以为这里点不动。
+    """
+
+    def __init__(self, master, *, textvariable, show=None, font=None,
+                 radius=9, padx=10, pady=6, cc=None, parent_bg=None,
+                 chars=None, width=None):
+        self._cc = cc
+        self._font = font or _font(10)
+        self._radius, self._padx = radius, padx
+        if parent_bg is None:
+            try:
+                parent_bg = master["bg"]
+            except (tk.TclError, KeyError):
+                parent_bg = "#f7f9fa"
+        self._bgc = parent_bg
+        self._fill = cc._c("inputbg") if cc else "#ffffff"
+        self._ink = cc._c("inputfg") if cc else "#1c2530"
+        self._line = cc._c("border") if cc else "#e6eaee"
+        self._focus_line = cc._c("primary") if cc else "#0f8f85"
+        f = tkfont.Font(font=self._font)
+        h = f.metrics("linespace") + pady * 2
+        # 不传 `width` / `chars` 时按默认宽度，靠 `pack(fill="x")` 拉伸；
+        # 放在 `side="left"` 这种「宽度自己定」的位置上就给个字符数（脑内抽屉
+        # 的搜索框、标签输入框都是这种）。
+        if width is None and chars:
+            width = f.measure("0") * int(chars) + padx * 2 + 6
+        kw = {"height": h}
+        if width:
+            kw["width"] = width
+        super().__init__(master, highlightthickness=0, bd=0, bg=self._bgc, **kw)
+        self._entry = tk.Entry(self, textvariable=textvariable, show=show or "",
+                               font=self._font, bd=0, highlightthickness=0,
+                               bg=self._fill, fg=self._ink,
+                               insertbackground=self._ink)
+        self._win = self.create_window(padx, h // 2, window=self._entry,
+                                       anchor="w")
+        self.bind("<Configure>", self._on_resize)
+        self._entry.bind("<FocusIn>", lambda _e=None: self._draw(True))
+        self._entry.bind("<FocusOut>", lambda _e=None: self._draw(False))
+        self._draw(False)
+
+    @property
+    def text(self):
+        """里面的真 `tk.Entry` —— 要绑 `<Return>` / 取选中范围时用它。
+
+        干嘛的：`RoundedArea.text` 是这么叫的，这里跟着叫同一个名字，
+                   调用方不用记「哪个控件里层的属性叫 `_entry`、哪个叫 `text`」。
+        """
+        return self._entry
+
+    def _on_resize(self, e):
+        self.itemconfigure(self._win, width=max(24, e.width - self._padx * 2))
+        self._draw(self._entry.focus_get() is self._entry)
+
+    def _draw(self, focused):
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1:                      # 还没被 pack 量过尺寸，先按请求尺寸画
+            w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.delete("bg")
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=self._focus_line if focused else self._line,
+                   width=1, tags="bg")
+        self.tag_lower("bg")
+
+
+class RoundedSpinbox(tk.Canvas):
+    """圆角数字框（左半边真输入框 + 右半边自绘上下箭头）。
+
+    干嘛的：`ttk.Spinbox` 的边框和上下箭头都是 ttk element 拼的，**画不出圆角**
+               （和 `RoundedEntry` / `RoundedSelect` 同一个原因）。「外观」页的
+               「界面字号」、「掉线告警」页的「探活间隔 / 告警冷却」、「回旋镖」
+               页的「回溯天数」、「发文件」页的「图片占用报警阈值」—— 这五个数字
+               框是配置中心最后剩下的直角方框（用户 2026-10-16「做，全部统一成
+               圆角。包括探活间隔那里的箭头框」）。
+               做法：Canvas 画圆角矩形，左半边嵌一个真 `tk.Entry`，右半边自绘
+               两条折线当上下箭头，点一下 ±1；`<Up>` / `<Down>` 同效。
+    谁调用它：`ConfigCenter._render_one_field`（kind == int）。
+    🔴 **读数走 `get()`，不要直接 `IntVar.get()`**：用户把框清空、或者敲到一半
+       （想输 "12"，得先把 120 删空）时 `IntVar.get()` 会抛
+       `TclError: expected floating-point number but got ""` —— 而这通常是在变量
+       trace 里调的，异常被 Tk 吞掉，值静默不进暂存（旧 `ttk.Spinbox` 就有这个
+       毛病）。`get()` 把「空 / 非法」一律当「上一次的合法值」，离开焦点时再把
+       合法值写回框里。
+    🔴 上下限跟着设置定义走（`min` / `max`，缺省 0 / 1024，和旧 Spinbox 一致），
+       箭头到边界就不动；后端 `normalize` 还会再拦一道。
+    """
+
+    def __init__(self, master, *, textvariable, lo=None, hi=None, font=None,
+                 radius=9, padx=10, pady=5, cc=None, parent_bg=None, chars=10):
+        self._cc = cc
+        self._font = font or _font(10)
+        self._radius, self._padx = radius, padx
+        self._lo = 0 if lo is None else int(lo)
+        self._hi = 1024 if hi is None else int(hi)
+        if parent_bg is None:
+            try:
+                parent_bg = master["bg"]
+            except (tk.TclError, KeyError):
+                parent_bg = "#f7f9fa"
+        self._bgc = parent_bg
+        self._fill = cc._c("inputbg") if cc else "#ffffff"
+        self._ink = cc._c("inputfg") if cc else "#1c2530"
+        self._dim = cc._c("secondary") if cc else "#5b7b90"
+        self._line = cc._c("border") if cc else "#e6eaee"
+        self._focus_line = cc._c("primary") if cc else "#0f8f85"
+        f = tkfont.Font(font=self._font)
+        h = f.metrics("linespace") + pady * 2
+        self._arrow_w = 22              # 右边箭头区宽度
+        self._last = 0                  # 最后一次合法值（空框 / 敲一半时的兜底）
+        super().__init__(master, highlightthickness=0, bd=0, bg=self._bgc,
+                         height=h,
+                         width=f.measure("0") * int(chars) + padx * 2
+                         + self._arrow_w + 4)
+        self._var = textvariable if textvariable is not None else tk.IntVar()
+        _v0 = self._read_var()
+        if _v0 is not None:
+            self._last = self._clamp(_v0)
+        self._entry = tk.Entry(
+            self, textvariable=self._var, font=self._font, bd=0,
+            highlightthickness=0, bg=self._fill, fg=self._ink,
+            insertbackground=self._ink,
+            # 只放行数字和空串 —— 用户敲不进字母，`IntVar.get()` 也就不会撞上
+            # 「非法内容」；空串是删到一半的中间态，得放行（`get()` 兜底）。
+            validate="key",
+            validatecommand=(self.register(
+                lambda s: s == "" or s.isdigit()), "%P"))
+        self._win = self.create_window(padx, h // 2, window=self._entry,
+                                       anchor="w")
+        self._hot = None                # 悬停到哪个箭头："up" / "down" / None
+        self._trace = self._var.trace_add("write", lambda *_a: self._on_var())
+        self.bind("<Configure>", self._on_resize)
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", lambda _e=None: self._set_hot(None))
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Destroy>", lambda _e=None: self._unhook())
+        self._entry.bind("<FocusIn>", lambda _e=None: self._draw())
+        self._entry.bind("<FocusOut>", lambda _e=None: self._on_blur())
+        self._entry.bind("<Up>", lambda _e: self._step(1))
+        self._entry.bind("<Down>", lambda _e: self._step(-1))
+        self._draw()
+
+    def _unhook(self):
+        """控件被销毁（切分区 / 换肤整窗重建）→ 把变量上的 trace 摘掉。
+
+        🔴 **必须摘**：`IntVar` 挂在 `ConfigCenter._var_map` 外面，比控件活得久。
+           不摘的话，之后任何人写一次那个变量，trace 就会去碰已经死掉的窗口 ——
+           `TclError: bad window path name`（探针里踩到过：切走再切回来，
+           手里那个旧控件已经没了，写变量直接刷一屏栈）。
+        """
+        if self._trace is None:
+            return
+        try:
+            self._var.trace_remove("write", self._trace)
+        except (tk.TclError, ValueError):
+            pass
+        self._trace = None
+
+    # ── 读数 ────────────────────────────────────────────────────────
+    def _read_var(self):
+        """`IntVar` 当前值 —— 读不出来（空 / 非法）返回 `None`。"""
+        try:
+            return int(self._var.get())
+        except (tk.TclError, ValueError):
+            return None
+
+    def _clamp(self, v):
+        return max(self._lo, min(self._hi, int(v)))
+
+    def get(self):
+        """读出一个**合法整数**的字符串形式（暂存 / 脏判据 / 保存都走它）。
+
+        🔴 **以变量为准，不要直接读框里的文字**：`Entry` 的 `-textvariable`
+           是**下一拍才刷**的（Tk 内部标了「文本变量变了」等 idle 再重画），
+           所以变量刚写完的那一刻 `entry.get()` 还是旧文字。读框的话，「刚点的
+           那个箭头」会被读丢 —— 探针实测：变量已经是 120，框里还显示 3600，
+           `_sync_pending` 于是把 3600 写进暂存，保存按钮一直亮着。
+           （反方向没这个问题：用户敲键盘是 Entry 直接写变量，同步的。）
+        """
+        v = self._read_var()
+        if v is not None:
+            return str(self._clamp(v))
+        try:
+            return str(self._clamp(int(str(self._entry.get()).strip())))
+        except (tk.TclError, ValueError):
+            return str(self._last)
+
+    # ── 改值 ────────────────────────────────────────────────────────
+    def _on_var(self):
+        """变量被写（用户敲字 / 箭头 / `set()`）→ 记下最后一次合法值 + 重画。"""
+        v = self._read_var()
+        if v is not None:
+            self._last = self._clamp(v)
+        self._draw()
+
+    def _step(self, delta):
+        v = self._clamp(int(self.get()) + delta)
+        self._last = v
+        self._var.set(v)                # 触发 trace → 判脏
+        self._draw()
+        return "break"                  # 别让 <Up>/<Down> 再冒到别处
+
+    def _on_blur(self):
+        """离开焦点：把框里的文字拉回合法值（空 / 超范围一律纠正）。"""
+        v = int(self.get())
+        self._last = v
+        if self._read_var() != v:
+            self._var.set(v)            # 触发 trace → 判脏
+        self._draw()
+
+    # ── 画 / 交互 ───────────────────────────────────────────────────
+    def _size(self):
+        """当前像素尺寸 —— 还没被 pack 量过就退回请求尺寸。
+
+        🔴 控件可能已经没了（trace 比控件活得久，见 `_unhook`）：`winfo_*` 会抛
+           `TclError: bad window path name`。这里统一吞掉、返回 (0, 0)，
+           调用方（`_draw`）看到 `w <= 1` 直接收手。
+        """
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w <= 1:
+                w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+            return w, h
+        except tk.TclError:
+            return 0, 0
+
+    def _set_hot(self, name):
+        if name == self._hot:
+            return
+        self._hot = name
+        self.configure(cursor="hand2" if name else "")
+        self._draw()
+
+    def _on_motion(self, e):
+        w, h = self._size()
+        if e.x < w - self._arrow_w:
+            self._set_hot(None)
+        else:
+            self._set_hot("up" if e.y < h / 2 else "down")
+
+    def _on_click(self, e):
+        w, h = self._size()
+        if e.x < w - self._arrow_w:     # 点的是左边输入区 —— 让 Entry 自己处理
+            return
+        self._step(1 if e.y < h / 2 else -1)
+
+    def _on_resize(self, e):
+        self.itemconfigure(self._win,
+                           width=max(24, e.width - self._padx * 2 - self._arrow_w))
+        self._draw()
+
+    def _draw(self):
+        w, h = self._size()
+        if w <= 1:
+            return                      # 控件已销毁，或还没量到尺寸
+        # 🔴 **不能 `delete("all")`**：里面那个 `tk.Entry` 是用 `create_window`
+        #    挂上来的**窗口项**，`delete("all")` 会连它一起删掉 —— 控件还在、
+        #    但画布不再显示它，框里空空的什么都不显示（截图才发现）。所以分两个
+        #    tag：`bg` = 圆角底（要 `tag_lower` 压到底下），`ink` = 箭头 / 高亮。
+        self.delete("bg")
+        self.delete("ink")
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=(self._focus_line
+                            if self._entry.focus_get() is self._entry
+                            else self._line),
+                   width=1, tags="bg")
+        self.tag_lower("bg")
+        ax, cy = w - self._arrow_w, h // 2
+        # 悬停到哪个箭头，就把哪半边的底垫亮 —— 不然看不出这两条线能点
+        if self._hot == "up":
+            round_rect(self, ax + 2, 3, w - 3, cy - 1, 6,
+                       fill=self._cc._c("active") if self._cc else "#e6f4f2",
+                       outline="", tags="ink")
+        elif self._hot == "down":
+            round_rect(self, ax + 2, cy + 1, w - 3, h - 3, 6,
+                       fill=self._cc._c("active") if self._cc else "#e6f4f2",
+                       outline="", tags="ink")
+        self.create_line(ax, 4, ax, h - 4, fill=self._line, tags="ink")
+        for name, yc, sign in (("up", h // 4, -1), ("down", 3 * h // 4, 1)):
+            self.create_line(ax + 6, yc - sign * 2, ax + 11, yc + sign * 2,
+                             ax + 16, yc - sign * 2,
+                             fill=(self._focus_line if self._hot == name
+                                   else self._dim),
+                             width=1, tags="ink")
+
+
+class RoundedSelect(tk.Canvas):
+    """圆角下拉选择框（替代 `ttk.Combobox`，后者画不出圆角）。
+
+    干嘛的：`ttk.Combobox` 的边框和右边那个箭头都是 ttk element 拼的，**画不出
+               圆角**（和 `RoundedEntry` 同一个原因）。脑内抽屉底部那个「标签」
+               筛选框，左边刚换成圆角搜索框、右边全是圆角按钮，就它一个直角方框
+               杵在中间（用户 2026-10-16「脑内抽屉页的各种方框也都改成圆角的」）。
+               做法：Canvas 上画圆角矩形 + 当前值文字 + 右侧折线箭头；点一下在
+               下方弹一个**自绘的浮层面板**列选项。
+    谁调用它：`BrainDrawerTab._build`（标签筛选）。
+    🔴 是**只读**选择框：值只能从给定列表里挑，挑不到就选「全部」。
+       要能自由输入就用 `RoundedEntry`。
+    🔴 值走 `textvariable`（和 `RoundedEntry` 同一个口径）：调用方自己拿那个
+       `StringVar`，本控件只负责「长得像圆角下拉框」。
+    🔴 选项变了调 `set_values()`，别去改内部属性 —— 换值时要顺手把当前值
+       校一遍（原 combobox 靠 `["values"]=` 赋值，没有这步）。
+    🔴 **不用 `tk.Menu`**（试过，不能用）：
+       ① `tk_popup` 里有 `tkwait visibility`，`_probe/popup_min.py` 实测在窗口
+          不是前台时**永不返回**（直筒里调 3 秒没回来；放进 `after` 回调里连
+          4 秒兜底定时器都没能救回来）⇒ 真机上点一下就可能冻住界面；
+       ② 原生菜单是系统方角样式，跟这里的圆角语言对不上，等于把「方框」问题
+          搬到了弹出层。
+       所以浮层是 `overrideredirect` 的 Toplevel + 一块自绘 Canvas，靠
+       `grab_set` 收「点外面就关」。
+    """
+
+    def __init__(self, master, *, values=(), textvariable=None, font=None,
+                 radius=9, padx=10, pady=5, cc=None, parent_bg=None,
+                 chars=None, width=None, command=None, placeholder="全部"):
+        self._cc = cc
+        self._font = font or _font(9)
+        self._radius, self._padx = radius, padx
+        self._values = list(values)
+        self._command = command
+        self._placeholder = placeholder
+        if parent_bg is None:
+            try:
+                parent_bg = master["bg"]
+            except (tk.TclError, KeyError):
+                parent_bg = "#f7f9fa"
+        self._bgc = parent_bg
+        self._fill = cc._c("inputbg") if cc else "#ffffff"
+        self._ink = cc._c("inputfg") if cc else "#1c2530"
+        self._dim = cc._c("secondary") if cc else "#5b7b90"
+        self._line = cc._c("border") if cc else "#e6eaee"
+        self._active = cc._c("active") if cc else "#e6f4f2"
+        self._focus_line = cc._c("primary") if cc else "#0f8f85"
+        f = tkfont.Font(font=self._font)
+        h = f.metrics("linespace") + pady * 2
+        # 右边要留出箭头的位子（原 combobox 的宽度里就含箭头，所以这里 +22）
+        if width is None and chars:
+            width = f.measure("0") * int(chars) + padx * 2 + 22
+        kw = {"height": h}
+        if width:
+            kw["width"] = width
+        super().__init__(master, highlightthickness=0, bd=0, bg=self._bgc, **kw)
+        self._var = textvariable if textvariable is not None else tk.StringVar()
+        self._trace = self._var.trace_add("write", lambda *_a: self._draw())
+        self._hover = False
+        self._panel = None          # 展开中的浮层 Toplevel（没展开时是 None）
+        self._panel_cv = None
+        self._panel_rows = []       # [(row_id, 值, y0, y1)]
+        self._hot = -1              # 鼠标悬停到第几行
+        self.bind("<Configure>", lambda _e=None: self._draw())
+        self.bind("<Enter>", lambda _e=None: self._set_hover(True))
+        self.bind("<Leave>", lambda _e=None: self._set_hover(False))
+        self.bind("<Button-1>", self._popup)
+        self.bind("<Destroy>", self._on_destroy)
+        self._draw()
+
+    def _on_destroy(self, _e=None):
+        """控件没了 → 收掉浮层 + 摘掉变量上的 trace。
+
+        🔴 摘 trace 的理由同 `RoundedSpinbox._unhook`：变量比控件活得久，
+           不摘的话之后写一次变量就会去碰死窗口（`bad window path name`）。
+           顺带把浮层收掉 —— 抽屉重建时不能留一个孤儿 grab。
+        """
+        self._close_panel()
+        if self._trace is None:
+            return
+        try:
+            self._var.trace_remove("write", self._trace)
+        except (tk.TclError, ValueError):
+            pass
+        self._trace = None
+
+    def _set_hover(self, on):
+        self._hover = on
+        self.configure(cursor="hand2" if on else "")
+        self._draw()
+
+    def get(self):
+        return self._var.get()
+
+    def set(self, value):
+        self._var.set(value or "")
+
+    def set_values(self, values):
+        """换选项列表 —— 当前值不在新列表里就退回「全部」。"""
+        self._values = list(values)
+        if self._var.get() not in self._values:
+            self._var.set("")
+
+    # ── 展开的浮层面板 ──────────────────────────────────────────────
+    def _popup(self, _e=None):
+        """在下方弹出选项面板（放不下就翻到上方）。"""
+        if not self._values or self._panel is not None:
+            return
+        f = tkfont.Font(font=self._font)
+        row_h = f.metrics("linespace") + 9
+        pad = 6
+        w = max(self.winfo_width(), 96)
+        h = row_h * len(self._values) + pad * 2
+        top = tk.Toplevel(self)
+        top.overrideredirect(True)
+        top.configure(bg=self._bgc)
+        cv = tk.Canvas(top, width=w, height=h, bg=self._bgc,
+                       highlightthickness=0, bd=0)
+        cv.pack()
+        self._panel, self._panel_cv = top, cv
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + 2
+        if y + h > self.winfo_screenheight():       # 下方放不下 → 翻到上方
+            y = max(0, self.winfo_rooty() - h - 2)
+        top.geometry("+%d+%d" % (x, y))
+
+        round_rect(cv, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=self._line, width=1)
+        cur = self._var.get()
+        self._panel_rows = []
+        for i, v in enumerate(self._values):
+            y0, y1 = pad + i * row_h, pad + (i + 1) * row_h
+            rid = cv.create_rectangle(4, y0, w - 4, y1, fill=self._fill,
+                                      outline="")
+            cv.create_text(self._padx, (y0 + y1) // 2, anchor="w",
+                           text=(v or self._placeholder), font=self._font,
+                           fill=self._focus_line if v == cur else self._ink)
+            self._panel_rows.append((rid, v, y0, y1))
+
+        cv.bind("<Motion>", self._on_panel_motion)
+        cv.bind("<Leave>", lambda _e=None: self._paint_hot(-1))
+        cv.bind("<Button-1>", self._on_panel_click)
+        cv.bind("<Escape>", lambda _e=None: self._close_panel())
+        # 点面板以外的地方（同一应用内）会被 grab 送到面板窗口本身
+        top.bind("<Button-1>", lambda _e=None: self._close_panel())
+        top.bind("<Escape>", lambda _e=None: self._close_panel())
+        top.bind("<FocusOut>", lambda _e=None: self._close_panel())
+
+        top.update_idletasks()
+        try:
+            top.grab_set()              # 窗口不可见时会抛 TclError，抛了就退化成
+        except tk.TclError:             # 「点面板才关」，不至于把界面卡住
+            pass
+        try:
+            top.focus_force()
+        except tk.TclError:
+            pass
+
+    def _on_panel_motion(self, e):
+        for i, (_rid, _v, y0, y1) in enumerate(self._panel_rows):
+            if y0 <= e.y < y1:
+                self._paint_hot(i)
+                return
+        self._paint_hot(-1)
+
+    def _paint_hot(self, idx):
+        if idx == self._hot:
+            return
+        self._hot = idx
+        cv, cur = self._panel_cv, self._var.get()
+        if cv is None:
+            return
+        for i, (rid, v, _y0, _y1) in enumerate(self._panel_rows):
+            cv.itemconfigure(
+                rid, fill=(self._active if i == idx
+                           else self._fill if v != cur else self._active))
+
+    def _on_panel_click(self, e):
+        for _rid, v, y0, y1 in self._panel_rows:
+            if y0 <= e.y < y1:
+                self._close_panel()
+                self._pick(v)
+                return "break"          # 别再冒到 Toplevel 的「点外面就关」上
+        self._close_panel()
+        return "break"
+
+    def _close_panel(self, _e=None):
+        """收起浮层。**先解 grab 再销毁** —— 留一个挂着的 grab 会吞掉整窗点击。"""
+        top, self._panel = self._panel, None
+        self._panel_cv, self._panel_rows, self._hot = None, [], -1
+        if top is None:
+            return
+        try:
+            top.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            top.destroy()
+        except tk.TclError:
+            pass
+
+    def _pick(self, value):
+        self._var.set(value)
+        if self._command:
+            self._command(value)
+
+    def _draw(self):
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w <= 1:                  # 还没被 pack 量过尺寸，先按请求尺寸画
+                w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        except tk.TclError:
+            return                      # 控件已销毁（trace 可能比控件活得久）
+        self.delete("all")
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=self._focus_line if self._hover else self._line,
+                   width=1)
+        val = self._var.get()
+        cy = h // 2
+        # 右侧折线箭头（两条线拼一个 v，比三角更轻，和整体扁平风一致）
+        ax = w - self._padx - 5
+        self.create_line(ax - 5, cy - 2, ax, cy + 3, ax + 5, cy - 2,
+                         fill=self._dim, width=1)
+        txt = val or self._placeholder
+        # 🔴 文字长了要**按像素截断**，不能用 `create_text(width=…)`：那个是
+        #    自动折行，会把单行值折成两行、骑到箭头上。标签名一般很短，这里只是
+        #    兜底（原 combobox 是硬裁，连省略号都没有）。
+        avail = max(10, ax - 8 - self._padx)
+        ff = tkfont.Font(font=self._font)
+        if ff.measure(txt) > avail:
+            while txt and ff.measure(txt + "…") > avail:
+                txt = txt[:-1]
+            txt += "…"
+        self.create_text(self._padx, cy, anchor="w", text=txt,
+                         font=self._font,
+                         fill=self._ink if val else self._dim)
+
+
+class RoundedArea(tk.Canvas):
+    """圆角多行文本框（给 `scrolledtext.ScrolledText` 套一层圆角外壳）。
+
+    干嘛的：和 `RoundedEntry` 同一个理由 —— Tk 的文本框画不出圆角，「功能介绍」
+               那种多行输入框方方正正地夹在一堆圆角控件里很突兀（用户
+               2026-10-16「把这种文本框都做成圆角的」）。
+    谁调用它：`ConfigCenter._render_one_field`（kind == area）、`_render_moyu`。
+    🔴 里面那个 `ScrolledText` 仍然是**真控件**（滚动条 / 选区 / 右键菜单都在），
+       本控件只负责给它画圆角底 + 描边，并在 `<Configure>` 里把它撑到内边距内。
+       所以调用方拿的仍然是 `ra.text`（`_var_map` / `_watch_text` 都指它）。
+    """
+
+    def __init__(self, master, *, value="", height=5, font=None, radius=9,
+                 pad=6, cc=None, parent_bg=None, plain=False, fill=None,
+                 line=None):
+        self._cc, self._pad, self._radius = cc, pad, radius
+        if parent_bg is None:
+            try:
+                parent_bg = master["bg"]
+            except (tk.TclError, KeyError):
+                parent_bg = "#f7f9fa"
+        self._bgc = parent_bg
+        self._fill = fill or (cc._c("inputbg") if cc else "#ffffff")
+        self._ink = cc._c("inputfg") if cc else "#1c2530"
+        self._line = line or (cc._c("border") if cc else "#e6eaee")
+        self._focus_line = cc._c("primary") if cc else "#0f8f85"
+        super().__init__(master, highlightthickness=0, bd=0, bg=self._bgc)
+        # `plain=True` 用**光板** `tk.Text`（不带滚动条）—— 卡片上那个「结论 /
+        # 备注」框是自动长高的，多一条滚动条反而多余。
+        cls = tk.Text if plain else scrolledtext.ScrolledText
+        self.text = cls(self, height=height, width=80, wrap="word", bd=0,
+                        highlightthickness=0, font=font or _font(9),
+                        bg=self._fill, fg=self._ink,
+                        insertbackground=self._ink)
+        self.text.insert("1.0", str(value or ""))
+        self._win = self.create_window(pad, pad, window=self.text, anchor="nw")
+        self.refit()
+        self.bind("<Configure>", self._on_resize)
+        self.text.bind("<FocusIn>", lambda _e=None: self._draw(True))
+        self.text.bind("<FocusOut>", lambda _e=None: self._draw(False))
+        self._draw(False)
+
+    def refit(self):
+        """把外壳高度重新贴合里面控件的请求高度。
+
+        干嘛的：里面那个 `tk.Text` 会**自己长高**（结论框按内容行数调 `height`），
+                外壳不跟着长的话，文字就溢出圆角框了。
+        谁调用它：`_open_modal` 的 `_fit_note`。
+        """
+        try:
+            self.text.update_idletasks()
+            h = self.text.winfo_reqheight() + self._pad * 2
+        except tk.TclError:
+            return
+        if int(self["height"]) != h:
+            self.configure(height=h)
+
+    def _on_resize(self, e):
+        self.itemconfigure(self._win, width=max(40, e.width - self._pad * 2),
+                           height=max(24, e.height - self._pad * 2))
+        self._draw(self.text.focus_get() is self.text)
+
+    def _draw(self, focused):
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1:                      # 还没被 pack 量过尺寸，先按请求尺寸画
+            w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.delete("bg")
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=self._focus_line if focused else self._line,
+                   width=1, tags="bg")
+        self.tag_lower("bg")
+
+
+class FitScrolledFrame(ScrolledFrame):
+    """`ScrolledFrame` 的「装得下就不出滚动条」版。
+
+    干嘛的：ttkbootstrap 的 `auto_hide=True` 是「鼠标不在里面就藏、一移进去就
+               显示」—— **不管装不装得下**。用户 2026-10-16 报的「鼠标移到侧栏，
+               就算没有可移动的范围，也会显示一个滑动条」就是这个：一条亮线
+               无缘无故从边上冒出来。
+               这里只加一条判据：**内容真的超出视口**才让滚动条显形。
+    谁调用它：`ConfigCenter._build`（左侧导航）、`_render_ext`（已装扩展列表）。
+    🔴 「鼠标在不在里面」用 `winfo_containing` 现问，**不靠 Enter/Leave 事件**：
+       Tk 在指针从父控件移进子控件时也会给父控件发一个 `<Leave>`
+       （detail=NotifyInferior），拿事件当判据会让滚动条一hover就闪没。
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._sync_bar()
+
+    def _needs_scroll(self):
+        """内容高过视口了吗（高过才需要滚动条）。"""
+        try:
+            return self.winfo_reqheight() > self._canvas.winfo_height()
+        except tk.TclError:
+            return False
+
+    def _pointer_inside(self):
+        try:
+            w = self.winfo_containing(*self.winfo_pointerxy())
+        except (tk.TclError, KeyError):
+            return False
+        while w is not None:
+            if w is self.container:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _sync_bar(self):
+        """滚动条 = 「鼠标在里面」且「内容溢出」，两条都满足才显形。"""
+        try:
+            if self._pointer_inside() and self._needs_scroll():
+                self.show_scrollbars()
+            else:
+                self.hide_scrollbars()
+        except tk.TclError:
+            pass
+
+    def _on_enter(self, event=None):
+        super()._on_enter(event)
+        self._sync_bar()
+
+    def _on_leave(self, event=None):
+        super()._on_leave(event)
+        self._sync_bar()
+
+    def _on_content_configure(self, event=None):
+        super()._on_content_configure(event)
+        self._sync_bar()
+
+    def _on_canvas_configure(self, event=None):
+        super()._on_canvas_configure(event)
+        self._sync_bar()
+
+
+class RoundedToast(tk.Canvas):
+    """圆角轻提示条（底部那条「已保存：…」/「保存失败」）。
+
+    干嘛的：以前是个 `tk.Label`（`padx=16 pady=7`）—— 一个直角矩形，全应用就它
+               一个方角（用户 2026-10-16「通知依然是直角矩形」）。这里换成
+               Canvas 自绘：圆角矩形 + 居中文字。
+    谁调用它：`App.toast`。
+    🔴 **尺寸得自己按文字量**：`place` 不会给尺寸，Canvas 也不会随文字长大。
+       每次 `set_msg()` 之后用 `tkfont.Font.measure` 重算宽高，再 `_draw()`。
+    🔴 画布底色 = 窗口底色，不然圆角外面那四个角会露出另一块颜色。
+    """
+
+    def __init__(self, master, *, font=None, radius=10, padx=16, pady=7,
+                 bg=None):
+        self._font = font or _font(9)
+        self._radius, self._padx, self._pady = radius, padx, pady
+        self._fill, self._fg, self._text = "#0f8f85", "#ffffff", ""
+        super().__init__(master, highlightthickness=0, bd=0,
+                         bg=bg or "#ffffff", width=1, height=1)
+        self._draw()
+
+    def set_msg(self, text, fill, fg):
+        """换文案 + 配色，并按文字重算尺寸（调用方随后自己 `place`）。"""
+        self._text, self._fill, self._fg = text, fill, fg
+        f = tkfont.Font(font=self._font)
+        self.configure(width=f.measure(text) + self._padx * 2,
+                       height=f.metrics("linespace") + self._pady * 2)
+        self._draw()
+
+    def _draw(self):
+        try:
+            w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        except tk.TclError:
+            return                      # 控件已销毁（整窗重建）
+        self.delete("all")
+        round_rect(self, 0, 0, w, h, self._radius, fill=self._fill,
+                   outline="", tags="bg")
+        self.create_text(w / 2, h / 2, text=self._text, fill=self._fg,
+                         font=self._font, anchor="center", tags="ink")
+
+
+class RoundedCheck(tk.Canvas):
+    """圆角勾选框（回收站每行左边那个「选这条」的框）。
+
+    干嘛的：`ttkbootstrap` 的 `bootstyle="primary"` 走的是 checkbutton 那套资源
+               —— 画出来是**方框 + 对勾**，全应用最后几个直角之一（用户
+               2026-10-16「多选框也改成圆角」）。Canvas 自绘：圆角方框，选中
+               填品牌色 + 一个白勾，悬停时描边转品牌色。
+               ⚠️ 别拿 `primary-round-toggle` 顶替：那是 iOS 那种**拨杆**，
+                  用来做多选没人看得懂（用户原话「哪有用这个开关做选择的」）。
+    谁调用它：`BrainDrawerTab._trash_win` 的每一行（`command=_refresh_count`）。
+
+    🔴 **它是会改变量的**（点一下翻转），不是只读显示 ⇒ 也得给变量挂 trace，
+       否则外面用「全选 / 清空选择」批量 `set()` 时框不会跟着变。而**变量比控件
+       活得久** ⇒ `<Destroy>` 里必须 `trace_remove`（和 `RoundedSpinbox` 同一条铁律）。
+    🔴 画布上没有内嵌控件，`delete("all")` 本来不会出事；仍然分 `bg` / `ink`
+       两个 tag 只删这两个 —— 和家族里别的控件保持同一口径，将来往里面嵌东西
+       也不会突然踩到「窗口项被删掉」。
+    """
+
+    def __init__(self, master, *, variable, command=None, size=16, radius=3,
+                 line="#cfe3ee", fill="#ffffff", on_fill="#0f8f85",
+                 mark="#ffffff", parent_bg=None):
+        self._var, self._command = variable, command
+        self._size, self._radius = size, radius
+        self._line, self._on_fill, self._mark = line, on_fill, mark
+        self._hot = False
+        self._fill = parent_bg or fill
+        super().__init__(master, width=size, height=size, highlightthickness=0,
+                         bd=0, bg=self._fill, cursor="hand2")
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", lambda _e=None: self._set_hot(True))
+        self.bind("<Leave>", lambda _e=None: self._set_hot(False))
+        self.bind("<Destroy>", lambda _e=None: self._unhook())
+        self._trace = self._var.trace_add("write", lambda *_a: self._draw())
+        self._draw()
+
+    def _unhook(self):
+        """控件被销毁 → 摘掉变量上的 trace（变量比控件活得久）。"""
+        if self._trace is None:
+            return
+        try:
+            self._var.trace_remove("write", self._trace)
+        except (tk.TclError, ValueError):
+            pass
+        self._trace = None
+
+    def get(self):
+        try:
+            return bool(self._var.get())
+        except tk.TclError:
+            return False
+
+    def set(self, on):
+        self._var.set(bool(on))
+
+    def _set_hot(self, on):
+        self._hot = on
+        self._draw()
+
+    def _on_click(self, _e=None):
+        # 先写变量：写下去 trace 就会重画一次，这里不用再手动 `_draw()`
+        self._var.set(not self.get())
+        if self._command is not None:
+            self._command()
+        return "break"
+
+    def _draw(self):
+        try:
+            self.delete("bg")
+            self.delete("ink")
+        except tk.TclError:
+            return                      # 控件已销毁（回收站窗口关掉 / 整窗重建）
+        w = h = self._size
+        on = self.get()
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius,
+                   fill=(self._on_fill if on else self._fill),
+                   outline=(self._on_fill if (on or self._hot) else self._line),
+                   width=1, tags="bg")
+        if on:
+            # 白勾：两段折线 + 圆头圆角（粗度随尺寸走，16px 下是 2px）
+            self.create_line(w * 0.28, h * 0.53, w * 0.44, h * 0.70,
+                             w * 0.73, h * 0.30, fill=self._mark,
+                             width=max(2, self._size // 7),
+                             capstyle="round", joinstyle="round", tags="ink")
+
+
 class RoundedButton(tk.Canvas):
     """圆角扁平按钮：Tk 原生按钮画不出圆角，统一用 Canvas 自绘。
 
@@ -382,7 +1298,7 @@ class RoundedButton(tk.Canvas):
                  outline=None, hover_outline=None, hover_fg=None,
                  selected_fg=None, selected_fill=None, disabled_fg=None,
                  bold_selected=True, anchor="center", fixed_width=None,
-                 parent_bg=None):
+                 parent_bg=None, dirty_fg=None):
         self._text, self._command, self._kind = text, command, kind
         self._font, self._radius = font, radius
         self._padx, self._pady, self._anchor = padx, pady, anchor
@@ -394,6 +1310,11 @@ class RoundedButton(tk.Canvas):
         self._selected = False
         self._hover_on = False
         self._state = "normal"
+        # 🔴 未保存标记（v0.3.2 第四节）：左侧分区这一页还有没保存的改动时，
+        #    右侧点一个叹号。琥珀色和托盘「账号掉线」同一个色系 —— 都是
+        #    「有件事没结」的提醒，不刺眼但扫一眼就看得见。
+        self._dirty = False
+        self._dirty_fg = dirty_fg or "#d97706"
         if parent_bg is None:
             try:
                 parent_bg = master["bg"]
@@ -408,8 +1329,13 @@ class RoundedButton(tk.Canvas):
         super().__init__(master, width=w, height=h, highlightthickness=0,
                          bd=0, bg=parent_bg, cursor="hand2")
         self.bind("<Button-1>", self._on_click)
-        self.bind("<Enter>", lambda e: self._set_hover(True))
-        self.bind("<Leave>", lambda e: self._set_hover(False))
+        # 🔴 `e` 必须带默认值：真机偶发（整窗重建、鼠标恰好停在按钮上时），
+        #    Tk 会**无参**调用这两个回调，抛
+        #    `TypeError: <lambda>() missing 1 required positional argument: 'e'`。
+        #    它只在 stderr 里刷一屏栈、界面看不出异常，但很脏。
+        #    `_set_hover` 根本不读 event，给个默认值行为完全不变。
+        self.bind("<Enter>", lambda e=None: self._set_hover(True))
+        self.bind("<Leave>", lambda e=None: self._set_hover(False))
         self._draw()
 
     # -- 状态 --
@@ -417,6 +1343,24 @@ class RoundedButton(tk.Canvas):
         if self._selected != bool(on):
             self._selected = bool(on)
             self._draw()
+
+    def set_dirty(self, on):
+        """未保存标记（叹号）开 / 关。
+
+        干嘛的：这一页有没保存的改动时，左侧分区导航按钮右侧点一个叹号 ——
+                用户扫一眼左侧就知道哪页还欠一次保存，不用一页页点进去看。
+        谁调用它：`ConfigCenter.refresh`（建导航时按脏集合回填）、
+                `ConfigCenter._recheck_dirty`（编辑时实时更新）。
+        🔴 画在按钮**内部**右侧，不另放控件：导航按钮是自绘 canvas，额外叠一个
+            Label 会在深色主题下露出一圈底色，且随圆角裁不干净。
+        """
+        if self._dirty != bool(on):
+            self._dirty = bool(on)
+            self._draw()
+
+    def set_command(self, cmd):
+        """换点击回调（页头那个共用的保存按钮按分区换命令用）。"""
+        self._command = cmd
 
     def set_text(self, text):
         if text != self._text:
@@ -455,7 +1399,7 @@ class RoundedButton(tk.Canvas):
             self._draw()
 
     # -- 内部 --
-    def _on_click(self, _e):
+    def _on_click(self, _e=None):
         if self._state == "normal" and self._command:
             self._command()
 
@@ -493,6 +1437,13 @@ class RoundedButton(tk.Canvas):
         tx = self._padx if self._anchor == "w" else w // 2
         self.create_text(tx, h // 2, text=self._text, fill=fg, font=font,
                          anchor="w" if self._anchor == "w" else "center")
+        # 未保存叹号：固定画在右侧，左对齐的文字不会和它抢位置（导航标题
+        # 都很短，最长的「版本与诊断」离右边也还远）。禁用态不淡化它 ——
+        # 叹号本身是「状态提示」，不是按钮文字，褪色了就白画了。
+        if self._dirty:
+            self.create_text(w - self._padx, h // 2, text="!", anchor="e",
+                             fill=self._dirty_fg,
+                             font=self._font[:2] + ("bold",))
 
 
 # ── 主窗口 ────────────────────────────────────────────────────────
@@ -504,7 +1455,11 @@ class App:
         self.cw = load_config_web()
         # 主题偏好：'light' / 'dark' / 'system'（默认跟随系统）。
         # 读不到就退化为跟随系统，别因为偏好文件坏了就黑屏。
-        self.theme_mode = load_ui_theme()
+        self.theme_mode = load_ui_theme()      # **已保存**的偏好（落盘的那份）
+        # 🔴 「当前摆在屏幕上」的偏好（v0.3.2 第 ⑧ 轮）：点颜色是**立即预览**，
+        #    预览只动 `theme_display`、不碰 `theme_mode` —— 于是「脏判据」拿
+        #    `theme_mode` 当基线，天然就能判出「预览了但没保存」。
+        self.theme_display = self.theme_mode
         self.theme = self._resolve_theme()
         # 🔴 ttkbootstrap 强制单根：先建唯一的 Window（它内部会建 root + style），
         # 再从 Window 上拿 style 注册品牌主题，绝不能在建 Window 之前另建 Style（会多一个 root）。
@@ -526,27 +1481,9 @@ class App:
         """极简白基调的全局控件样式：无边框、弱化矩形感、留白呼吸。"""
         s = self.style
         c = s.colors
-        # 两个主入口 tab（配置中心 / 脑内抽屉）：加大字号、选中要**一眼看得出来**。
-        # 🔴 TNotebook 自己的背景必须也换成主题 bg —— 否则残留内置主题（flatly）的
-        #    白色，在 tab 行和内容边缘露出一圈「白边」。
-        # 🔴 选中态以前几乎看不出来（用户 2026-10-12 报的「页签切换不够明显」）：
-        #    主题里 `active`（浅色 #eef4f3）跟 `bg`（#f7f9fa）差不到一个色阶，
-        #    选中 tab 只有字色从灰变品牌色 —— 扫一眼根本分不清在哪个页。
-        #    现在选中 = 品牌淡底 + 品牌色**粗体** + 品牌色描边，hover 才用 active。
-        sel_bg = lerp_color(c.primary, c.bg, 0.86)
-        s.configure("TNotebook", border_width=0, tabmargins=(0, 0, 0, 0),
-                    background=c.bg, bordercolor=c.bg,
-                    lightcolor=c.bg, darkcolor=c.bg)
-        s.configure("TNotebook.Tab", padding=(24, 11),
-                    font=_font(12), borderwidth=1, focuscolor=c.bg,
-                    background=c.bg, bordercolor=c.bg, lightcolor=c.bg, darkcolor=c.bg)
-        s.map("TNotebook.Tab",
-              background=[("selected", sel_bg), ("active", c.active)],
-              foreground=[("selected", c.primary), ("active", c.fg)],
-              bordercolor=[("selected", c.primary)],
-              lightcolor=[("selected", c.primary)],
-              darkcolor=[("selected", c.primary)],
-              font=[("selected", _font(12, "bold"))])
+        # 两个主入口页签（配置中心 / 脑内抽屉）**不走 ttk.Notebook**（页签要圆角，
+        # Notebook 的元素画不出来），改成 `RoundedButton` 自绘 + `show_tab()` 切换
+        # —— 见 `App._build()`。所以这里没有 TNotebook / TNotebook.Tab 的样式。
         # 按钮一律去边框
         s.configure("TButton", borderwidth=0, focuscolor=c.bg)
         # 🔴 Frame / Label 也必须显式钉住背景色 —— ttk 这两类默认不跟随品牌主题，
@@ -579,10 +1516,11 @@ class App:
     def _build(self):
         root = self.root
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=0)
-        root.rowconfigure(1, weight=1)
+        root.rowconfigure(0, weight=0)     # 顶部标题行
+        root.rowconfigure(1, weight=0)     # 两个主入口的页签行
+        root.rowconfigure(2, weight=1)     # 页签内容
 
-        top = ttk.Frame(root, padding=10)
+        top = ttk.Frame(root, padding=(10, 5, 10, 5))
         top.grid(row=0, column=0, sticky="ew")
         ttk.Label(top, text="摸鱼bot · 本地应用",
                   font=_font(14, "bold")).pack(side="left")
@@ -591,9 +1529,27 @@ class App:
         self.ver_label = ttk.Label(top, text="", bootstyle="secondary")
         self.ver_label.pack(side="right")
 
-        nb = ttk.Notebook(root)
-        nb.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        self.notebook = nb
+        # ── 两个主入口的页签（配置中心 / 脑内抽屉）──
+        # 🔴 不用 `ttk.Notebook`：Tk 的页签是 ttk **元素**拼出来的，画不出圆角
+        #    （用户要求圆角）。改成和左侧分区导航同一套 `RoundedButton` 自绘页签，
+        #    圆角天然支持，视觉也和导航统一。
+        # 🔴 切换必须走 `grid_remove()` / `grid()`，**不能两个都 grid 在同一格
+        #    靠 `tkraise()` 叠**：`ConfigCenter._on_wheel()` 和
+        #    `BrainDrawerTab._front_and_visible()` 都拿 `winfo_ismapped()` 判
+        #    「当前是不是这一页」—— 两个都 mapped 的话，滚轮和抽屉的自动刷新
+        #    会在两页同时生效（以前靠 Notebook 自动 unmap 非当前页）。
+        # 🔴 页签行**下面留 6px 空隙**（用户 2026-10-16「页签下方和展示区留一点
+        #    空隙，不要像现在这样直接接住，不好看」）：这点高度是从页头省出来的
+        #    （`top` 的上下 padding 10 → 5），净变化为负，一屏预算没被吃掉。
+        # 页签行下面留 15px 空隙（用户 2026-10-16：6px 不够，改成 15px）——
+        # 这一段高度从内容区的视口里扣，所以页高预算要跟着重算（见
+        # `_probe/page_heights.py`：改完 12 个分区仍无超屏）。
+        tabbar = ttk.Frame(root, padding=(8, 2, 8, 15))
+        tabbar.grid(row=1, column=0, sticky="ew")
+        self._tab_body = ttk.Frame(root, padding=(8, 0, 8, 8))
+        self._tab_body.grid(row=2, column=0, sticky="nsew")
+        self._tab_body.columnconfigure(0, weight=1)
+        self._tab_body.rowconfigure(0, weight=1)
         # 窗口 + 任务栏图标用品牌金鱼（assets/icons 是图标的唯一来源）。
         # 🔴 **`-default` 变体只设「以后新建窗口」的默认图标，不改当前窗口** ——
         #    以前只写 `iconbitmap(default=…)` / `iconphoto(True, …)`，当前窗口
@@ -620,22 +1576,58 @@ class App:
                     _set()
                 except Exception:
                     pass
-        self.config_center = ConfigCenter(nb, self)
-        self.brain_drawer = BrainDrawerTab(nb, self)
-        nb.add(self.config_center, text="配置中心")
-        nb.add(self.brain_drawer, text="脑内抽屉")
-        # 切到脑内抽屉时把焦点给舞台（点气泡 / 拖选区都从它出发，行为统一）
-        nb.bind("<<NotebookTabChanged>>",
-                lambda e: e.widget.nametowidget(
-                    e.widget.select()).focus_set()
-                if e.widget.select() is not None else None)
+        self.config_center = ConfigCenter(self._tab_body, self)
+        self.brain_drawer = BrainDrawerTab(self._tab_body, self)
+        self._tab_widgets = {"cc": self.config_center, "bd": self.brain_drawer}
+        self._tab_btns = {}
+        c = self.style.colors
+        for _key, _text in (("cc", "配置中心"), ("bd", "脑内抽屉")):
+            _b = RoundedButton(
+                tabbar, _text, lambda k=_key: self.show_tab(k),
+                kind="ghost", padx=20, pady=7, radius=12, font=_font(12),
+                fg=c.secondary, hover_fill=c.active,
+                selected_fg=c.primary,
+                selected_fill=lerp_color(c.primary, c.bg, 0.86),
+                parent_bg=c.bg)
+            _b.pack(side="left", padx=(0, 6))
+            self._tab_btns[_key] = _b
+        self._cur_tab = None
+        self.show_tab("cc")
 
         # 关窗口时走自己的处理（现在只是 destroy，但留一个明确的落点）
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def show_tab(self, key):
+        """切「配置中心 / 脑内抽屉」两个主入口。
+
+        干嘛的：替代 `ttk.Notebook` 的自绘页签切换（Notebook 的页签画不出圆角）。
+        谁调用它：`_build()`（首次落到配置中心）、页签按钮回调。
+        🔴 用 `grid_remove()` 而不是 `tkraise()` —— 见 `_build()` 里那段说明：
+            `winfo_ismapped()` 是「当前是不是这一页」的判据，非当前页必须真的
+            不在 mapped 状态。
+        """
+        if key == self._cur_tab:
+            return
+        for k, w in self._tab_widgets.items():
+            if k == key:
+                w.grid(row=0, column=0, sticky="nsew")
+            else:
+                w.grid_remove()
+        for k, b in self._tab_btns.items():
+            b.set_selected(k == key)
+        self._cur_tab = key
+        # 切页后把焦点给这一页（点气泡 / 拖选区都从它出发，行为统一）
+        try:
+            self._tab_widgets[key].focus_set()
+        except tk.TclError:
+            pass
+
     def _on_close(self):
         """关窗口。
 
+        🔴 先问「保存并退出 / 放弃更改 / 取消」（v0.3.2 第四节）：任一配置分区
+           有没保存的改动时，以前直接关 = 静默丢失。返回 False = 别关
+           （用户取消，或有改动保存失败了）。
         🔴 **不手动 `after_cancel` 任何定时器** —— 试过，会炸：
            `after_cancel` 末尾的 `deletecommand(id)` 对「已经跑过 / 已经取消过」
            的 id 会抛 TclError，而它抛之前已经把 Tcl 侧取消掉了，于是
@@ -644,6 +1636,9 @@ class App:
         🔴 也不需要取消：`mainloop()` 一退出，队列里那些 `after` 就不会再执行了
            （用户关窗走的正是这条路）。
         """
+        cc = getattr(self, "config_center", None)
+        if cc is not None and not cc.confirm_close():
+            return
         self.root.destroy()
 
     def refresh(self):
@@ -671,59 +1666,100 @@ class App:
     def _rebuild_for_font(self):
         """字号变了 → 把整个窗口拆了重建（并停在用户原来那个分区上）。"""
         keep = getattr(getattr(self, "config_center", None), "current", None)
+        keep_tab = getattr(self, "_cur_tab", None)
         for w in self.root.winfo_children():
             w.destroy()
         self._flat_styles()            # 末尾会 _build() + refresh()
+        if keep_tab:                   # 重建会落回「配置中心」，用户在哪页就回哪页
+            self.show_tab(keep_tab)
         if keep:
             try:
-                self.config_center.show_section(keep)
+                # ask=False：重建是内部路径，用户没点导航，不该弹「保存并切换」
+                self.config_center.show_section(keep, ask=False)
             except (tk.TclError, StopIteration):
                 pass
 
     # ── 浅色 / 深色 / 跟随系统 ────────────────────────────────────
-    def _resolve_theme(self):
-        """按当前偏好算出要用的 ttkbootstrap 主题名。"""
-        if self.theme_mode == "dark":
+    def _resolve_theme(self, mode=None):
+        """按偏好算出要用的 ttkbootstrap 主题名。
+
+        不传 `mode` 时按**当前显示**的偏好算（预览中的那个），不是已保存的那个
+        —— 否则预览换肤会算出「保存值对应的主题」、重建完又变回去。
+        """
+        mode = self.theme_display if mode is None else mode
+        if mode == "dark":
             return THEME_DARK
-        if self.theme_mode == "light":
+        if mode == "light":
             return THEME_LIGHT
         return THEME_DARK if detect_system_dark() else THEME_LIGHT
 
-    def set_theme_mode(self, mode):
-        """切换浅色 / 深色 / 跟随系统，并把偏好落盘。
+    def _apply_theme(self, mode):
+        """把 `mode` 摆到屏幕上（必要时整窗重建），**不落盘**。
 
-        🔴 必须整窗重建：Tk 的字号/主题都是**建控件时定死**的，没有事后改主题的
+        🔴 必须整窗重建：Tk 的字号 / 主题都是**建控件时定死**的，没有事后改主题的
            统一入口；重建是唯一干净的做法（和字号变更走同一条 `_rebuild_window`）。
-            主题没变就不重建 —— 点同一个按钮只是把偏好再写一遍，不闪屏。
+           主题没变就不重建 —— 只是把偏好再摆一遍，不闪屏。
         """
-        if mode not in ("light", "dark", "system"):
-            return
-        save_ui_theme(mode)
-        self.theme_mode = mode
-        target = self._resolve_theme()
+        self.theme_display = mode
+        target = self._resolve_theme(mode)
         if target == self.theme:
             self._sync_system_poll()   # 偏好变了，把轮询状态对齐一下
             return
         self.theme = target
         self._rebuild_window()
 
+    def set_theme_mode(self, mode):
+        """切换浅色 / 深色 / 跟随系统，并把偏好**落盘**。
+
+        谁调用它：`ConfigCenter._on_save` / `_flush_dirty`（点「保存更改」那一刻）。
+        🔴 「点一下直接换肤」那条路已经拆开了 —— 点颜色走 `preview_theme`
+           （只摆屏幕、不落盘），保存才走这里（用户 2026-10-16 要求）。
+        """
+        if mode not in ("light", "dark", "system"):
+            return
+        save_ui_theme(mode)
+        self.theme_mode = mode
+        self._apply_theme(mode)
+
+    def preview_theme(self, mode):
+        """只把颜色摆到屏幕上、**一个字都不落盘** —— 「外观」页点颜色的预览。
+
+        干嘛的：用户 2026-10-16 要求「点颜色要能预览，但点保存才生效，不然就回退」。
+                预览 = 这条；回退 = 用**已保存**的偏好再调一次这条。
+        谁调用它：`ConfigCenter._pick_theme`（点颜色）、
+                `ConfigCenter._reconcile_theme`（离开这一页时拉回应然值）。
+        """
+        if mode not in ("light", "dark", "system"):
+            return
+        self._apply_theme(mode)
+
     def _rebuild_window(self):
         """拆掉所有子控件、换主题、按当前分区重建（字号变更也复用这条）。"""
         keep = getattr(getattr(self, "config_center", None), "current", None)
+        keep_tab = getattr(self, "_cur_tab", None)
         for w in self.root.winfo_children():
             w.destroy()
         self.style.theme_use(self.theme)
         self._flat_styles()            # 末尾会 _build() + refresh()
+        if keep_tab:                   # 重建会落回「配置中心」，用户在哪页就回哪页
+            self.show_tab(keep_tab)
         if keep:
             try:
-                self.config_center.show_section(keep)
+                # ask=False：换肤是内部路径。🔴 未保存的改动由 `App._pending`
+                # 兜着（挂 App 上，重建也不丢）—— 验收就有一条「换深浅色 →
+                # 填了一半的内容不丢」。
+                self.config_center.show_section(keep, ask=False)
             except (tk.TclError, StopIteration):
                 pass
         self._sync_system_poll()
 
     def _sync_system_poll(self):
-        """跟随系统模式下，周期性读注册表盯系统主题切换；其余模式关掉轮询。"""
-        if getattr(self, "theme_mode", "system") == "system":
+        """跟随系统模式下，周期性读注册表盯系统主题切换；其余模式关掉轮询。
+
+        🔴 判据用**显示中**的偏好（`theme_display`）不是已保存的：预览成浅色
+           时不该还挂着系统轮询 —— 轮询一发现系统是深色就会把预览覆盖掉。
+        """
+        if getattr(self, "theme_display", "system") == "system":
             if getattr(self, "_sys_job", None) is None:
                 self._sys_job = self.root.after(1500, self._poll_system)
         else:
@@ -738,7 +1774,7 @@ class App:
     def _poll_system(self):
         """注册表里的系统主题变了就跟着换；没变就继续轮询。"""
         self._sys_job = None
-        if getattr(self, "theme_mode", "system") != "system":
+        if getattr(self, "theme_display", "system") != "system":
             return
         target = THEME_DARK if detect_system_dark() else THEME_LIGHT
         if target != self.theme:
@@ -774,8 +1810,9 @@ class App:
                 self.state["bot"]["autostart"] = task in ("ready", "running")
                 self._update_bot_status()
                 # 「运行方式」页上也有这个状态和自启勾选框 —— 正开着就重画一下
+                # （ask=False：这是后台轮询补数据，不是用户点导航，别弹窗）
                 if self.config_center.current == "runtime":
-                    self.config_center.show_section("runtime")
+                    self.config_center.show_section("runtime", ask=False)
                 return
             if tries < 25:                   # 最多等 ~7.5 秒（正常 1.3 秒内就回来了）
                 self._poll_job = self.root.after(
@@ -809,7 +1846,7 @@ class App:
         return True, "已保存：" + "、".join(parts)
 
     def toast(self, msg, ok=True):
-        """轻提示：主窗口底部居中的一条应用内文字，2.5s 自己消失。
+        """轻提示：主窗口底部居中的一条**圆角**应用内文字，2.5s 自己消失。
 
         🔴 用户 2026-10-12：去掉所有右下角通知。ttkbootstrap 自带的
            系统级弹窗默认 position=(5, 50, 'se') —— 屏幕右下角的
@@ -817,22 +1854,29 @@ class App:
            Windows 通知设置吞掉。改成应用内的一条：不抢焦点、不挡操作。
         🔴 失败信息也只做轻提示，不弹模态框 —— 保存失败时用户往往正盯着
            表单，一个 messagebox 会把视线整个抢走。
+        🔴 用 `RoundedToast` 不用 `tk.Label`（用户 2026-10-16「通知依然是
+           直角矩形」）：Tk 的 Label 画不出圆角，和全应用别处对不上。
         """
         try:
             lbl = getattr(self, "_toast_lbl", None)
             if lbl is None or not lbl.winfo_exists():
-                lbl = tk.Label(self.root, text="", anchor="center",
-                               padx=16, pady=7, font=_font(9))
+                lbl = RoundedToast(self.root, font=_font(9),
+                                   bg=self.style.colors.bg)
                 self._toast_lbl = lbl
             dark = self.theme == THEME_DARK
             # 色板跟着主题走：成功用品牌色、出错用 danger；字色取底色系的前景。
-            conf = dict(bg=self.style.colors.primary if ok
+            lbl.set_msg(msg,
+                        self.style.colors.primary if ok
                         else self.style.colors.danger,
-                        fg="#0b2a3d" if dark else "#ffffff")
-            lbl.configure(text=msg, **conf)
+                        "#0b2a3d" if dark else "#ffffff")
             # 底部居中、压在底栏上方一点（别盖住状态栏 / 任务栏）
             lbl.place(relx=0.5, rely=1.0, anchor="s", y=-16)
-            lbl.lift()
+            # 🔴 置顶**必须走 `_raise_widget`**：`RoundedToast` 是 Canvas，本机
+            #    tkinter 把 `Canvas.lift = tkraise = tag_raise`（抬**画布条目**，
+            #    要求 tagOrId）⇒ `lbl.lift()` 抛 `wrong # args`，而它下面那圈
+            #    `try/except` 会把它吞掉 —— 后果是**这一条提示永远不会自动消失**
+            #    （`after(2500, _hide)` 那行根本没执行到）。探针 ④ 抓到的。
+            _raise_widget(lbl)
             job = getattr(self, "_toast_job", None)
             if job is not None:
                 try:
@@ -854,6 +1898,145 @@ class App:
 
 
 # ── 配置中心标签页 ────────────────────────────────────────────────
+class _PathList(ttk.Frame):
+    """可增删的目录列表（「发文件」的搜索根目录）。
+
+    干嘛的：这块以前是个多行文本框，一行一个目录 —— 看着像一段日志，一眼读不出
+                「一共几条」，删一条还得小心别把换行删错（用户报的「文本框
+               不好读」）。现在一行一条、每条右边一个「×」，底下
+               「＋ 添加目录…」走系统的选目录对话框。
+    谁调用它：`ConfigCenter._render_one_field`（`kind == "paths"`）。
+    🔴 `.get()` 必须和 `_base_value()` 对 paths 的换算**一字不差**（换行串、
+       逐行 strip、丢空行），否则脏判据会把没改过的页判成脏 —— 一进页面
+       保存按钮就亮着。
+    """
+
+    def __init__(self, master, cc, paths, on_change):
+        super().__init__(master)
+        self._cc = cc
+        self._on_change = on_change
+        self._paths = []
+        self._rows = ttk.Frame(self)
+        self._rows.pack(fill="x")
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", pady=(6, 0))
+        cc._ghost_btn(bar, "＋ 添加目录…", self._add,
+                      padx=12, pady=4).pack(side="left")
+        ttk.Label(bar, text="「发文件」只在这些目录下面找；目录越大搜得越慢。",
+                  bootstyle="secondary", font=_font(8)).pack(side="left", padx=8)
+        self.set(paths)
+
+    # ── 读数 / 回填 ──────────────────────────────────────────────
+    def get(self):
+        """按 `_base_value()` 的口径交出值：换行串、逐行 strip、丢空行。"""
+        return "\n".join(self._paths)
+
+    def set(self, paths):
+        if isinstance(paths, str):
+            paths = re.split(r"[;\n]", paths)
+        self._paths = [str(p).strip() for p in (paths or []) if str(p).strip()]
+        self._redraw()
+
+    # ── 画 / 增 / 删 ─────────────────────────────────────────────
+    def _redraw(self):
+        for w in self._rows.winfo_children():
+            w.destroy()
+        if not self._paths:
+            ttk.Label(self._rows, text="还没加任何目录 —— 「发文件」会找不到文件。",
+                      bootstyle="secondary",
+                      font=_font(9)).pack(anchor="w", pady=(0, 2))
+            return
+        for i, p in enumerate(self._paths):
+            row = ttk.Frame(self._rows, padding=(0, 4))
+            row.pack(fill="x")
+            self._cc._ghost_btn(row, "×", lambda idx=i: self._remove(idx),
+                                color="danger", padx=8, pady=2).pack(side="right")
+            ttk.Label(row, text=_soft_wrap(p, 600, 9), wraplength=600,
+                      font=_font(9)).pack(side="left", anchor="w")
+            # 条与条之间来一条细线：不然几行目录挨在一起读不出「这是几条」
+            if i < len(self._paths) - 1:
+                tk.Frame(self._rows, bg=self._cc._c("border"),
+                         height=1).pack(fill="x")
+
+    def _remove(self, idx):
+        if 0 <= idx < len(self._paths):
+            del self._paths[idx]
+            self._redraw()
+            self._on_change()
+
+    def _add(self):
+        d = filedialog.askdirectory(title="选一个「发文件」的搜索目录")
+        if not d:
+            return
+        d = os.path.normpath(d)
+        if d in self._paths:      # 重复的加进来没意义，直接忽略
+            return
+        self._paths.append(d)
+        self._redraw()
+        self._on_change()
+
+
+class _UnsavedDialog(tk.Toplevel):
+    """有未保存改动时拦一道（v0.3.2 第四节「保存更改」不再丢）。
+
+    干嘛的：改完一页没保存就切走（或关窗口），以前改动静默没了。现在给两个
+                都说得清的选项：保存并切换（关窗口时是「保存并退出」）/
+                放弃更改。
+    谁调用它：`ConfigCenter._guard_leave`（切分区）、`confirm_close`（关窗口）。
+    🔴 **没有「取消」按钮**（用户 2026-10-16 要求删）：它和右上角的 × 是同一件
+        事（都是「先别走」），并排放着只让人多犹豫一下。× 走
+        `WM_DELETE_WINDOW` → `_done("cancel")`，语义一点没少。
+    🔴 默认焦点给「保存并切换」—— 误触回车也不会丢东西。
+    🔴 模态靠 `grab_set` + `wait_window`：等用户答完再返回 `.result`，
+        调用方（导航按钮回调 / 关窗协议）不用改造成异步。
+    """
+
+    def __init__(self, app, *, closing=False, page="", target=""):
+        super().__init__(app.root)
+        self.app = app
+        self.result = None
+        self.title("摸鱼bot")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.configure(bg=app.style.colors.bg)
+        cc = app.config_center
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both")
+        ttk.Label(body, text="有没保存的改动", font=_font(11, "bold")
+                  ).pack(anchor="w")
+        msg = ("关掉窗口，这些改动就没了。要保存了再关吗？" if closing else
+               f"「{page}」还有没保存的改动。\n保存了再切去「{target}」，"
+               f"还是直接放弃？")
+        ttk.Label(body, text=msg, bootstyle="secondary", wraplength=380,
+                  font=_font(9)).pack(anchor="w", pady=(6, 14))
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        save_btn = cc._solid_btn(row, "保存并退出" if closing else "保存并切换",
+                                 lambda: self._done("save"), padx=14, pady=6)
+        save_btn.pack(side="left")
+        cc._ghost_btn(row, "放弃更改", lambda: self._done("drop"),
+                      color="danger", padx=12, pady=6).pack(side="left",
+                                                            padx=(8, 0))
+        save_btn.focus_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: self._done("cancel"))
+        # 居中压在父窗口上
+        self.update_idletasks()
+        pw, ph = app.root.winfo_width(), app.root.winfo_height()
+        px, py = app.root.winfo_rootx(), app.root.winfo_rooty()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + max(0, (pw - w) // 2)}+{py + max(0, (ph - h) // 2)}")
+        self.grab_set()
+        self.wait_window(self)
+
+    def _done(self, ans):
+        self.result = ans
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+
 class ConfigCenter(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
@@ -878,31 +2061,79 @@ class ConfigCenter(ttk.Frame):
         self._multi = {}          # (target, key) -> {choice: BooleanVar}
         self._push = {}           # (scope, oid) -> BooleanVar
         self._moyu_texts = {}
+        # 「外观」页的颜色三选一（自绘按钮，不进 `_var_map`）：渲染时记下来，
+        # `_pick_theme` 要按它刷选中态。见 `_theme_buttons`。
+        self._theme_btns = []
         # 自定义指令页：后台探测的结果（主线程轮询取用）+ 列表容器 + 提示行
         self._ext_result = None
         self._ext_box = None
+        self._ext_h = None        # 列表视口**当前**高度（自己设的，见 _fit_ext_box）
         self._ext_count = None
         self._ext_note = None
+        # ── 未保存改动跟踪（v0.3.2 第四节「保存更改」不再丢）──
+        # 🔴 暂存与脏集合必须挂在 `App` 上，不是这里：换肤 / 改字号会整窗重建
+        #    （ConfigCenter 连实例一起换新的），挂这儿一重建就丢，用户填了一半
+        #    的内容跟着没了。App 上取不到就地创建（首次进配置中心时）。
+        self._pending = getattr(app, "_pending", None)
+        if self._pending is None:
+            self._pending = {}
+            app._pending = self._pending
+        self._dirty_secs = getattr(app, "_dirty_secs", None)
+        if self._dirty_secs is None:
+            self._dirty_secs = set()
+            app._dirty_secs = self._dirty_secs
+        # 渲染期间控件初始赋值也会触发 trace —— 那不叫「用户改了」
+        self._rendering = False
+        # 每个分区渲染时拍下的「已保存值」基线：脏判据拿它和暂存比
+        self._base = {}
         self._build()
 
     def _build(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        nav = ttk.Frame(self, width=190, padding=(6, 8))
+        nav = ttk.Frame(self, width=190, padding=(6, 6))
         nav.grid(row=0, column=0, sticky="ns")
         nav.pack_propagate(False)
-        self.nav = nav
-        ttk.Label(nav, text="分区", font=_font(10, "bold"),
-                  bootstyle="secondary").pack(anchor="w", pady=(0, 6))
+        # 🔴 导航**必须能滚**：9 个页签 + 6 个分组标题在 720 高的窗口下会超出
+        #    可用高度，超出部分被裁掉又滚不动 —— 用户报的「看不到左侧下面的
+        #    内容，让用户自己去拉窗口是不合理的」。套一层 ScrolledFrame 兜底，
+        #    窗口再矮也能滚到底；`auto_hide=True` 让滚动条平时不占宽。
+        #    同时 `refresh()` 里已经去掉了分组分隔线（省 ~78px），默认窗口下
+        #    根本不会触发滚动。
+        # 🔴 用 `FitScrolledFrame`（不是原版）：原版 `auto_hide=True` 是「鼠标一
+        #    进来就显滚动条」，装得下也显 —— 用户 2026-10-16 报的「鼠标移到侧栏，
+        #    就算没有可移动的范围，也会显示一个滑动条」。
+        self._nav_scroll = FitScrolledFrame(nav, auto_hide=True, padding=0)
+        self._nav_scroll.pack(fill="both", expand=True)
+        self.nav = self._nav_scroll
+        # 🔴 顶部不放「分区」大标题（用户明确要求）：分组本身就是导航的一部分，
+        #    上面再压一行总标题只是多占高度、还和分组名重复。
 
         body = ttk.Frame(self, padding=12)
         body.grid(row=0, column=1, sticky="nsew")
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
 
-        self.title = ttk.Label(body, text="", font=_font(13, "bold"))
-        self.title.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        # 页头：分区标题 + 共用的保存按钮（同一行右侧，不额外占高度）
+        # 🔴 保存按钮从可滚内容区最底下挪到这里（v0.3.2 第四节）：以前改完一页
+        #    没看见最底下那个按钮就切走，改动静默丢失。页头在滚动区外面，
+        #    不用滚就看得见；文字 / 命令 / 显隐按分区在 `show_section` 里换。
+        # 🔴 高度贴着标题行做小（pady=4）—— 一屏预算 512px 是按整页实测的，
+        #    多一行就多挤掉一截视口。
+        head = ttk.Frame(body)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        head.columnconfigure(0, weight=1)
+        self.title = ttk.Label(head, text="", font=_font(13, "bold"))
+        self.title.grid(row=0, column=0, sticky="w")
+        self.save_btn = self._solid_btn(head, "保存更改", self._on_header_save,
+                                        padx=14, pady=4)
+        # 🔴 必须用 grid：标题在这一行里已经是 grid 管理的了，同一父容器混用
+        #    pack 会直接被 Tk 拒（cannot use geometry manager pack inside …
+        #    which already has slaves managed by grid）—— 真机探针一跑就炸。
+        self.save_btn.grid(row=0, column=1, sticky="e")
+        # 没改的时候是灰的、点了没反应；改了才亮（`_recheck_dirty` 维护）
+        self.save_btn.configure(state="disabled")
         self.desc = ttk.Label(body, text="", bootstyle="secondary", wraplength=720,
                               font=_font(9))
         self.desc.grid(row=1, column=0, sticky="w", pady=(0, 10))
@@ -946,6 +2177,8 @@ class ConfigCenter(ttk.Frame):
 
     def _on_canvas_resize(self, e):
         self.canvas.itemconfigure(self._canvas_win, width=e.width)
+        # 窗口尺寸变了，扩展列表框的「撑满」高度跟着重算（放大了要补，缩小了要收）
+        self._fit_ext_box()
         self._sync_scrollregion()
 
     def _on_wheel(self, e):
@@ -957,67 +2190,95 @@ class ConfigCenter(ttk.Frame):
         🔴 装得下就直接吞掉：`scrollregion` 比视口矮时 Tk **照样**接受
            `yview_scroll`，只是把原点推成负数 —— 内容被整体下推（见
            `_sync_scrollregion`）。这里先拦一道，别给它机会。
+        🔴 内部自己滚的列表（v0.3.2 的已装扩展）不掺和：滚轮在它上面时
+           两边一起滚，用户看到的是「页面和列表同时动」，像界面坏了。
+           轮子交给里面那个，外层一个字都不动。
+        🔴 往上找父控件的终点是 `self.app.root`，**不是 `self.root`** ——
+           ConfigCenter 根本没有 `root` 属性，写成 `self.root` 会抛
+           AttributeError，被 Tk 回调吞进 stderr，表现就是**整个窗口滚轮全废**
+           （每滚一下都在这儿炸，`yview_scroll` 永远到不了）。真机踩到。
         """
         if not self.canvas.winfo_ismapped():
             return
         if self.scroll.winfo_reqheight() <= self.canvas.winfo_height():
             return
+        top = self.app.root
+        node = e.widget
+        while node is not None and node is not top:
+            if isinstance(node, ScrolledFrame):
+                return
+            node = getattr(node, "master", None)
         self.canvas.yview_scroll(-1 * (e.delta // 120), "units")
 
     def refresh(self, state):
         self.state = state
-        for b, _ in self._nav:
-            b.destroy()
+        # 🔴 清导航必须**连分组标题一起清**：`_nav` 里只有按钮，只 destroy 按钮
+        #    的话，每 refresh 一次就多留一组「分隔线 + 分组标题」—— 保存一次
+        #    设置左栏就多出一整套标题（用户报的「保存后页签刷新成错误样式」，
+        #    截图里上半截是残影、下半截才是新的）。整容器清空最干净。
+        for w in self.nav.winfo_children():
+            w.destroy()
         self._nav.clear()
-        for g in state["groups"]:
-            b = RoundedButton(
-                self.nav, g["title"],
-                lambda k=g["key"]: self.show_section(k),
-                kind="ghost", anchor="w", padx=12, pady=6, radius=10,
-                fg=self._c("secondary"), hover_fill=self._c("active"),
-                selected_fg=self._c("primary"), selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
-                parent_bg=self._c("bg"), fixed_width=174)
-            b.pack(anchor="w", pady=2, fill="x")
-            self._nav.append((b, g["key"]))
-        # 主题切换常驻在导航底部（浅色 / 跟随系统 / 深色）—— 不进任何分区，
-        # 三个功能里「切换深浅色」的入口就在这。
-        self._build_theme_switch()
+        # 🔴 导航按「你在这儿干什么」分组（v0.3.2 结构归位）：以前 10 个页签平铺，
+        #    每个都是个功能开关，用户得从头扫到尾才能猜出「外观类的东西在哪」。
+        #    分组标题只是标签，不带点击 —— 顺序即分组，`GROUPS` 本身就是页面顺序。
+        nav_items = {g["key"]: g for g in state["groups"]}
+        for grp in state.get("nav_groups") or []:
+            # 🔴 分组标题下面**不画分隔线**：整条导航要压在窗口高度内。6 条线
+            #    连 pady 一起要吃掉 ~78px，而加粗标题 + 上方留白已经够分开了。
+            # 🔴 缩进分两级（用户 2026-10-16「整理缩进，让大标题在小标题前面」）：
+            #    分组标题贴左边（padx=10），子项再缩进一级（按钮内边距 24）——
+            #    以前两者都是 12，标题和子项看着一样平，读不出层级。
+            ttk.Label(self.nav, text=grp["name"], font=_font(10, "bold"),
+                      bootstyle="secondary").pack(anchor="w", padx=(10, 0),
+                                                  pady=(6, 2))
+            for k in grp["keys"]:
+                g = nav_items.get(k)
+                if g is None:
+                    continue          # 分组里写了不存在的页 —— 跳过，别崩
+                b = RoundedButton(
+                    self.nav, g["title"],
+                    lambda kk=g["key"]: self.show_section(kk),
+                    kind="ghost", anchor="w", padx=24, pady=5, radius=10,
+                    fg=self._c("secondary"), hover_fill=self._c("active"),
+                    selected_fg=self._c("primary"), selected_fill=lerp_color(self._c("primary"), self._c("bg"), 0.86),
+                    parent_bg=self._c("bg"), fixed_width=174,
+                    dirty_fg=self._c("warning"))
+                b.pack(anchor="w", pady=0, fill="x")
+                # 🔴 有未保存改动的分区，导航上点一个叹号（换肤重建后靠
+                #    `_dirty_secs` 回填 —— 所以这个集合挂在 App 上）。
+                if g["key"] in self._dirty_secs:
+                    b.set_dirty(True)
+                self._nav.append((b, g["key"]))
         if self.current is None:
             self.current = state["groups"][0]["key"]
-        self.show_section(self.current)
+        self.show_section(self.current, ask=False)
 
     def _c(self, key):
         """当前主题色（ttkbootstrap Colors 的字段）。"""
         return getattr(self.app.style.colors, key)
 
-    def _build_theme_switch(self):
-        """导航底部常驻「跟随系统 / 浅色 / 深色」三态切换。
+    def _theme_buttons(self, parent):
+        """往 `parent` 里摆「跟随系统 / 浅色 / 深色」三态按钮，返回按钮列表。
 
-        偏好落在数据目录 ui-theme.txt（见 load/save_ui_theme），选中即整窗重建换肤。
-        三个按钮竖排、样式同分区导航，避免 RoundedButton 不支持 fill 拉伸导致
-        并排时圆角矩形只画在左半边。
+        偏好落在数据目录 ui-theme.txt（见 load/save_ui_theme）。
+        🔴 **点一下 = 立刻预览，但不落盘**（用户 2026-10-16 两轮反馈合起来的要求）：
+           第一轮「点这三个按钮直接是结果态的更改，不走保存更改了，和整体逻辑不
+           一致」→ 改成只进暂存；第二轮「点颜色要可以预览，但点保存才能生效，
+           不然就回退回设置」→ 现在点选**立刻换肤给你看**（`preview_theme`），
+           但偏好**一个字都不写**；点「保存更改」才落盘（`set_theme_mode`），
+           没保存就离开这一页则回退（`_reconcile_theme`）。
         🔴 顺序固定「跟随系统 / 浅色 / 深色」（用户 2026-10-12）——
            「跟随系统」是默认值，排第一；别再把它夹在中间。
+        谁调用它：`_render_look()`（「外观」页）。
         """
-        for w in getattr(self, "_theme_widgets", []):
-            try:
-                w.destroy()
-            except tk.TclError:
-                pass
-        self._theme_widgets = []
-        nav = self.nav
-        sep = tk.Frame(nav, bg=self._c("border"), height=1)
-        sep.pack(fill="x", padx=8, pady=(8, 6))
-        self._theme_widgets.append(sep)
-        lbl = tk.Label(nav, text="外观", bg=self._c("bg"),
-                       fg=self._c("secondary"), font=_font(10, "bold"))
-        lbl.pack(anchor="w", padx=12, pady=(0, 4))
-        self._theme_widgets.append(lbl)
-        cur = getattr(self.app, "theme_mode", "system")
+        out = []
+        cur = (self._pending.get("look") or {}).get(
+            ("ui", "theme")) or getattr(self.app, "theme_mode", "system")
         for text, mode in (("跟随系统", "system"),
                            ("浅色", "light"),
                            ("深色", "dark")):
-            b = RoundedButton(nav, text, lambda m=mode: self.app.set_theme_mode(m),
+            b = RoundedButton(parent, text, lambda m=mode: self._pick_theme(m),
                               kind="ghost", anchor="w", padx=12, pady=5, radius=10,
                               font=_font(9),
                               fg=self._c("secondary"),
@@ -1028,7 +2289,47 @@ class ConfigCenter(ttk.Frame):
             b.pack(anchor="w", pady=2, fill="x")
             if mode == cur:
                 b.set_selected(True)
-            self._theme_widgets.append(b)
+            out.append(b)
+        self._theme_btns = out
+        return out
+
+    def _pick_theme(self, mode):
+        """点「跟随系统 / 浅色 / 深色」：进暂存 + **立刻预览**，但**不落盘**。
+
+        🔴 三步（用户 2026-10-16 要求「点颜色要能预览，但点保存才能生效，
+           不然就回退回设置」）：
+             ① 写暂存 → 脏判据立刻亮（基线是**已保存**的 `app.theme_mode`）；
+             ② 调 `preview_theme` 立刻换肤给人看；
+             ③ 没点保存就离开这一页 → `_reconcile_theme` 把显示拉回已保存值。
+        🔴 `preview_theme` 会**整窗重建**，`self` 当场被销毁 —— 它必须是本函数
+           的最后一句（和 `_on_save` 里换肤放最后同一个道理）。
+        """
+        if self._rendering:
+            return
+        self._pending.setdefault(self.current, {})[("ui", "theme")] = mode
+        for b, m in zip(getattr(self, "_theme_btns", []),
+                        ("system", "light", "dark")):
+            b.set_selected(m == mode)
+        self._recheck_dirty()
+        if mode != getattr(self.app, "theme_display", None):
+            self.app.preview_theme(mode)    # ← 最后一步：之后 self 已销毁
+
+    def _reconcile_theme(self):
+        """把**显示中**的皮肤拉回「已保存值 + 暂存值」的应然值。
+
+        干嘛的：点颜色是立即预览，保存才算数。用户预览完**没保存**就离开这一页
+                （对话框选「放弃更改」），或把选择改回原样 —— 显示会停在上一次
+                预览的样子。这里把它拉回来（回退）。
+        谁调用它：`show_section` 渲染完新页之后 —— 那时暂存已经定型（该清清的
+                已经清了），读到的就是「应然值」。
+        🔴 暂存里没有 theme 就用**已保存**的 `theme_mode`，不能用 `theme_display`
+           —— 后者正是要纠正的那个值，拿它当目标等于什么都不做。
+        """
+        want = (self._pending.get("look") or {}).get(("ui", "theme"))
+        if want is None:
+            want = getattr(self.app, "theme_mode", "system")
+        if want != getattr(self.app, "theme_display", None):
+            self.app.preview_theme(want)
 
     def _dim(self):
         """禁用 / 占位文字色：比正文淡但仍看得见（别用 border，那是边框色）。"""
@@ -1046,15 +2347,60 @@ class ConfigCenter(ttk.Frame):
                              disabled_fg=self._dim(),
                              parent_bg=self._c("bg"), padx=padx, pady=pady)
 
+    def _btn_line(self):
+        """次级按钮的**常态描边色**：比 `border` 明显一档，但仍远弱于主按钮。
+
+        干嘛的：`border`（#e6eaee 之类）贴着背景几乎看不见，拿它做按钮轮廓等于
+                没画；直接用 `secondary` 又太重、抢主按钮的视线。取两者之间
+                偏淡的一档。
+        谁调用它：`_ghost_btn`。
+        """
+        return lerp_color(self._c("border"), self._c("secondary"), 0.45)
+
     def _ghost_btn(self, parent, text, cmd, *, color="secondary",
                    padx=14, pady=6):
-        """次级圆角按钮（平时只显文字，hover 显淡底）。"""
+        """次级圆角按钮：常态就带**淡描边 + 比背景亮一档的底**，一眼认得出是按钮。
+
+        🔴 以前是「纯文字，只有鼠标移上去才冒出一块底色」（用户 2026-10-16 报的
+           「能点击的按钮和文字区分不明显，只有鼠标移上去会有个块提示」）——
+           不 hover 就完全看不出它能点。
+        🔴 强度**必须弱于主按钮**（用户原话「不要像保存更改那么强」）：主按钮是
+           品牌色实心 + 反白字；这里只有一条 1px 淡线 + 一层几乎看不见的底，
+           文字仍是次级灰。hover 时底色才加深。
+        """
         return RoundedButton(parent, text, cmd, kind="ghost",
-                             fg=self._c(color), hover_fill=self._c("active"),
+                             fg=self._c(color), fill=self._c("inputbg"),
+                             outline=self._btn_line(),
+                             hover_fill=self._c("active"),
+                             hover_outline=self._c("secondary"),
                              disabled_fg=self._dim(),
                              parent_bg=self._c("bg"), padx=padx, pady=pady)
 
-    def show_section(self, key):
+    # 各分区的保存入口（v0.3.2 第四节）。页头那个共用的保存按钮按这张表换
+    # 文字 / 命令；表里没有的分区（运行方式 / 自定义指令 / 版本与诊断）
+    # 没有可保存的东西 —— 按钮直接藏起来，不留一个灰着骗人的「保存更改」。
+    _SEC_SAVE = {
+        "bot": ("保存凭据", "fields"),
+        "behavior": ("保存更改", "fields"),
+        "msg": ("保存更改", "fields"),
+        "files": ("保存更改", "fields"),
+        "bubbles": ("保存更改", "fields"),
+        "boomerang": ("保存更改", "fields"),
+        "look": ("保存更改", "fields"),
+        "alerts": ("保存更改", "fields"),
+        "moyu": ("保存摸鱼库", "moyu"),
+    }
+
+    def show_section(self, key, *, ask=True):
+        """切分区。
+
+        `ask=True`（默认，导航点击走的）：这一页有没保存的改动时，先拦一道问
+        「保存并切换 / 放弃更改 / 取消」—— 以前直接切走，改动静默没了。
+        `ask=False` 是内部路径（刷新 / 换肤 / 改字号重建后回原分区）：
+        用户没点导航，不该弹窗；改动由 `App._pending` 兜着，本来就不会丢。
+        """
+        if ask and key != self.current and self._guard_leave(key):
+            return                      # 用户在对话框里选了「取消」
         self.current = key
         # 左侧分区导航：选中 = 品牌色文字 + 圆角淡底；未选中 = 灰字
         for b, k in self._nav:
@@ -1065,38 +2411,285 @@ class ConfigCenter(ttk.Frame):
         self._multi.clear()
         self._push.clear()
         self._moyu_texts.clear()
+        self._capture_base(key)
 
         g = next(x for x in self.state["groups"] if x["key"] == key)
         self.title.configure(text=g["title"])
         # 分区描述也过 `_soft_wrap`（同上：中文长句 Tk 会留大片行尾空白）
         self.desc.configure(text=_soft_wrap(g["desc"], 720, 9))
-
-        if key == "bot":
-            self._render_bot()
-        elif key == "msg":
-            self._render_msg()
-        elif key == "runtime":
-            self._render_runtime()
-        elif key == "moyu":
-            self._render_moyu()
-        elif key == "ext":
-            self._render_ext()
-        elif key == "version":
-            self._render_version()
+        # 页头共用的保存按钮：按分区换文字 / 显隐
+        spec = self._SEC_SAVE.get(key)
+        if spec is None:
+            # grid_remove（不是 destroy）：记住 grid 配置，下次 pack 回来原位
+            self.save_btn.grid_remove()
         else:
-            self._render_fields(key)
-            self._save_btn()
+            self.save_btn.set_text(spec[0])
+            if not self.save_btn.winfo_manager():
+                self.save_btn.grid(row=0, column=1, sticky="e")
+
+        # 🔴 渲染期间控件初始赋值也会触发 trace / KeyRelease —— 那不叫
+        #    「用户改了」。用 `_rendering` 把这段拦住，否则一进页面按钮就亮着。
+        self._rendering = True
+        try:
+            if key == "bot":
+                self._render_bot()
+            elif key == "msg":
+                self._render_msg()
+            elif key == "look":
+                self._render_look()
+            elif key == "alerts":
+                self._render_alerts()
+            elif key == "runtime":
+                self._render_runtime()
+            elif key == "moyu":
+                self._render_moyu()
+            elif key == "ext":
+                self._render_ext()
+            elif key == "version":
+                self._render_version()
+            else:
+                self._render_fields(key)
+        finally:
+            self._rendering = False
+        self._recheck_dirty()
         # 内容整批换过了 → 滚动范围要跟着重算，否则留着上一页的余量
         # （用户报的「滚轮上滑还能滚出一大串空白」就是这么来的）。
         # 🔴 还要**回到顶部**：上一页滚到一半的位置留着的话，短页面一打开
         #    就停在半路（原点还是负的，上面一片空）。
         def _after_swap():
             self._sync_scrollregion()
+            # 🔴 排版落定后再 fit 一次扩展列表框：渲染期间 canvas 还没量出
+            #    高度（=1），那时算不出「视口富余」，撑不满。
+            self._fit_ext_box()
+            self._sync_scrollregion()
             try:
                 self.canvas.yview_moveto(0)
             except tk.TclError:
                 pass
         self.after_idle(_after_swap)
+        # 🔴 最后一步：把显示中的皮肤拉回应然值（点颜色预览过、又没保存就离开
+        #    这一页时，这里负责回退）。它内部可能整窗重建，所以必须是最后一句。
+        self._reconcile_theme()
+
+    # ---- 未保存改动跟踪（v0.3.2 第四节）----
+    def _capture_base(self, key):
+        """渲染前把这一页的「已保存值」拍下来 —— 脏判据的基线。
+
+        🔴 基线必须是**已保存值**、不是「屏幕上当时的值」：用户上一轮改了一半
+            切走（值进了 `_pending`），这轮回来按暂存回填。要是拿回填后的值当
+            基线，「改了又改回来不算脏」就会把上轮真的改动一起判成没改。
+        """
+        base = {}
+        if key == "moyu":
+            m = self.state.get("moyu") or {}
+            base[("__moyu__", "groups")] = dict(m.get("groups") or {})
+        else:
+            for f in section_fields(self.state, key):
+                if f.get("hidden"):
+                    continue          # 不渲染的字段不参与脏判据
+                # 🔴 基线必须换算成**控件读数的形态**（`_base_value`）——
+                #    存储形态和显示形态不是一回事，不换算一进页面就算脏。
+                base[(f["target"], f["key"])] = _base_value(f)
+            if key == "look":
+                # 🔴 「外观」页的颜色三选一是**自绘按钮**（不在 `section_fields`
+                #    里），基线得单独拍 —— 不然一进这一页就被判成脏、保存按钮
+                #    莫名其妙亮着。基线取**已保存**的 `theme_mode`，不是显示中的
+                #    `theme_display` —— 后者可能是没保存的预览值。
+                base[("ui", "theme")] = getattr(self.app, "theme_mode", "system")
+            if key == "msg":
+                # 🔴 播报目标同理：`QQ_PUSH_TARGETS` 标了 hidden、由自绘勾选列表
+                #    管，`section_fields` 里没有它 —— 基线单独拍。
+                base[("env", "QQ_PUSH_TARGETS")] = self._push_saved()
+        self._base[key] = base
+
+    def _disp_val(self, f):
+        """渲染取值：本分区暂存的未保存改动优先，否则已保存值。"""
+        got = (self._pending.get(self.current) or {}).get((f["target"], f["key"]))
+        return f.get("value") if got is None else got
+
+    def _on_input(self):
+        """控件值变了 → 重算脏状态（按钮灰/亮、左侧叹号、暂存）。
+
+        输入框 / 多选 / 开关走变量 trace，文本框走 `<KeyRelease>` —— 右键粘贴
+        不触发键盘事件，那种漏网情况靠离开前 / 关窗前的 `_sync_pending` 兜底。
+        """
+        if self._rendering:
+            return
+        self._sync_pending()
+        self._recheck_dirty()
+
+    def _sync_pending(self):
+        """把当前页的控件读数写进暂存（App._pending），并维护脏集合。
+
+        干嘛的：暂存是「改动跨页保留」的唯一载体 —— 切页会销毁控件，值只能
+                先落到这里。离开前 / 关窗前也会主动调一次兜底。
+        🔴 值回到已保存状态（改了又改回来）时，暂存直接丢 —— 没有要保存的
+            东西，留着只会让下次进来时按钮莫名其妙亮着。
+        """
+        sec = self.current
+        if sec is None:
+            return
+        vals = {}
+        for (target, key), var in self._var_map.items():
+            vals[(target, key)] = _read_input(var)
+        for (target, key), vars_ in self._multi.items():
+            vals[(target, key)] = ",".join(c for c, v in vars_.items() if v.get())
+        # 🔴 播报目标（勾选列表）也是自绘控件，不在 `_var_map` / `_multi` 里 ——
+        #    同 `("ui","theme")` 的道理，得自己并进来；不然点了保存它不在暂存里，
+        #    这一页的改动会被静默丢掉（用户 2026-10-16 报的「这里的修改是实时
+        #    生效，没有走保存更改」—— 顺手把它并进同一套体系）。
+        if self._push:
+            vals[("env", "QQ_PUSH_TARGETS")] = self._push_picked()
+        # 🔴 自绘控件（「外观」页的颜色三选一，`_pick_theme` 直接写的暂存）不走
+        #    `_var_map` —— 这里必须原样保留，否则下一次重算就把它的值抹掉了。
+        for k, v in (self._pending.get(sec) or {}).items():
+            if k[0] == "ui":
+                vals[k] = v
+        if self._moyu_texts:
+            vals[("__moyu__", "groups")] = {
+                k: [ln.strip() for ln in t.get("1.0", "end").splitlines()
+                    if ln.strip()]
+                for k, t in self._moyu_texts.items()}
+        if vals:
+            self._pending[sec] = vals
+        else:
+            self._pending.pop(sec, None)
+        if self._is_dirty(sec):
+            self._dirty_secs.add(sec)
+        else:
+            self._dirty_secs.discard(sec)
+            self._pending.pop(sec, None)
+
+    def _is_dirty(self, sec):
+        """这一页有没有没保存的改动（改了又改回来不算）。
+
+        🔴 当前页必须走**实时比较**，不能先看脏标记 —— 标记是上一轮编辑时
+            打上的；用户把值改回已保存状态时，只有实时比较能发现「其实没改」，
+            先看标记会一直留着个脏，按钮莫名其妙亮着、离开还拦人。
+        """
+        if sec is None:
+            return False
+        if sec == self.current:
+            return bool(_pending_diff(self._base.get(sec) or {},
+                                      self._pending.get(sec) or {}))
+        return sec in self._dirty_secs
+
+    def _recheck_dirty(self):
+        """刷新保存按钮灰/亮 + 左侧导航叹号。"""
+        try:
+            dirty = self._is_dirty(self.current)
+            self.save_btn.configure(state="normal" if dirty else "disabled")
+        except tk.TclError:
+            pass                         # 整窗重建那一刻控件没了
+        for b, k in self._nav:
+            try:
+                b.set_dirty(self._is_dirty(k))
+            except tk.TclError:
+                pass
+
+    def _clear_dirty(self, sec):
+        """这一页的未保存改动作废（已保存 / 已丢弃都走这里）。"""
+        self._pending.pop(sec, None)
+        self._dirty_secs.discard(sec)
+        self._recheck_dirty()
+
+    def _guard_leave(self, next_key):
+        """当前页有未保存改动 → 问「保存并切换 / 放弃更改 / 取消」。
+
+        返回 True = 别切（用户取消，或保存失败了 —— 比如目录不存在）。
+        """
+        cur = self.current
+        if cur is None or cur == next_key:
+            return False
+        self._sync_pending()             # 兜底同步（右键粘贴不触发事件）
+        if not self._is_dirty(cur):
+            return False
+        g_cur = next((x["title"] for x in self.state["groups"]
+                      if x["key"] == cur), cur)
+        g_next = next((x["title"] for x in self.state["groups"]
+                       if x["key"] == next_key), next_key)
+        ans = _UnsavedDialog(self.app, page=g_cur, target=g_next).result
+        if ans == "save":
+            return not self._save_section(cur)
+        if ans == "drop":
+            self._clear_dirty(cur)
+            return False
+        return True                      # 取消 / 直接关对话框
+
+    def _save_section(self, sec):
+        """保存指定分区（离开拦截里的「保存并切换」）。返回是否成功。"""
+        kind = (self._SEC_SAVE.get(sec) or (None, None))[1]
+        if kind == "moyu":
+            self._moyu_save()
+            return sec not in self._dirty_secs
+        return self._on_save()
+
+    def confirm_close(self):
+        """关窗前拦一道：任一分区有未保存改动就问「保存并退出 / 放弃更改 / 取消」。
+
+        干嘛的：关窗口以前直接 destroy，改了一半的设置静默丢失。
+        返回 False = 别关（用户取消，或有改动保存失败了）。
+        """
+        self._sync_pending()
+        if not self._dirty_secs:
+            return True
+        ans = _UnsavedDialog(self.app, closing=True).result
+        if ans == "save":
+            return self._flush_dirty()
+        if ans == "drop":
+            return True
+        return False
+
+    def _flush_dirty(self):
+        """把关窗口前选「保存」的改动全部写盘。
+
+        当前页有控件、其余页只有暂存值 —— 但暂存就是按控件读数同步过来的，
+        两条路读出来的东西一样，这里统一走暂存。
+        """
+        theme = None
+        for sec in sorted(self._dirty_secs):
+            vals = self._pending.get(sec) or {}
+            if not vals:
+                continue
+            if (self._SEC_SAVE.get(sec) or (None, None))[1] == "moyu":
+                groups = vals.get(("__moyu__", "groups")) or {}
+                ok, info = self.cw._moyu.save_items(groups)
+                if not ok:
+                    self.app.toast(info or "保存失败", False)
+                    return False
+                self._clear_dirty(sec)
+                continue
+            env_vals = {k: v for (t, k), v in vals.items() if t == "env"}
+            set_vals = {k: v for (t, k), v in vals.items() if t == "settings"}
+            # 「外观」页的颜色三选一：不是 env / settings 键，落盘走 ui-theme.txt
+            if vals.get(("ui", "theme")):
+                theme = vals[("ui", "theme")]
+            if not env_vals and not set_vals:
+                self._clear_dirty(sec)
+                continue
+            bad = self._bad_path_lines(env_vals)
+            if bad:
+                shown = "、".join(bad[:3]) + ("…" if len(bad) > 3 else "")
+                self.app.toast(f"这几行目录不存在，删掉或改对再保存：{shown}", False)
+                return False
+            ok, msg = self.app.save(env_vals, set_vals)
+            if not ok:
+                self.app.toast(msg, False)
+                return False
+            self._clear_dirty(sec)
+        if theme is not None:
+            # 🔴 换肤放**最后**：它会整窗重建 —— 放在循环里会把后面几页的控件
+            #    当场换掉（值在 `App._pending` 里不丢，但没必要折腾一遍）。
+            self.app.set_theme_mode(theme)
+        return True
+
+    def _on_header_save(self):
+        """页头共用的保存按钮：按分区分派。"""
+        kind = (self._SEC_SAVE.get(self.current) or (None, None))[1]
+        if kind == "moyu":
+            self._moyu_save()
+        else:
+            self._on_save()
 
     # ---- 通用字段渲染 ----
     def _render_fields(self, group_key):
@@ -1111,6 +2704,9 @@ class ConfigCenter(ttk.Frame):
 
     def _render_one_field(self, f):
         target, key, kind = f["target"], f["key"], f["kind"]
+        # 🔴 显示值优先取本分区暂存的未保存改动（v0.3.2 第四节）：改了一半
+        #    切去别的页再回来，控件按 `App._pending` 回填，改动还在。
+        val = self._disp_val(f)
         wrap = ttk.Frame(self.scroll, padding=(0, 4))
         wrap.pack(fill="x", pady=4)
         ttk.Label(wrap, text=f["label"], font=_font(10, "bold")).pack(anchor="w")
@@ -1122,59 +2718,74 @@ class ConfigCenter(ttk.Frame):
                       wraplength=720, font=_font(9)).pack(anchor="w", pady=(0, 4))
 
         if kind == "bool":
-            var = tk.BooleanVar(value=str(f.get("value")) not in ("", "false", "False", "0"))
+            var = tk.BooleanVar(value=str(val) not in ("", "false", "False", "0"))
             ttk.Checkbutton(wrap, text="启用" if var.get() else "未启用", variable=var,
                             bootstyle="primary-round-toggle").pack(anchor="w", pady=(2, 6))
             self._var_map[(target, key)] = var
+            self._watch_var(var)
         elif kind == "secret":
-            var = tk.StringVar()
-            ent = ttk.Entry(wrap, textvariable=var, show="•", width=48)
-            ent.pack(fill="x")
+            var = tk.StringVar(value=str(val or ""))
+            # 圆角输入框（用户 2026-10-16）：ttk.Entry 画不出圆角，见 `RoundedEntry`
+            RoundedEntry(wrap, textvariable=var, show="•", cc=self,
+                         parent_bg=self._c("bg")).pack(fill="x")
             ttk.Label(wrap, text="（留空 = 不修改已保存的值）", bootstyle="secondary",
                       font=_font(8)).pack(anchor="w")
             self._var_map[(target, key)] = var
+            self._watch_var(var)
         elif kind == "paths":
-            # 多个搜索根（「发文件」用）：一行一个目录，和网页版 textarea 同规格。
+            # 多个搜索根（「发文件」用）：一行一条、可增可删（`_PathList`）。
             # 存进来的值可能是分号串（write_env 归一后的形态）或换行串（手改的），
-            # 一律拆开展示；保存时原样交出去，write_env 会再归一分号串。
-            _dirs = [p.strip() for p in
-                     re.split(r"[;\n]", str(f.get("value", ""))) if p.strip()]
-            txt = scrolledtext.ScrolledText(wrap, height=max(3, min(8, len(_dirs) + 1)),
-                                            width=64, wrap="none")
-            txt.insert("1.0", "\n".join(_dirs))
-            txt.pack(fill="x")
-            row = ttk.Frame(wrap)
-            row.pack(fill="x", pady=(4, 0))
-            self._ghost_btn(row, "浏览…",
-                            lambda t=txt: self._browse_into(t),
-                            padx=10, pady=4).pack(side="left")
-            ttk.Label(row, text="一行一个目录 —— 「发文件」只在这些目录下面找；"
-                                "目录越大搜得越慢。",
-                      bootstyle="secondary", font=_font(8)).pack(side="left", padx=8)
-            self._var_map[(target, key)] = txt
+            # `_PathList.set()` 一律拆开展示；保存时原样交出去，write_env 会再归一分号串。
+            pl = _PathList(wrap, self, val, self._on_input)
+            pl.pack(fill="x")
+            self._var_map[(target, key)] = pl
         elif kind == "area":
-            txt = scrolledtext.ScrolledText(wrap, height=5, width=80, wrap="word")
-            txt.insert("1.0", str(f.get("value", "")))
-            txt.pack(fill="x")
-            self._var_map[(target, key)] = txt
+            # 圆角多行文本框（用户 2026-10-16）：见 `RoundedArea`。交给脏判据的
+            # 仍然是里面那个 `ScrolledText`（`ra.text`），口径不变。
+            ra = RoundedArea(wrap, value=val, height=5, cc=self,
+                             parent_bg=self._c("bg"))
+            ra.pack(fill="x")
+            self._var_map[(target, key)] = ra.text
+            self._watch_text(ra.text)
         elif kind == "int":
-            # 上下限跟着设置定义走（后端 normalize 也会拦，这里让 Spinbox 直接框住）
+            # 上下限跟着设置定义走（后端 normalize 也会拦，这里让控件直接框住）
+            # 圆角数字框（用户 2026-10-16「做，全部统一成圆角。包括探活间隔那里
+            # 的箭头框」）：`ttk.Spinbox` 画不出圆角，见 `RoundedSpinbox`。
+            # 🔴 交给脏判据的是**壳**（`sb`）不是 `IntVar` —— 框空着时
+            #    `IntVar.get()` 会抛，壳的 `get()` 有兜底。
             lo, hi = f.get("min"), f.get("max")
-            var = tk.IntVar(value=int(f.get("value") or 0))
-            ttk.Spinbox(wrap, from_=0 if lo is None else lo,
-                        to=1024 if hi is None else hi,
-                        textvariable=var, width=10).pack(anchor="w")
-            self._var_map[(target, key)] = var
+            var = tk.IntVar(value=int(val or 0))
+            sb = RoundedSpinbox(wrap, textvariable=var, lo=lo, hi=hi, cc=self,
+                                parent_bg=self._c("bg"))
+            sb.pack(anchor="w")
+            self._var_map[(target, key)] = sb
+            self._watch_var(var)
         elif kind == "multi":
             self._render_multi(f)
         else:  # text
-            var = tk.StringVar(value=str(f.get("value", "")))
-            ttk.Entry(wrap, textvariable=var, width=64).pack(fill="x")
+            var = tk.StringVar(value=str(val or ""))
+            # 圆角输入框（用户 2026-10-16）：ttk.Entry 画不出圆角，见 `RoundedEntry`
+            RoundedEntry(wrap, textvariable=var, cc=self,
+                         parent_bg=self._c("bg")).pack(fill="x")
             self._var_map[(target, key)] = var
+            self._watch_var(var)
+
+    def _watch_var(self, var):
+        """变量类控件（输入框 / 开关 / 数字框里的 `IntVar`）接上变更监听。"""
+        var.trace_add("write", lambda *_a: self._on_input())
+
+    def _watch_text(self, txt):
+        """文本框接上变更监听。
+
+        🔴 Text 控件没有变量可 trace，只能绑 `<KeyRelease>`。右键粘贴不触发
+            键盘事件 —— 那种漏网情况由离开前 / 关窗前的 `_sync_pending`
+            兜底同步，不会丢。
+        """
+        txt.bind("<KeyRelease>", lambda _e: self._on_input())
 
     def _render_multi(self, f):
         target, key = f["target"], f["key"]
-        cur = as_set(f.get("value"))
+        cur = as_set(self._disp_val(f))
         choices = f.get("choices") or []
         labels = f.get("choice_labels") or {}
         vars_ = {}
@@ -1182,6 +2793,7 @@ class ConfigCenter(ttk.Frame):
             v = tk.BooleanVar(value=c in cur)
             ttk.Checkbutton(self.scroll, text=labels.get(c, c), variable=v,
                             bootstyle="primary-round-toggle").pack(anchor="w", pady=4)
+            self._watch_var(v)
             vars_[c] = v
         self._multi[(target, key)] = vars_
 
@@ -1192,7 +2804,7 @@ class ConfigCenter(ttk.Frame):
             入口要恢复只需把 `_render_fields` 里 hidden 分支的 `continue` 改回来。
         """
         key = f["key"]
-        cur = as_set(f.get("value"))
+        cur = as_set(self._disp_val(f))
         lf = ttk.LabelFrame(self.scroll, text=f["label"], padding=8)
         lf.pack(fill="x", pady=6)
         if f.get("help"):
@@ -1207,10 +2819,6 @@ class ConfigCenter(ttk.Frame):
             vars_[scope] = v
         self._multi[("settings", key)] = vars_
 
-    def _save_btn(self):
-        self._solid_btn(self.scroll, "保存更改",
-                        self._on_save).pack(anchor="e", pady=10)
-
     def _browse(self, var):
         import tkinter.filedialog as fd
         d = fd.askdirectory(initialdir=var.get() or os.path.expanduser("~"))
@@ -1222,7 +2830,7 @@ class ConfigCenter(ttk.Frame):
 
         干嘛的：「发文件」的搜索根是 paths 字段（多个目录），浏览选一个就追加
         一行；初始目录取当前最后一行，连续挑同一个目录下的子目录时不用每次重找。
-        谁调用它：`_render_one_field` 的 paths 分支（桌面配置中心「④ 发文件」）。
+        谁调用它：`_render_one_field` 的 paths 分支（桌面配置中心「发文件」）。
         """
         import tkinter.filedialog as fd
         cur = txt.get("1.0", "end").strip()
@@ -1252,83 +2860,145 @@ class ConfigCenter(ttk.Frame):
         return bad
 
     def _on_save(self):
-        env_vals, set_vals = {}, {}
-        for (target, key), var in self._var_map.items():
-            if isinstance(var, tk.BooleanVar):
-                v = "true" if var.get() else "false"
-            elif isinstance(var, scrolledtext.ScrolledText):
-                v = var.get("1.0", "end").strip()
-            else:
-                v = var.get()
-            (env_vals if target == "env" else set_vals)[key] = v
-        for (target, key), vars_ in self._multi.items():
-            checked = [c for c, v in vars_.items() if v.get()]
-            (env_vals if target == "env" else set_vals)[key] = ",".join(checked)
+        """页头「保存更改」：把当前页的改动写盘。返回是否成功。
+
+        🔴 值从暂存读（进来先 `_sync_pending` 兜底同步一次）—— 暂存、脏判据、
+            保存三处必须同一套读数，否则会出现「按钮说没改、一保存却有改动」
+            这种对不上的账。
+        🔴 保存失败时**不清暂存**：控件还是用户填的样子，改动还在，不用从头
+            再填一遍。
+        """
+        self._sync_pending()
+        vals = self._pending.get(self.current) or {}
+        env_vals = {k: v for (t, k), v in vals.items() if t == "env"}
+        set_vals = {k: v for (t, k), v in vals.items() if t == "settings"}
+        # 「外观」页的颜色三选一：既不是 env 键也不是 settings 键 —— 它落盘到
+        # `ui-theme.txt`、应用方式是整窗重建，所以单独拿出来处理。
+        theme = vals.get(("ui", "theme"))
         # 多目录先点名：有不存在的一律拦下，指出具体是哪几行。
         bad = self._bad_path_lines(env_vals)
         if bad:
             shown = "、".join(bad[:3]) + ("…" if len(bad) > 3 else "")
             self.app.toast(f"这几行目录不存在，删掉或改对再保存：{shown}", False)
-            return
-        ok, msg = self.app.save(env_vals, set_vals)
-        self.app.toast(msg, ok)
+            return False
+        if env_vals or set_vals:
+            ok, msg = self.app.save(env_vals, set_vals)
+            if not ok:
+                self.app.toast(msg, False)
+                return False
+        else:
+            msg = "已保存"
+        self._clear_dirty(self.current)
+        if theme is not None and theme != getattr(self.app, "theme_mode", None):
+            # 🔴 换肤放**最后**：`set_theme_mode` 会整窗重建，重建之后这个
+            #    ConfigCenter 实例连同它的 toast 一起没了 —— 换肤本身就是反馈。
+            self.app.set_theme_mode(theme)
+            return True
+        self.app.toast(msg, True)
+        return True
 
-    # ---- ① 连接 QQ：凭据 ----
+    # ---- 连接 QQ：凭据 ----
     def _render_bot(self):
         self._render_fields("bot")
         self._group_switches_box()
-        self._solid_btn(self.scroll, "保存凭据", self._on_save
-                        ).pack(anchor="e", pady=(4, 10))
+        # 保存按钮在页头（v0.3.2 第四节：`_SEC_SAVE` 里 bot → 「保存凭据」）
 
     def _group_switches_box(self):
         """「去 QQ 里开两个开关」提示块（内容与网页版配置中心一致）。
 
         干嘛的：这两个开关在 QQ 那边管，配置中心碰不到它们；不开的话机器人
         收不到普通发言、也发不出播报，用户会以为「机器人坏了」。十个人有九个
-        不看说明书，所以直接摆在「① 连接 QQ」页上，别指望人家去翻安装指南。
-        谁调用它：`_render_bot()`（桌面配置中心「① 连接 QQ」页）。
+        不看说明书，所以直接摆在「连接 QQ」页上，别指望人家去翻安装指南。
+        谁调用它：`_render_bot()`（桌面配置中心「连接 QQ」页）。
+        🔴 v0.3.2 改**可折叠、默认收起**：这一块展开有 252px，把整页顶到 632px
+           （超出 512px 预算 120px，用户要上下拉才看得全「保存凭据」）。
+           但内容一个字都不能删 —— 那两条开关漏一个机器人就是半残。
+           折中：**只留最要命的那句（分不清是谁说的）常驻可见**，
+           其余说明收起来，要看点一下。整页从 632px 压到一屏内。
         """
-        lf = ttk.LabelFrame(
-            self.scroll,
-            text="要在群聊中使用机器人，你需要打开的开关：",
-            padding=8)
+        lf = ttk.LabelFrame(self.scroll, padding=8)
         lf.pack(fill="x", pady=8)
-        # 🔴 关键限制要先讲清楚（用户 2026-10-12 定稿）：机器人**分不清是谁说的**，
-        #    多人同时聊会串；按用户分别收集还在开发。不先说明白，用户在多人群里
-        #    用一次就会觉得「这机器人记的东西全乱了」。
+        head = ttk.Frame(lf)
+        head.pack(fill="x")
+        ttk.Label(head, text="在群里用之前，先去 QQ 打开两个开关",
+                  font=_font(10, "bold")).pack(side="left")
+        self._manual_btn = self._ghost_btn(
+            head, "展开说明 ▸", self._toggle_manual, padx=10, pady=3)
+        self._manual_btn.pack(side="right")
+        # 🔴 关键限制**永远可见**（用户 2026-10-12 定稿）：机器人分不清是谁说的，
+        #    多人同时聊会串。这句被折叠藏起来的话，用户在多人群里用一次就会觉得
+        #    「这机器人记的东西全乱了」—— 那正是它要防的事。
         _limit = ("注意：机器人现在分不清一句话是谁说的，只适合单人活跃的群；"
                   "多人同时聊会串。按用户分别收集正在开发中。")
         ttk.Label(lf, text=_soft_wrap(_limit, 720, 9),
                   bootstyle="warning", wraplength=720,
-                  font=_font(9)).pack(anchor="w", pady=(0, 8))
+                  font=_font(9)).pack(anchor="w", pady=(6, 0))
+
+        # ↓↓↓ 折叠区：以下全部是说明书，默认收起 ↓↓↓
+        self._manual_body = ttk.Frame(lf)
         _intro = ("把机器人拉进群之后，用手机点群里的机器人头像 → 右上角"
                   "「设置」→ 打开下面这两项。这两项在 QQ 那边管，"
                   "配置中心管不到它们。")
-        ttk.Label(lf, text=_soft_wrap(_intro, 720, 9),
+        ttk.Label(self._manual_body, text=_soft_wrap(_intro, 720, 9),
                   bootstyle="secondary", wraplength=720,
-                  font=_font(9)).pack(anchor="w", pady=(0, 6))
+                  font=_font(9)).pack(anchor="w", pady=(6, 6))
         for title, action, note in (
             ("机器人可获取的群聊消息范围", "选「获取群内全部消息」",
              "不开：只有 @ 它才理你，群里的普通发言它收不到"),
             ("机器人主动在群聊内发言", "打开",
              "不开：它没法主动发东西 —— 上线播报发不出来"),
         ):
-            row = ttk.Frame(lf)
+            row = ttk.Frame(self._manual_body)
             row.pack(fill="x", pady=2)
             ttk.Label(row, text=f"{title} → {action}",
                       font=_font(10, "bold")).pack(anchor="w")
             ttk.Label(row, text=note, bootstyle="secondary",
                       font=_font(9)).pack(anchor="w")
         _done = "开完在群里发一句「待办 测试」，能收到回执就说明配好了。"
-        ttk.Label(lf, text=_soft_wrap(_done, 720, 9),
+        ttk.Label(self._manual_body, text=_soft_wrap(_done, 720, 9),
                   bootstyle="secondary", wraplength=720,
                   font=_font(9)).pack(anchor="w", pady=(6, 0))
 
-    # ---- ③ 播报：文案 + 播报目标勾选 ----
+    def _toggle_manual(self):
+        """展开 / 收起「连接 QQ」页的说明书（内容一个字都没删，只是藏起来）。"""
+        body = getattr(self, "_manual_body", None)
+        if body is None or not body.winfo_exists():
+            return
+        shown = bool(body.winfo_manager())
+        if shown:
+            body.pack_forget()
+            self._manual_btn.set_text("展开说明 ▸")
+        else:
+            body.pack(fill="x", pady=(6, 0))
+            self._manual_btn.set_text("收起说明 ▾")
+            self._manual_btn.configure(state="normal")
+
+    # ---- 播报：文案 + 播报目标勾选 ----
+    def _push_saved(self):
+        """**已保存**的播报目标，拼成与 `.env` 同口径的字符串（排序，比较稳定）。
+
+        干嘛的：脏判据的基线。`QQ_PUSH_TARGETS` 在 `ENV_SPEC` 里标了 hidden、
+                由自绘勾选列表管，`section_fields` 里没有它 —— 基线得单独拍。
+        谁调用它：`_render_msg`（渲染初值）、`_capture_base`。
+        """
+        return ";".join(sorted(self.state.get("push_targets") or []))
+
+    def _push_picked(self):
+        """**当前勾选**的播报目标 → 与 `.env` 同口径的字符串。
+
+        谁调用它：`_sync_pending`（写进暂存，保存时按它落盘）。
+        """
+        return ";".join(sorted(f"{sc}:{oid}" for (sc, oid), v in self._push.items()
+                               if v.get()))
+
     def _render_msg(self):
         self._render_fields("msg")
         sess = self.state.get("sessions", [])
-        targets = set(self.state.get("push_targets", []))
+        # 🔴 初值优先取本分区**暂存**：预览换肤会整窗重建，只按 `state` 渲染的话
+        #    用户刚勾的那几个会当场掉回原样。
+        pend = (self._pending.get("msg") or {}).get(("env", "QQ_PUSH_TARGETS"))
+        raw = self._push_saved() if pend is None else pend
+        targets = set(x for x in raw.split(";") if x)
         if sess:
             lf = ttk.LabelFrame(self.scroll, text="播报目标（勾选 = 启动播报发到这些会话）",
                                 padding=8)
@@ -1341,44 +3011,62 @@ class ConfigCenter(ttk.Frame):
                 v = tk.BooleanVar(value=tag in targets)
                 row = ttk.Frame(lf, padding=(0, 4))
                 row.pack(fill="x")
-                cb = ttk.Checkbutton(row, text=name, variable=v,
-                                     bootstyle="primary-round-toggle")
-                cb.pack(side="left")
+                # 🔴 开关和名字拆成两个控件（用户 2026-10-16）：`ttk.Checkbutton`
+                #    带上 text 之后**点名字也会跟着切换**，而用户只想点前面那个
+                #    开关。名字单独做成 Label —— 点它什么都不会发生。
+                ttk.Checkbutton(row, variable=v,
+                                bootstyle="primary-round-toggle").pack(side="left")
+                ttk.Label(row, text=name, font=_font(9)).pack(side="left", padx=(6, 8))
                 ttk.Label(row, text=last[:40], bootstyle="secondary",
-                          font=_font(8)).pack(side="left", padx=8)
-                cb.configure(command=lambda sc=scope, o=oid, v=v: self._toggle_push(sc, o, v))
+                          font=_font(8)).pack(side="left")
                 self._push[(scope, oid)] = v
-        self._save_btn()
+                # 🔴 走「保存更改」体系（用户 2026-10-16）：以前勾一下**立刻写
+                #    `.env`**，而同一页别的东西却要按保存 —— 同一页两套规矩。
+                #    现在和普通字段一样：勾 → 进暂存 + 亮保存按钮 → 点保存才落盘。
+                self._watch_var(v)
+        # 这一页的保存按钮管两样：上面的通用字段 + 下面的播报目标勾选
+        # （`_SEC_SAVE` 里 msg → fields，勾选由 `_sync_pending` 并进同一份暂存）。
 
-    def _toggle_push(self, scope, oid, var):
-        """勾 / 取消一个播报目标 → 立刻写 `.env`。
+    # ---- 外观 ----
+    def _render_look(self):
+        """「外观」页（v0.3.2 结构归位）：颜色 + 界面字号。
 
-        🔴 这里**不能**调 `self.app.refresh()`：那会① 重新查计划任务（起一次
-        PowerShell，几百毫秒的卡顿）② 把整页控件重建 —— 包括用户正在点的这个
-        复选框，等于「点下去控件没了」。写完直接提示就行，复选框自己的状态
-        已经是新的了。
+        干嘛的：把散落两处的「外观参数」收成一页 —— 颜色原来常驻在左侧导航最底下，
+                界面字号原来在「脑内抽屉」页（它改的是**整个桌面端**的字号，
+                跟抽屉里放哪几类没关系）。两个都是外观设置，就该在一处。
+        谁调用它：`show_section` 在 key == "look" 时调它。
         """
-        cur = set(self.cw._push.targets())
-        item = (scope, oid)
-        if var.get():
-            cur.add(item)
-        else:
-            cur.discard(item)
-        keys, err = self.cw.write_env(
-            {"QQ_PUSH_TARGETS": self.cw._push.format_targets(list(cur))})
-        if err:
-            self.app.toast(f"保存失败：{err}", False)
-            var.set(not var.get())          # 回滚复选框，别骗用户
-            return
-        # 🔴 同步内存里的 state：切走再切回这一页时，复选框是按 `app.state` 重建的。
-        #    只写 `.env` 不更新它的话，重新进来又会按旧值渲染 —— 用户看到的是
-        #    「取消勾选 → 切一下页 → 又勾上了」。
-        if isinstance(self.app.state, dict):
-            self.app.state["push_targets"] = [
-                f"{sc}:{oid}" for sc, oid in sorted(cur)]
-        self.app.toast("播报目标已更新", True)
+        lf = ttk.LabelFrame(self.scroll, text="颜色", padding=8)
+        lf.pack(fill="x", pady=6)
+        ttk.Label(lf, text="跟随系统会跟着 Windows 的主题设置自动切换。",
+                  bootstyle="secondary", wraplength=720,
+                  font=_font(9)).pack(anchor="w", pady=(0, 6))
+        self._theme_buttons(lf)
+        # 界面字号是通用字段（settings 的 ui_font_scale），走通用渲染
+        self._render_fields("look")
 
-    # ---- ⑦ 运行方式 ----
+    # ---- 掉线告警 ----
+    def _render_alerts(self):
+        """「掉线告警」页（v0.3.2）：开关 / 探活间隔 / webhook / 冷却时间。
+
+        干嘛的：账号掉线时 QQ 通道本身就废了，告警只能走系统通知（托盘气泡）和
+                webhook。这一页就是这四个参数的唯一入口。
+        谁调用它：`show_section` 在 key == "alerts" 时调它。
+        🔴 判据只在 `alerts.py` 里定义（阈值 + `bot.link` 的路径都在那），
+           这里只管把值写进 settings.json，不掺判定逻辑。
+        🔴 开头只写**一句能落到动作上的话**，不重复各字段自己的 help ——
+           这一页 4 个字段的说明本来就占了大部分高度，开头再抄一遍（以前写成
+           「机器人进程还在、但账号掉了线时…」）实测超预算 6px，而且和
+           `alert_enabled` 的 help 说的是同一件事。
+        """
+        ttk.Label(self.scroll, text=_soft_wrap(
+            "账号掉线时 QQ 通道本身就废了 —— 告警只能走系统托盘"
+            "（外加一个可选的 webhook）。下面四项改完点保存就行。", 720, 9),
+            bootstyle="secondary", wraplength=720,
+            font=_font(9)).pack(anchor="w", pady=(0, 8))
+        self._render_fields("alerts")
+
+    # ---- 运行方式 ----
     def _render_runtime(self):
         bot = self.state["bot"]
         st = primary_button_state(bot)
@@ -1414,13 +3102,24 @@ class ConfigCenter(ttk.Frame):
         ttk.Label(lf2, text="开启后，登录 Windows 会自动把管家跑起来（含机器人，后台无窗口）。",
                   bootstyle="secondary", font=_font(8)).pack(anchor="w")
 
-        lf3 = ttk.LabelFrame(self.scroll, text="依赖自检", padding=8)
-        lf3.pack(fill="x", pady=6)
+    def _dep_box(self, parent):
+        """「依赖自检」区块 —— 建在 `parent` 里（调用方决定它在哪个页）。
+
+        干嘛的：列出依赖是否齐、缺的能不能一键装。用户遇到 bug 时最后一定来这儿找
+                「是不是我环境缺东西」，所以它属于**诊断**，不属于「怎么启动」。
+        谁调用它：`_render_version()`（v0.3.2 起只在「版本与诊断」页）——
+                   以前它在「运行方式」页，而「导出诊断包」在版本页，
+                   同一件事被拆到两页（用户 2026-10-15 报的结构问题）。
+        🔴 `_install_btn` / `_install_note` 记在实例上：`_on_install_result` 要改它们的
+           文字（装完要点名「装好了」），没引用就够不着。
+        """
+        lf3 = ttk.LabelFrame(parent, text="依赖自检", padding=8)
+        lf3.pack(fill="x", pady=(0, 6))
         for d in self.state.get("deps", []):
             mark = "✓" if d["ok"] else ("✗" if d.get("needed") else "·")
             col = "success" if d["ok"] else ("danger" if d.get("needed") else "secondary")
             ttk.Label(lf3, text=f"{mark} {d['name']}：{d['detail']}", bootstyle=col,
-                      font=_font(9)).pack(anchor="w", pady=1)
+                      font=_font(9)).pack(anchor="w", pady=0)
 
         # 🔴「一键安装缺失依赖」：缺**任何可自动装的东西**（pip 包 / npm 包）就显形。
         #    以前只数 pip 包 —— playwright-core（Node 包）缺着时按钮根本不出现，
@@ -1461,10 +3160,10 @@ class ConfigCenter(ttk.Frame):
                 font=_font(8)).pack(anchor="w", pady=(4, 0))
 
     def _render_version(self):
-        """「⑩ 版本」独立页签（item19 2026-10-12）：当前版本、检查更新、下载新版。
+        """「版本与诊断」独立页签（v0.3.2 改名 + 收编依赖自检）。
 
-        干嘛的：把原来塞在「⑦ 运行方式」里的版本块单独拆成一页，和网页版
-                config_core 的「⑩ 版本」页签对齐。
+        干嘛的：当前版本、检查更新、下载新版，加上**依赖自检**和**诊断包** ——
+                用户遇到问题时来这儿一站搞定，不用在「运行方式」和「版本」两页之间跳。
         谁调用它：show_section 在 key == "version" 时调它，不再走通用表单
                 （version 没有可编辑字段，走通用表单会成一页空壳还多个没用的保存按钮）。
         🔴 检查更新的结果存在 `_upd_view` 里、每次重建回填 —— 换肤会整窗
@@ -1496,24 +3195,30 @@ class ConfigCenter(ttk.Frame):
                         self._check_update, padx=14, pady=5).pack(side="left", padx=(8, 0))
         ttk.Label(lf4, text="国内网络 git 直连不稳定，可在你下载摸鱼bot的群内寻找最新群文件。",
                   bootstyle="secondary", wraplength=720,
-                  font=_font(8)).pack(anchor="w", pady=(6, 0))
+                  font=_font(8)).pack(anchor="w", pady=(4, 0))
 
-        # ── 遇到问题：一键导出诊断包（用户 2026-10-13）──────────────
-        # 🔴 为什么放在「版本」这一区：用户遇到 bug 时最后一定是来这儿找
-        #    「我这版是不是旧的」，顺手就能看到「出问题该导什么」。
-        ttk.Label(lf4, text=_soft_wrap(
-            "遇到问题：点下面这个按钮，会在桌面生成一个「诊断包」—— 里面是版本、"
+        # ── 诊断包：和「版本」「依赖自检」**平级**的一小块（用户 2026-10-16）──
+        # 🔴 以前它挂在「版本」那一块的里面。用户报的「导出诊断包这里需要与
+        #    【版本】【依赖】一个层级的一个小标题」—— 它是独立的一件事（出问题
+        #    了该导什么），不是「版本」的子项，给它自己的标题。
+        lf5 = ttk.LabelFrame(self.scroll, text="诊断包", padding=8)
+        lf5.pack(fill="x", pady=(0, 6))
+        ttk.Label(lf5, text=_soft_wrap(
+            "遇到问题时，点下面这个按钮会在桌面生成一个「诊断包」—— 里面是版本、"
             "运行环境和最近一段日志，不含你的待办 / 思绪 / 密钥。把它发给群主，"
             "对方就能定位问题。", 720, 9),
             bootstyle="secondary", wraplength=720,
-            font=_font(9)).pack(anchor="w", pady=(12, 0))
-        _diag_row = ttk.Frame(lf4, padding=(0, 6))
+            font=_font(9)).pack(anchor="w")
+        _diag_row = ttk.Frame(lf5, padding=(0, 6))
         _diag_row.pack(anchor="w", fill="x")
         self._ghost_btn(_diag_row, "导出诊断包",
                         self._export_diag, padx=14, pady=5).pack(side="left")
         self._diag_note = ttk.Label(_diag_row, text="", bootstyle="secondary",
                                     font=_font(9), wraplength=520)
         self._diag_note.pack(side="left", padx=(10, 0))
+
+        # 依赖自检（v0.3.2 从「运行方式」搬来）：诊断相关的东西收在同一页
+        self._dep_box(self.scroll)
 
     def _export_diag(self):
         """导出诊断包（打包内容与隐私红线见 `diag.py`）。
@@ -1872,27 +3577,45 @@ class ConfigCenter(ttk.Frame):
         if pending is not None and pending != (want if ok else (not want)):
             self._autostart(pending)
 
-    # ---- ⑧ 摸鱼库 ----
+    # ---- 摸鱼库 ----
     def _render_moyu(self):
         m = self.state["moyu"]
+        # 🔴 这一页是**全应用最高的一页**，页签下那 15px 空隙就是从它这儿省出来的
+        #    （2026-10-16：空隙 6px → 15px，视口 531 → 522，这一页当场超 9px）。
+        #    省法只动间距、不动文本框行数 —— 行数是用户明确要过的大小（6 → 4 行
+        #    那次就是为了压回一屏），再往下砍等于把「填长内容」这条路堵回去。
+        #    `_probe/page_heights.py` 每次改完都量。
         ttk.Label(self.scroll,
                   text=f"内置 {m['builtin_total']} 条；当前来源：{m['source']}（改完点保存立刻生效）",
-                  bootstyle="secondary", font=_font(9)).pack(anchor="w", pady=(0, 6))
+                  bootstyle="secondary", font=_font(9)).pack(anchor="w", pady=(0, 3))
+        # 🔴 文本回填也走暂存覆盖（v0.3.2 第四节）：改了一半切去别的页再回来，
+        #    填的内容还在。键统一成 `("__moyu__", "groups")`，和 `_sync_pending`
+        #    / `_capture_base` 用同一个。
+        groups = _pending_overlay(
+            m["groups"],
+            (self._pending.get("moyu") or {}).get(("__moyu__", "groups")))
         for c in m["cats"]:
             lf = ttk.LabelFrame(self.scroll, text=f"{c['icon']} {c['name']}", padding=6)
-            lf.pack(fill="x", pady=4)
+            lf.pack(fill="x", pady=(2, 4))
             if c.get("help"):
                 ttk.Label(lf, text=_soft_wrap(c["help"], 700, 8),
                           bootstyle="secondary",
                           font=_font(8), wraplength=700).pack(anchor="w")
-            txt = scrolledtext.ScrolledText(lf, height=6, width=80, wrap="word")
-            txt.insert("1.0", "\n".join(m["groups"].get(c["key"], [])))
-            txt.pack(fill="x")
+            # 🔴 4 行不是 6 行（v0.3.2 结构归位）：这一页有三个分类 × 一个文本框，
+            #    6 行时实测 581px、超出 512px 的预算 69px。降到 4 行后每类省 2 行，
+            #    整页压回一屏。内容多的分类**框内自己滚**（ScrolledText），
+            #    不会因为行数少就存不进去。
+            ra = RoundedArea(lf, value="\n".join(groups.get(c["key"], [])),
+                             height=4, cc=self, parent_bg=self._c("bg"))
+            ra.pack(fill="x")
+            txt = ra.text
+            self._watch_text(txt)
             self._moyu_texts[c["key"]] = txt
-        bar = ttk.Frame(self.scroll, padding=(0, 6))
+        # 🔴 「保存摸鱼库」挪到页头（v0.3.2 第四节，`_SEC_SAVE` 里 moyu →
+        #    「保存摸鱼库」）—— 以前它在内容区最底部，改完得滚到底才看得见。
+        #    这里只留「恢复内置」：它是动作不是保存，且自带确认语义。
+        bar = ttk.Frame(self.scroll, padding=(0, 3))
         bar.pack(anchor="e")
-        self._solid_btn(bar, "保存摸鱼库",
-                        self._moyu_save).pack(side="left", padx=4)
         self._ghost_btn(bar, "恢复内置",
                         self._moyu_reset).pack(side="left", padx=4)
 
@@ -1901,16 +3624,23 @@ class ConfigCenter(ttk.Frame):
                   for k, t in self._moyu_texts.items()}
         ok, info = self.cw._moyu.save_items(groups)
         self.app.toast(info if ok else "保存失败", ok)
-        self.app.refresh()
+        if ok:
+            # 🔴 成功才清暂存 + 刷新：失败时刷新会把用户填的文本框按已保存值
+            #    重绘，填了一半的内容当场没了（以前就是这样）。
+            self._clear_dirty("moyu")
+            self.app.refresh()
 
     def _moyu_reset(self):
         ok, msg = self.cw._moyu.reset_items()
         self.app.toast(msg or "已恢复", ok)
-        self.app.refresh()
+        if ok:
+            # 恢复内置 = 内容已被已保存值取代，未保存改动作废
+            self._clear_dirty("moyu")
+            self.app.refresh()
 
-    # ---- ⑨ 自定义指令 ----
+    # ---- 自定义指令 ----
     def _render_ext(self):
-        """「⑨ 自定义指令」页：导入 / 列出 / 移除扩展包。
+        """「自定义指令」页：导入 / 列出 / 移除扩展包。
 
         🔴 探测「每个包装了哪些指令」要**开子进程**（扩展是任意代码，在本进程
            `exec_module` 的话一个死循环就把 Tk 主线程冻住了），所以走
@@ -1919,12 +3649,13 @@ class ConfigCenter(ttk.Frame):
         """
         self._ext_result = None
         self._ext_box = None
+        self._ext_h = _EXT_LIST_MAX_H    # 初始视口高 = 构造时传的那个 height
         self._ext_count = None
 
         head = ttk.LabelFrame(self.scroll, text="导入一个指令包", padding=8)
         head.pack(fill="x", pady=6)
         _ext_help = ("选一个 .py（单文件指令）或 .zip（指令包）。导入不会自动生效 ——"
-                     " 导完到「⑦ 运行方式」点一下「重启」，指令才会注册进机器人。")
+                     " 导完到「运行方式」点一下「重启」，指令才会注册进机器人。")
         ttk.Label(head, text=_soft_wrap(_ext_help, 720, 9),
                   bootstyle="secondary", wraplength=720,
                   font=_font(9)).pack(anchor="w")
@@ -1943,11 +3674,69 @@ class ConfigCenter(ttk.Frame):
         self._ext_count = ttk.Label(lf, text="", bootstyle="secondary",
                                     font=_font(9))
         self._ext_count.pack(anchor="w", pady=(0, 4))
-        self._ext_box = ttk.Frame(lf)
+        # 🔴 列表装在一个**自己会滚**的视口里（v0.3.2 结构归位）：以前列表直接摊在
+        #    页面上，装 7 个扩展这一页就 569px、超出 512px 预算 57px；装十几个更是
+        #    一屏放不下。视口高度由 `_fit_ext_box()` 现算（= 这一页剩下的高度），
+        #    装得再多也只是列表在框内滚，**这一页的高度永远等于窗口高**。
+        #    `auto_hide=True`：鼠标不在上面时滚动条自动藏起来，不常驻占宽。
+        #    🔴 用 `FitScrolledFrame`：原版是「鼠标一进来就显」，扩展只有两三个、
+        #       压根不用滚的时候也冒一条出来（同左侧导航那个毛病）。
+        self._ext_box = FitScrolledFrame(lf, height=_EXT_LIST_MAX_H, auto_hide=True)
+        # 🔴 ttkbootstrap 的 ScrolledFrame 只关了容器的 `pack_propagate`，可容器里的
+        #    canvas + 滚动条是 **grid** 管的 ⇒ 容器的请求高度仍由内部 canvas 的
+        #    `-height` 决定，`container.configure(height=…)` **静默无效**（`cget`
+        #    会回显新值，实际高度一点没变 —— 真机踩到，探针里量出来一直是 240）。
+        #    补关 `grid_propagate` 后 `-height` 才真的说了算，`_fit_ext_box` 才动得了。
+        self._ext_box.container.grid_propagate(False)
         self._ext_box.pack(fill="x")
         self._draw_ext_items(_extmgr.list_items(probe=False))
         threading.Thread(target=self._ext_probe_work, daemon=True).start()
         self._poll_ext(0)
+
+    def _fit_ext_box(self):
+        """把「已装的扩展」列表视口调成**正好吃掉这一页剩下的高度**。
+
+        干嘛的：`ScrolledFrame(height=…)` 是**固定**视口。以前写死 240px，于是
+                扩展少的时候页面比窗口矮一截 —— 底下留一大片空白，滚轮还因为
+                「装得下」被判成不用滚而彻底失灵（用户报的「列表不够窗口长度，
+                也没法滚轮查看」）。现在按 `视口高 − 这一页除列表框以外的固定高`
+                现算：页面于是**正好等于视口高**，不空转也不留白；扩展多到装不下
+                时列表在框内自己滚，页面高度照样不变。
+        谁调用它：`_draw_ext_items()`（每次重画后都调一次）、`_after_swap`
+                （切页排版落定后）、`_on_canvas_resize`（窗口尺寸变了）。
+        🔴 只在主线程调（碰 Tk）。
+        🔴 **目标高度只能由「这次调整不会改到的量」算出来**，否则死循环：改框高
+           → `self.scroll` 跟着变高 → 触发它的 `<Configure>` → 又回到这里重算。
+           第一版把富余写成 `canvas高 − scroll总高`（**总高里含当前框高**），
+           于是「按内容收」和「撑到填满」算出的两个值互为下一次的输入，来回跳、
+           Configure 事件无穷无尽 —— 界面直接卡死（真机踩到，探针挂在那儿不动）。
+           现在先量**除列表框以外**的固定部分：`总高 − 当前框高`（框高自己记在
+           `self._ext_h`，不靠控件反查），`富余 = 视口高 − 固定部分`。目标值于是
+           成了**不动点**：算一次、设一次，再进来结果一样，不会再改。
+        """
+        box = self._ext_box
+        if box is None or not box.winfo_exists():
+            return
+        try:
+            box.update_idletasks()
+            cur_h = self._ext_h or _EXT_LIST_MAX_H
+            # 🔴 先量**除列表框以外**的固定部分：这一页总高减去列表框当前占的
+            #    高度。它跟框高无关（上下都是固定高/定宽换行的块），所以拿它算
+            #    出来的目标值是**不动点** —— 设一次就稳定，不会再触发重算。
+            others = self.scroll.winfo_reqheight() - cur_h
+            room = self.canvas.winfo_height() - others
+            if others > 0 and room > 0:
+                # 视口剩下的高度全给列表：页面正好等于视口高，滚轮既不空转、
+                # 扩展多到装不下时也只是列表在框内滚，页面高度照样不变。
+                h = max(40, room)
+            else:
+                # 还没排版出来（canvas 高 = 1）时别乱猜，按内容收一个
+                h = max(40, min(_EXT_LIST_MAX_H, box.winfo_reqheight() + 4))
+            if h != cur_h:
+                box.container.configure(height=h)
+                self._ext_h = h
+        except (tk.TclError, AttributeError):
+            pass
 
     def _ext_probe_work(self):
         """后台线程：只写变量，**绝不碰任何 Tk 控件**（Tkinter 不是线程安全的）。"""
@@ -1993,6 +3782,7 @@ class ConfigCenter(ttk.Frame):
         if not items:
             ttk.Label(box, text="还没装任何自定义指令。", bootstyle="secondary",
                       font=_font(9)).pack(anchor="w")
+            self._fit_ext_box()
             return
         for it in items:
             row = ttk.Frame(box, padding=(0, 6))
@@ -2028,6 +3818,7 @@ class ConfigCenter(ttk.Frame):
                           bootstyle="danger", wraplength=700,
                           font=_font(8)).pack(anchor="w")
             ttk.Separator(box).pack(fill="x")
+        self._fit_ext_box()
 
     def _ext_pick(self):
         """「导入扩展…」—— 本机选文件，装进 extensions/local/。"""
@@ -2045,7 +3836,7 @@ class ConfigCenter(ttk.Frame):
                 self._set_ext_note("已取消（没有覆盖）", bad=True)
                 return
         if ok:
-            self._set_ext_note(f"{msg} —— 到「⑦ 运行方式」点「重启」才生效")
+            self._set_ext_note(f"{msg} —— 到「运行方式」点「重启」才生效")
         else:
             self._set_ext_note(msg, bad=True)
         self.app.toast(msg, ok)
@@ -2324,11 +4115,12 @@ class BrainDrawerTab(ttk.Frame):
     · 速度一致：所有气泡按同一个 px/s 走，行程 = 舞台高 + 自身高度 + 余量，
       所以越高的气泡走得越久，但都能完整飘出顶部，不会半路被切掉。
     · 开屏预热：每条泳道先摆一个、直接放到飞行途中（首屏立刻有内容）。
-    · 顶部遮罩：气泡**不用整体渐色**，而是从下面滑进舞台顶部的渐变带、
-      被逐层擦掉（用户 2026-10-12 把原来的 64px 实色带改成「不透明度 0」的渐变）。
-      早期用「整块插值到背景色」的做法是全局 alpha：长气泡的上半截会在
-      下半截还很清楚的时候先变灰 —— 看着像被啃掉一块（用户报的「视觉缺口」）。
-      渐变带没有这个问题：每层只盖住自己那一层，盖住多少就是多少。
+    · 顶部渐隐：**整卡统一 alpha**（Tk 控件没有真 alpha，只能把颜色插向底色来模拟），
+      判据取气泡的**底边** —— 只有「升出去之后还剩 ≤TOP_FADE_H 露在舞台上」时才
+      开始淡出，所以淡出永远只落在快走完的那一小截残片上。
+      🔴 判据取**顶边**是错的：一条 1010px 的长卡（舞台 604px）在顶边刚贴住舞台上沿时
+        还有 60% 露在屏幕中间，整张却已经只剩 10% 不透明 ⇒ 屏幕中段凭空多出一大片
+        空档（用户 2026-10-15 报的）。改取底边之后长卡短卡一视同仁。
     """
 
     BASE_DUR = 26.0        # 基准行程（1.26 倍舞台高）走完的秒数
@@ -2353,11 +4145,12 @@ class BrainDrawerTab(ttk.Frame):
     WIDE_CHARS = 300
     WIDE_SPAN = 2
     BAR_H = 34             # 底部筛选条高度（气泡在它下沿之下就开始渐显）
-    # 🔴 顶部渐隐区高度（气泡升到这里就开始化掉）。**不再用实体遮罩带** ——
-    #    用户 2026-10-12：「遮罩太硬…不能做渐变就去掉黄框内容，思绪卡片直接被
-    #    页签栏切断」。Tk 没有真正的 alpha，实色遮罩带就是一条硬边（还比底深，
-    #    看着像一道缝），所以改成**整卡按位置均匀渐隐**（见 `_alpha_at`）：
-    #    整张卡一起化掉，不会出现「上半截先变灰」的缺口（那是按位置分片渐变的锅）。
+    # 🔴 顶部渐隐区高度。**它不是「整卡从哪儿开始淡出」，而是「升出去之后还剩多高
+    #    露在舞台上时才淡出」** —— 判据取气泡的**底边**（见 `_alpha_at`），
+    #    所以这个值约束的是「残片高度」，不是卡片位置。
+    #    沿革：实体遮罩带被否（用户 2026-10-12「遮罩太硬…思绪卡片直接被页签栏切断」），
+    #    改成整卡统一 alpha；但那时判据取了顶边 ⇒ 长卡在顶边贴住上沿时整张只剩
+    #    10% 不透明（它还有 60% 在屏幕中间）⇒ 中段一大片空档（用户 2026-10-15 报）。
     TOP_FADE_H = 84
     ALPHA_STEP = 0.05      # 渐隐渐出的量化步长（0.12 只有 8 档，肉眼是「跳」的）
     BUBBLE_R = 13          # 气泡圆角半径（背景画在舞台 Canvas 上）
@@ -2540,14 +4333,14 @@ class BrainDrawerTab(ttk.Frame):
         tk.Label(sbar, text="搜索", bg=self._c("bg"), fg=self._c("secondary"),
                  font=_font(9)).pack(side="left")
         self._q_var = tk.StringVar(value="")
-        qent = tk.Entry(sbar, textvariable=self._q_var, width=26, font=_font(9),
-                        bd=1, relief="solid", bg=self._c("bg"),
-                        fg=self._c("fg"), insertbackground=self._c("fg"),
-                        highlightthickness=0)
-        qent.pack(side="left", padx=(6, 0), ipady=2)
-        qent.bind("<Return>", lambda e: self._search())
-        qent.bind("<Escape>", lambda e: (self._q_var.set(""),
-                                         self.stage.focus_set()))
+        # 圆角输入框（用户 2026-10-16「脑内抽屉页的各种方框也都改成圆角」）
+        qent = RoundedEntry(sbar, textvariable=self._q_var, font=_font(9),
+                            chars=26, padx=8, pady=4, cc=self,
+                            parent_bg=self._c("bg"))
+        qent.pack(side="left", padx=(6, 0))
+        qent.text.bind("<Return>", lambda e: self._search())
+        qent.text.bind("<Escape>", lambda e: (self._q_var.set(""),
+                                              self.stage.focus_set()))
         RoundedButton(sbar, "搜一下", self._search,
                       kind="ghost", radius=10, padx=10, pady=3,
                       font=_font(9),
@@ -2572,10 +4365,13 @@ class BrainDrawerTab(ttk.Frame):
         tk.Label(bar, text="标签", bg=self._c("bg"), fg=self._c("secondary"),
                  font=_font(9)).pack(side="left", padx=(10, 4))
         self._tag_var = tk.StringVar(value="")
-        self._tag_cb = ttk.Combobox(bar, textvariable=self._tag_var, width=12,
-                                    state="readonly")
-        self._tag_cb.pack(side="left", padx=2)
-        self._tag_cb.bind("<<ComboboxSelected>>", lambda e: self._set_tag())
+        # 圆角下拉框（用户 2026-10-16「脑内抽屉页的各种方框也都改成圆角」）——
+        # `ttk.Combobox` 画不出圆角，见 `RoundedSelect`。
+        self._tag_cb = RoundedSelect(bar, textvariable=self._tag_var, chars=12,
+                                     font=_font(9), padx=8, pady=4, cc=self,
+                                     parent_bg=self._c("bg"),
+                                     command=lambda _v: self._set_tag())
+        self._tag_cb.pack(side="left", padx=(2, 2))
         RoundedButton(bar, "刷新", lambda: self.refresh(self.app.state),
                       kind="ghost", radius=10, padx=8, pady=3,
                       font=_font(9),
@@ -2700,16 +4496,20 @@ class BrainDrawerTab(ttk.Frame):
         · **渐入**：顶边从舞台底边冒上来的 60px 内淡入。
           🔴 不能用「底边越过筛选条」当判据 —— 那样高气泡（能有两百多 px）
              顶边早就进视口了，alpha 还是 0，表现是「气泡隐形上升好几秒」。
-        · **渐隐（顶部）**：顶边升进顶端 TOP_FADE_H 之内开始淡出，到顶边贴住
-             舞台上沿时几乎透明 —— 于是气泡是「化掉」的，不是被页签栏硬切。
-          🔴 判据用**顶边 y**（不是底边）：整张卡的 alpha 是同一个数，一起化。
-             按位置分片渐变会让长卡「上半截先变灰」，那才是以前的「视觉缺口」。
-          🔴 渐隐终点**不用到 0**：留一个极小值（0.04）让它完全贴边时基本看不见，
-             但不会因为「alpha 必须正好 0」而多算一轮 —— 反正下一帧 p≥1 就摘掉了。
+        · **渐隐（顶部）**：判据取**底边**（`y + h`）—— 整张卡只剩 TOP_FADE_H
+             以内的可见高度时才开始淡出，一路化到最后一截彻底升出去。
+          🔴 判据**必须取底边**：整张卡的 alpha 是同一个数（见 `_apply_alpha`），
+             拿顶边当判据的话，一条 1010px 的长卡在顶边刚贴住舞台上沿时 alpha 只剩
+             0.1，而它还有 60% 露在屏幕中间 —— 表现是「卡片还在、整张却看不见」，
+             屏幕中段凭空多出一大片空档（用户 2026-10-15 报的）。
+             改取底边之后，淡出只作用在「已经基本升出去、只剩最后几十 px」的残片上，
+             长卡短卡一视同仁；短卡原来也是「一进顶带就整张变淡」，现在同样被修好。
+          🔴 渐隐终点**不用到 0**：底边贴住舞台上沿时还留一个极小值（≈0.1），
+             反正那一刻卡片已经被舞台上沿裁干净了，下一帧 p≥1 就摘掉。
         """
         L = self._L
         fade_in = max(0.0, min(1.0, (L["h"] - y) / 60.0))
-        fade_out = max(0.0, min(1.0, (y + 8.0) / self.TOP_FADE_H))
+        fade_out = max(0.0, min(1.0, (y + h + 8.0) / self.TOP_FADE_H))
         return max(0.0, min(1.0, min(fade_in, fade_out)))
 
     def _lane_x(self, lane):
@@ -2855,7 +4655,7 @@ class BrainDrawerTab(ttk.Frame):
             self._build_chips()
         self._tags = _store.tags_all()
         names = [t["name"] for t in self._tags]
-        self._tag_cb["values"] = [""] + names
+        self._tag_cb.set_values([""] + names)
         if self._tag not in names:
             self._tag = None
             self._tag_var.set("")
@@ -2900,6 +4700,34 @@ class BrainDrawerTab(ttk.Frame):
             statuses = list(_SUB_MATCH.get(bucket, (bucket,)))
         return kinds, statuses
 
+    @staticmethod
+    def _item_from_row(r):
+        """库行 → 轮播 / 列表 / 浮层通用的条目结构 —— **唯一的转换点**。
+
+        🔴 只此一处。以前 `_collect` 和 `_open_item_by_id` 各写一份，结果引用
+           两列只在其中一处被想起 ⇒ 气泡上有「源记录已更新」、浮层里却没有
+           （用户 2026-10-15 报的）。以后**新增列一律加在这里**，两条路同时生效。
+        """
+        tags = [t["name"] if isinstance(t, dict) else str(t)
+                for t in (r.get("tags") or [])]
+        return {
+            "id": r["id"],
+            "kind": r.get("kind") or _store.KIND_MEMO,
+            "status": r.get("status") or _store.STATUS_OPEN,
+            "bucket": _bucket_of(r),
+            "content": _clean_text(r.get("content")),
+            "date": _fmt_time(r.get("created_at")),
+            "tags": tags,
+            "images": r.get("images") or [],
+            # 结论 / 备注（只有灵感有；待办在库层面就没有这个概念）
+            "note": r.get("note") or "",
+            # 🔴 引用两列必须跟着条目走：气泡卡 / 浮层上的「源记录已更新」提示
+            #    是靠 `_store.quote_hint(it)` 判的，而它只认这两列。不透出去的话
+            #    提示永远不出现（`refers_to` 恒为空 → 恒返回 QUOTE_OK）。
+            "refers_to": r.get("refers_to"),
+            "quote_snapshot": r.get("quote_snapshot"),
+        }
+
     def _collect(self, rows, *, gate_show):
         """库记录 → 轮播 / 列表通用的条目结构。
 
@@ -2923,20 +4751,10 @@ class BrainDrawerTab(ttk.Frame):
                 show_b = "done" if b == "decided" else b
                 if show_b not in self._show:
                     continue
-            content = _clean_text(r.get("content"))
-            if not content:
+            it = self._item_from_row(r)
+            if not it["content"]:
                 continue
-            out.append({
-                "id": r["id"], "kind": r.get("kind") or _store.KIND_MEMO,
-                "status": r.get("status") or _store.STATUS_OPEN,
-                "bucket": b, "content": content,
-                "date": _fmt_time(r.get("created_at")),
-                "tags": [t["name"] if isinstance(t, dict) else str(t)
-                         for t in (r.get("tags") or [])],
-                "images": r.get("images") or [],
-                # 结论 / 备注（只有灵感有；待办在库层面就没有这个概念）
-                "note": r.get("note") or "",
-            })
+            out.append(it)
         out.sort(key=lambda x: x["date"], reverse=True)
         return out
 
@@ -3019,7 +4837,7 @@ class BrainDrawerTab(ttk.Frame):
         """按「配置中心 → 回旋镖」的规则翻一条旧记录出来，弹出它的全文。
 
         规则全在 settings 里：`boomerang_days`（翻多少天以前）+ `boomerang_scope`
-        （从哪几类里挑，分类与「⑤ 脑内抽屉」的展示范围一致）。和机器人收到
+        （从哪几类里挑，分类与「脑内抽屉」的展示范围一致）。和机器人收到
         「回旋镖」指令走**同一套** `store.pick_*` —— 不重新实现一遍规则。
 
         🔴 **抽出来的卡片会放回池子**（用户 2026-10-12）：不再 `mark_boomerang()`，
@@ -3235,6 +5053,29 @@ class BrainDrawerTab(ttk.Frame):
                                 font=_font(9))
             note_lbl.pack(anchor="w", pady=(5, 0))
             fade.append((note_lbl, "fg", self._c("secondary")))
+
+        # 引用提示：**只在源记录被改过 / 被删了**的时候才出现。
+        # 🔴 引用块本身（正文里那几行 `>`）显示的永远是**快照**，不跟源变 ——
+        #    所以这里只做提醒，不改正文一个字。点它**直接跳到源记录**看。
+        hint = _store.quote_hint(it)
+        if hint:
+            q_lbl = tk.Label(
+                body,
+                text=("源记录已更新" if hint == _store.QUOTE_UPDATED
+                      else "引用的记录已删除"),
+                bg=bg, fg=bg, font=_font(8),
+                cursor="hand2" if hint == _store.QUOTE_UPDATED else "")
+            q_lbl.pack(anchor="w", pady=(4, 0))
+            fade.append((q_lbl, "fg", self._c("secondary")))
+            if hint == _store.QUOTE_UPDATED:
+                def _jump(_e, _id=it.get("refers_to")):
+                    # 🔴 必须 return "break"：不挡住冒泡的话，祖先 frame / body 上
+                    #    那个「打开本条浮层」的绑定随后也会触发，把刚打开的源记录
+                    #    浮层又换回这一条。
+                    self._open_item_by_id(_id)
+                    return "break"
+
+                q_lbl.bind("<Button-1>", _jump)
 
         self.stage.update_idletasks()
         # 🔴 内缩量必须 ≥ r·(1 − 1/√2) ≈ 0.293r：控件本身是**直角**矩形，
@@ -3489,12 +5330,15 @@ class BrainDrawerTab(ttk.Frame):
 
         add = tk.Frame(wrap, bg=light)
         add.pack(anchor="w", fill="x", pady=(6, 0))
-        entry = tk.Entry(add, width=14, font=_font(9), bd=1,
-                         relief="solid", bg=light, fg=self._c("fg"),
-                         insertbackground=self._c("fg"),
-                         highlightthickness=0)
-        entry.pack(side="left", ipady=2)
-        RoundedButton(add, "加上", lambda: add_name(entry.get()),
+        # 🔴 名字**不能叫 `_tag_var`** —— 那是底部筛选下拉框的变量。同名的话
+        #    每开一次卡片浮层就把筛选框的变量覆盖掉，之后点筛选下拉会用浮层里
+        #    残留的输入去过滤（`_set_tag` 读的是 `self._tag_var`）。
+        self._tag_edit_var = tk.StringVar(value="")
+        entry = RoundedEntry(add, textvariable=self._tag_edit_var, font=_font(9),
+                             chars=14, padx=8, pady=3, cc=self,
+                             parent_bg=light)
+        entry.pack(side="left")
+        RoundedButton(add, "加上", lambda: add_name(self._tag_edit_var.get()),
                       kind="ghost", radius=9, padx=10, pady=3,
                       font=_font(9),
                       fg=self._c("primary"), hover_fill=self._c("active"),
@@ -3525,7 +5369,7 @@ class BrainDrawerTab(ttk.Frame):
         def add_name(name):
             if name and name.strip():
                 commit(state["tags"] + [name.strip()])
-            entry.delete(0, "end")
+            self._tag_edit_var.set("")
 
         def remove(name):
             commit([t for t in state["tags"] if t != name])
@@ -3560,9 +5404,25 @@ class BrainDrawerTab(ttk.Frame):
                                   hover_fill=self._c("active"),
                                   parent_bg=light).pack(side="left", padx=(0, 4))
 
-        entry.bind("<Return>", lambda e: add_name(entry.get()))
+        entry.text.bind("<Return>",
+                        lambda e: add_name(self._tag_edit_var.get()))
         redraw()
         return wrap
+
+    def _open_item_by_id(self, item_id):
+        """按 id 打开某条记录的浮层 —— 引用块「跳过去看源记录」用它。
+
+        🔴 库行 → 条目结构**必须走 `_item_from_row`**（唯一的转换点）。以前这里
+           手抄了一份键表，漏掉引用两列 ⇒ 跳过去看到源记录后，源记录自己如果
+           也引用了别人，那条提示不会出现。
+        🔴 源记录可能已经**被删 / 被丢弃**：删了给一句 toast；丢弃的照常打开
+           （行还在库里，浮层自己会把流程按钮灰掉）。
+        """
+        row = _store.get_item(item_id)
+        if row is None:
+            self.app.toast("源记录已经不在了", False)
+            return
+        self._open_modal(self._item_from_row(row), banner="引用的源记录")
 
     def _open_modal(self, it, banner=None):
         """点气泡弹出的全文浮层：看全文、打标签、改正文、推进流程。
@@ -3645,6 +5505,29 @@ class BrainDrawerTab(ttk.Frame):
                                   font=_font(9))
             banner_lbl.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+        # ── 行 6：引用提示（源记录已更新 / 引用的记录已删除）──────────
+        # 🔴 引用块显示的**永远是快照**（正文里那几行 `>`），这里只提醒
+        #    「源记录那边后来变了」；点一下就跳过去看它现在长什么样。
+        #    行号取 6（正文 2 / 标签 3 / 结论 4 / 附件 5 之后）—— 它是对引用块的脚注。
+        quote_lbl = None
+        _qhint = _store.quote_hint(it)
+        if _qhint:
+            quote_lbl = tk.Label(
+                card,
+                text=("源记录已更新 —— 点这里看它现在长什么样"
+                      if _qhint == _store.QUOTE_UPDATED
+                      else "引用的记录已删除（上面显示的仍是当时引用的原文）"),
+                bg=light,
+                fg=(self._c("primary") if _qhint == _store.QUOTE_UPDATED
+                    else self._dim()),
+                font=_font(9),
+                cursor="hand2" if _qhint == _store.QUOTE_UPDATED else "")
+            quote_lbl.grid(row=6, column=0, sticky="w", pady=(12, 0))
+            if _qhint == _store.QUOTE_UPDATED:
+                quote_lbl.bind("<Button-1>",
+                               lambda _e, _id=it.get("refers_to"):
+                               self._open_item_by_id(_id))
+
         # ── 行 2：正文（只读 Text：能拖选 / Ctrl+C ↔ 编辑态换成编辑框）────
         body_holder = tk.Frame(card, bg=light)
         body_holder.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -3674,13 +5557,12 @@ class BrainDrawerTab(ttk.Frame):
         # 编辑框拉高（用户 2026-10-12：编辑灵感时文本框太小）—— 6 行只够
         # 瞥见两句话，长一点的灵感得反复在里面翻。12 行 ≈ 小半屏，
         # 浮层本身高度封顶 + 正文区滚动，框大了也顶不穿屏幕。
-        editbox = scrolledtext.ScrolledText(body_holder, height=12, wrap="word",
-                                           font=_font(11),
-                                           bd=0, highlightthickness=1,
-                                           highlightbackground=self._c("primary"),
-                                           highlightcolor=self._c("primary"),
-                                           bg=self._c("bg"), fg=self._c("fg"),
-                                           insertbackground=self._c("fg"))
+        # 圆角编辑框（用户 2026-10-16）：外面套 `RoundedArea`，`editbox` 仍是
+        # 里面那个真 `ScrolledText`（滚动 / 选区 / 快捷键全都在）。
+        edit_shell = RoundedArea(body_holder, height=12, font=_font(11), cc=self,
+                                 parent_bg=light, fill=self._c("bg"),
+                                 line=self._c("primary"))
+        editbox = edit_shell.text
         # 编辑态才显示的提示行（照 web 版：只改正文 · 创建时间不变）
         edit_hint = tk.Label(body_holder, text="只改正文 · 创建时间不变 · Esc 取消",
                              bg=light, fg=self._c("secondary"),
@@ -3711,14 +5593,13 @@ class BrainDrawerTab(ttk.Frame):
             tk.Label(nhead, text="结论 / 备注（可选）", bg=light,
                      fg=self._c("secondary"),
                      font=_font(9)).pack(side="left")
-            note_box = tk.Text(note_wrap, height=2, wrap="word",
-                               font=_font(10),
-                               bd=0, highlightthickness=1,
-                               highlightbackground=self._c("border"),
-                               highlightcolor=self._c("primary"),
-                               bg=self._c("bg"), fg=self._c("fg"),
-                               insertbackground=self._c("fg"))
-            note_box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+            # 圆角输入框（用户 2026-10-16）：外面套 `RoundedArea`（`plain=True`
+            # 用光板 Text，不带滚动条 —— 这个框本来就会跟着内容长高）。
+            note_shell = RoundedArea(note_wrap, height=2, font=_font(10),
+                                     cc=self, parent_bg=light,
+                                     fill=self._c("bg"), plain=True)
+            note_box = note_shell.text
+            note_shell.grid(row=1, column=0, sticky="ew", pady=(4, 0))
             if it.get("note"):
                 note_box.insert("1.0", it["note"])
 
@@ -3762,6 +5643,7 @@ class BrainDrawerTab(ttk.Frame):
                 try:
                     if int(note_box.cget("height")) != n:
                         note_box.configure(height=n)
+                        note_shell.refit()      # 外壳跟着长，别让文字溢出圆角框
                         win.after(20, _fit_card)
                 except (tk.TclError, ValueError):
                     pass
@@ -3859,7 +5741,7 @@ class BrainDrawerTab(ttk.Frame):
                 editbox.delete("1.0", "end")
                 editbox.insert("1.0", it["content"])
                 body_box.pack_forget()      # 只读正文整盒收起（Text 是它的子控件）
-                editbox.pack(fill="x")
+                edit_shell.pack(fill="x")
                 edit_hint.pack(anchor="w", pady=(6, 0))
                 tag_wrap.grid_remove()
                 if note_wrap is not None:
@@ -3868,6 +5750,8 @@ class BrainDrawerTab(ttk.Frame):
                     imgs.grid_remove()
                 if banner_lbl is not None:
                     banner_lbl.grid_remove()
+                if quote_lbl is not None:
+                    quote_lbl.grid_remove()
                 # 编辑态收起整条动作面板（bar_wrap 是 bar_cv 的子控件，
                 # 直接 hide 父级 bar_cv 即可；bar_wrap 自己没有独立 pack 位）。
                 bar_cv.pack_forget()
@@ -3880,7 +5764,7 @@ class BrainDrawerTab(ttk.Frame):
                                    hover_outline=self._c("primary"),
                                    hover_fg=self._c("primary"))
             else:
-                editbox.pack_forget()
+                edit_shell.pack_forget()
                 edit_hint.pack_forget()
                 body_box.pack(anchor="nw")
                 tag_wrap.grid()
@@ -3890,6 +5774,8 @@ class BrainDrawerTab(ttk.Frame):
                     imgs.grid()
                 if banner_lbl is not None:
                     banner_lbl.grid()
+                if quote_lbl is not None:
+                    quote_lbl.grid()
                 bar_cv.pack(side="bottom", fill="x", padx=PAD, pady=(0, PAD))
                 edit_btn.set_text("编辑")
                 edit_btn.configure(fg=self._c("secondary"),
@@ -4444,8 +6330,19 @@ class BrainDrawerTab(ttk.Frame):
                 def _more():
                     page["n"] += self.LIST_PAGE
                     _render(at_top=False)      # 🔴 「加载更多」别把视图弹回顶部
-                self._ghost_btn(inner, f"加载更多（还有 {more} 条）", _more,
-                                padx=14, pady=6).pack(pady=12)
+                # 🔴 这里原来调的是 `_ghost_btn` —— 但那是 `ConfigCenter` 的方法，
+                #    `BrainDrawerTab` 上没有（也没有继承关系），抽屉里条目超过
+                #    `LIST_PAGE`（200）条时渲染这一行会直接 `AttributeError`。
+                #    改成就地建按钮，样式和配置中心那套次级按钮一致。
+                RoundedButton(inner, f"加载更多（还有 {more} 条）", _more,
+                              kind="ghost", fg=self._c("secondary"),
+                              fill=self._c("inputbg"),
+                              outline=lerp_color(self._c("border"),
+                                                 self._c("secondary"), 0.45),
+                              hover_fill=self._c("active"),
+                              hover_outline=self._c("secondary"),
+                              parent_bg=self._c("bg"),
+                              padx=14, pady=6).pack(pady=12)
             if at_top:
                 cv.yview_moveto(0)
 
@@ -4458,7 +6355,10 @@ class BrainDrawerTab(ttk.Frame):
         win.bind("<Escape>", lambda e: _close())
 
     def _open_trash(self):
-        """回收站：已丢弃条目的**静态列表**，勾出要永久删除的。
+        """回收站：已丢弃条目的**静态列表**，勾出要恢复 / 永久删除的。
+
+        🔴 丢弃**不是删除** —— 每一行都能「← 恢复」捞回丢弃前的状态（v0.3.2 第六节：
+            以前这里只有「删除」，手滑点错「× 丢弃」只能真删掉，和文档承诺的不一致）。
 
         🔴 刻意**不做成轮播**（用户明确要求「不用以泳道形式轮播」）：轮播是
            「过一遍、顺手处理」，回收站是「回头清理」，两种心智不该混在一个界面里。
@@ -4510,11 +6410,28 @@ class BrainDrawerTab(ttk.Frame):
             count_var.set(f"共 {len(sel)} 条 · 已选 {n} 条")
             del_btn.set_text(f"永久删除选中（{n}）")
             del_btn.configure(state="normal" if n else "disabled")
+            res_btn.set_text(f"← 恢复选中（{n}）")
+            res_btn.configure(state="normal" if n else "disabled")
 
         def _toggle_all(on):
             for v in sel.values():
                 v.set(on)
             _refresh_count()
+
+        def _restore(ids):
+            """恢复（←）。可逆 → **不二次确认**；回到丢弃前的状态（store 里逐行判）。
+
+            🔴 **不打通知** —— 条目自己回到轮播舞台和分类列表，那就是反馈
+                （和气泡上改状态的 `_set_status` 同一条规矩：用户明确要求过
+                别为每跳操作弹「已更新 N 条」）。
+            🔴 收尾和 `_purge` 完全一致：重画回收站 + 全局刷新（舞台要立刻
+                把恢复的条目接回去）。
+            """
+            if not ids:
+                return
+            _store.restore_items(ids)
+            _rebuild()
+            self.refresh(self.app.state)
 
         def _purge(ids):
             """真删。**不可逆** → 必须二次确认，且把条数写在提示里。"""
@@ -4537,14 +6454,31 @@ class BrainDrawerTab(ttk.Frame):
             sel[it["id"]] = var
             # 🔴 这里要的是**勾选**，不是开关。`*-round-toggle` 画出来是 iOS 那种
             #    拨杆，拿它做多选没人看得懂（用户原话「哪有用这个开关做选择的」）。
-            #    `bootstyle="primary"` 走的是 checkbutton 那套资源 —— 方框 + 对勾。
-            ttk.Checkbutton(row, variable=var,
-                            bootstyle="primary",
-                            command=_refresh_count).pack(side="left", anchor="n")
+            #    `bootstyle="primary"` 走 checkbutton 那套资源 —— 方框 + 对勾，样式对
+            #    但**画不出圆角**（用户 2026-10-16「多选框也改成圆角」）⇒ 换成
+            #    `RoundedCheck`（圆角方框 + 白勾）。
+            #    · 未选中时的描边用 `lerp_color(border, secondary, .45)` —— 和次级
+            #      按钮同一个口径（`border` 太淡，深色下 1px 框几乎看不见）。
+            #    · 深色下品牌色是浅青（#4fd1c5），白勾对比不够 ⇒ 勾用底色系的深墨。
+            RoundedCheck(row, variable=var, command=_refresh_count,
+                         line=lerp_color(self._c("border"),
+                                         self._c("secondary"), 0.45),
+                         fill=light, on_fill=self._c("primary"),
+                         mark="#0b2a3d" if self.app.theme == THEME_DARK
+                              else "#ffffff",
+                         parent_bg=light).pack(side="left", anchor="n")
             # pack 顺序：左右两侧先各占一边，中间那块再吃掉剩下的宽度
+            # 🔴 两个按钮都 side="right"：先 pack 的占最右。「删除」是危险操作，
+            #    放最右；「← 恢复」在它左边（和浮层里「永久删除」摆最右同规矩）。
             RoundedButton(row, "删除", lambda i=it["id"]: _purge([i]),
                           kind="ghost", radius=9, padx=10, pady=4,
                           font=_font(9), fg=self._c("danger"),
+                          hover_fill=self._c("active"),
+                          parent_bg=light).pack(side="right", anchor="n",
+                                                padx=(8, 0))
+            RoundedButton(row, "← 恢复", lambda i=it["id"]: _restore([i]),
+                          kind="ghost", radius=9, padx=10, pady=4,
+                          font=_font(9), fg=self._c("primary"),
                           hover_fill=self._c("active"),
                           parent_bg=light).pack(side="right", anchor="n",
                                                 padx=(8, 0))
@@ -4591,6 +6525,19 @@ class BrainDrawerTab(ttk.Frame):
                       hover_outline=self._c("primary"),
                       hover_fg=self._c("primary"),
                       parent_bg=self._c("bg")).pack(side="left", padx=(6, 0))
+        # 底部动作条：恢复在左、删除在右（危险操作永远靠最右，可误触最小）
+        res_btn = RoundedButton(foot, "← 恢复选中（0）",
+                                lambda: _restore([i for i, v in sel.items() if v.get()]),
+                                kind="ghost", radius=10, padx=14, pady=5,
+                                font=_font(9),
+                                fg=self._c("primary"), fill=self._c("bg"),
+                                outline=self._c("border"),
+                                hover_fill=self._c("active"),
+                                hover_outline=self._c("primary"),
+                                hover_fg=self._c("primary"),
+                                disabled_fg=self._dim(),
+                                parent_bg=self._c("bg"))
+        res_btn.pack(side="left", padx=(14, 0))
         del_btn = RoundedButton(foot, "永久删除选中（0）",
                                 lambda: _purge([i for i, v in sel.items() if v.get()]),
                                 kind="ghost", radius=10, padx=14, pady=5,
@@ -4602,7 +6549,7 @@ class BrainDrawerTab(ttk.Frame):
                                 hover_fg=self._c("danger"),
                                 disabled_fg=self._dim(),
                                 parent_bg=self._c("bg"))
-        del_btn.pack(side="left", padx=(14, 0))
+        del_btn.pack(side="left", padx=(6, 0))
         # 🔴 这里**不放「关闭」** —— 窗口右上角自带 X，Esc 也关得掉，两个入口重复
         #    （和浮层同一条规矩，用户明确要求过）。
 
