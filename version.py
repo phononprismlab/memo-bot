@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 REPO = "phononprismlab/memo-bot"
 RAW_URL = "https://cdn.jsdelivr.net/gh/{repo}@main/VERSION"
 # jsdelivr 的「这个仓库有哪些版本」接口。🔴 它按 **tag** 列版本，HTTP 缓存 5 分钟，

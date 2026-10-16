@@ -463,29 +463,30 @@ def test_bot():
     check("help_text 追加了扩展帮助行",
           all(h in bot.help_text() for h in bot.EXT.help_lines()))
 
-    # ── 「搜索灵感」指令 +「#」标签（用户 2026-10-12）──
-    # ① 「#」标签切分：词边界（空白 / 标点 / **汉字**）后的 # 开标签区，
-    #    区内按「标点 / 空格 / 换行」切多个名；字母数字后的 # 是词的一部分。
-    check("# 标签：空格 / 汉字后都能开切，区内可切多个名",
-          bot.split_tags("参考这个配色 #设计 UI") == ("参考这个配色", ["设计", "UI"])
+    # ── 「搜索灵感」指令 +「#」标签（用户 2026-10-12，2026-10-16 调整抽词模型）──
+    # ① 「#」标签切分：词边界（空白 / 标点 / **汉字**）后的 # 开**一个**标签，
+    #    取到「空格 / 下一个 # / 结尾」就停；字母数字后的 # 是词的一部分。
+    check("# 标签：空格 / 汉字后都能开切，一个#一个标签（空格后算正文）",
+          bot.split_tags("参考这个配色 #设计 UI") == ("参考这个配色 UI", ["设计"])
           and bot.split_tags("参考配色#设计") == ("参考配色", ["设计"]),
           f"got={bot.split_tags('参考这个配色 #设计 UI')}")
     check("# 标签：字母 / 数字后的 # 不当标签（C# / issue#42 不剪）",
           bot.split_tags("C# 和 Python 都学") == ("C# 和 Python 都学", [])
           and bot.split_tags("issue#42 已修") == ("issue#42 已修", []),
           f"got={bot.split_tags('issue#42 已修')}")
-    check("# 标签：逗号 / 顿号 / 全角标点都算分隔",
-          bot.split_tags("三个词 #设计,UI,参考") == ("三个词", ["设计", "UI", "参考"]),
-          f"got={bot.split_tags('三个词 #设计,UI,参考')}")
-    check("# 标签：重名只留一个",
-          bot.split_tags("x #设计 设计 #设计") == ("x", ["设计"]),
+    check("# 标签：一个#一个标签、空格分隔可写多个",
+          bot.split_tags("三个词 #设计 #UI #参考") == ("三个词", ["设计", "UI", "参考"]),
+          f"got={bot.split_tags('三个词 #设计 #UI #参考')}")
+    check("# 标签：重名只留一个（标签后正文保留）",
+          bot.split_tags("x #设计 设计 #设计") == ("x 设计", ["设计"]),
           f"got={bot.split_tags('x #设计 设计 #设计')}")
     check("# 标签：一条最多 10 个（防 abusive 输入）",
           bot.split_tags("x " + " ".join("#t%d" % i for i in range(15)))[1]
           == ["t%d" % i for i in range(10)],
           f"got={bot.split_tags('x ' + ' '.join('#t%d' % i for i in range(15)))[1]}")
-    check("# 标签：整条都是标签 → 原样返回（不留空正文卡片）",
-          bot.split_tags("#设计 #UI 参考") == ("#设计 #UI 参考", []))
+    check("# 标签：标签写开头 / 整条都标签也照抽，空格后算正文",
+          bot.split_tags("#设计 #UI 参考") == ("参考", ["设计", "UI"])
+          and bot.split_tags("#工作心得 更多内容") == ("更多内容", ["工作心得"]))
     check("# 标签：没有 # 的原文原样",
           bot.split_tags("没有标签") == ("没有标签", []))
 
@@ -523,8 +524,10 @@ def test_bot():
           "IDEA_SEARCH_RE.match(text)" in _bsrc
           and "reply = idea_search_text(q)" in _bsrc
           and "await message.reply(content=reply, msg_seq=1)" in _bsrc)
-    check("两条灵感入库路径都走 split_tags 切标签",
-          _bsrc.count("split_tags(") >= 3)     # def + _store_media + [图·@]
+    check("两条灵感入库路径都走 split_tags 切标签（已从 bot 迁到 store 共用）",
+          _bsrc.count("split_tags(") >= 2)     # _store_media + [图·@]（def 已迁 store.py）
+    check("🔴 空判据在切标签之后，且带 `not tags`（只发一个 #标签 别被当空消息丢掉）",
+          "if not body and not tags and not quote_snapshot:" in _bsrc)
     check("帮助菜单有「搜索灵感」和「# 标签」两行",
           "搜索灵感 <关键词>" in _bsrc and "写灵感带 # 号" in _bsrc)
 
@@ -2840,8 +2843,8 @@ def test_gui_source():
           and "def _load_items" in src and "def _list_items" in src)
     check("🖥 decided 过闸时按「已整理」一档判（与 done 合并显示）",
           'show_b = "done" if b == "decided" else b' in src)
-    check("🖥 只有轮播舞台套 bubbles_show 闸（列表/回收站不受限）",
-          "self._collect(self._rows(), gate_show=True)" in src
+    check("🖥 只有轮播舞台套 bubbles_show 闸（列表/回收站不受限；选标签时让位）",
+          "self._collect(self._rows(), gate_show=not self._tag)" in src
           and "gate_show=False" in src
           and "def _list_items(self, group=None, sub=None, bucket=None, query=None" in src)
     # 🔴 列表 / 搜索走 **SQL 分页**（审查报告：500 条固定窗口会隐藏更早的数据）。
@@ -4045,6 +4048,41 @@ def test_dirty_tracking():
           "class _PathList(ttk.Frame):" in src
           and "pl = _PathList(wrap, self, val, self._on_input)" in src
           and "isinstance(var, _PathList)" in src)
+    # 🔴 _PathList.get() 必须把反斜杠归一为正斜杠（和 _base_value / .env 落盘
+    #    口径一致）—— 否则「保存后切页签依然跳出未保存」（用户 2026-10-16 报的）：
+    #    `_add` 用 `os.path.normpath` 进来是反斜杠，`.env` 里是 `write_env` 转过
+    #    的正斜杠，`_norm_val` 一比就假脏。
+    _pl_src = src.split("class _PathList(ttk.Frame):", 1)[1].split(
+        "class _UnsavedDialog", 1)[0]
+    _pl_get = _pl_src.split("def get(self):", 1)[1].split(
+        "def set(self, paths):", 1)[0]
+    check("🔴 _PathList.get() 把反斜杠归一为正斜杠"
+          "（和 _base_value / .env 落盘口径一致；否则保存后切页签假脏）",
+          'p.replace("\\\\", "/")' in _pl_get)
+    # 实跑：把 get() 从源码摘出来，挂到空 stub 上跑（memo_gui 整体依赖 tkinter，
+    # 单测环境没有，但 get() 本身不碰任何控件 —— 跟 _base_value 同套路）。
+    _pl_ns = {"re": re}
+    for _cls in tree.body:
+        if isinstance(_cls, ast.ClassDef) and _cls.name == "_PathList":
+            for _m in _cls.body:
+                if isinstance(_m, ast.FunctionDef) and _m.name == "get":
+                    exec(ast.get_source_segment(src, _m), _pl_ns)
+    _pl_get_func = _pl_ns.get("get")
+    if _pl_get_func:
+        class _PathListStub:
+            pass
+        _stub = _PathListStub()
+        _stub._paths = ["C:\\Users\\A", "C:\\Users\\B"]
+        check("🖥 _PathList.get() 实跑：全反斜杠 → 全正斜杠",
+              _pl_get_func(_stub) == "C:/Users/A\nC:/Users/B")
+        _stub._paths = ["C:/X", "C:\\Y"]
+        check("🖥 _PathList.get() 实跑：混合斜杠全归一为正斜杠",
+              _pl_get_func(_stub) == "C:/X\nC:/Y")
+        _stub._paths = []
+        check("🖥 _PathList.get() 实跑：空列表返回空串",
+              _pl_get_func(_stub) == "")
+    else:
+        check("🖥 _PathList.get() 实跑（提取失败，跳过）", False, "extraction failed")
     check("🔴 颜色三选一：点选**立刻预览**，但落盘只走「保存更改」",
           "def _pick_theme(self, mode):" in src
           and 'self._pending.setdefault(self.current, {})[("ui", "theme")] = mode' in src
@@ -4223,6 +4261,104 @@ def test_dirty_tracking():
           and 'base[("__moyu__", "groups")]' in src)
     check("🖥 恢复内置 = 未保存改动作废（内容被已保存值取代）",
           "if ok:\n            # 恢复内置 = 内容已被已保存值取代" in src)
+
+    # ── 列表 / 回收站的行容器改圆角卡片（用户 2026-10-16「列表里面的这种框还不是圆角」）
+    check("🖥 🔴 列表行改圆角自绘（tk.Frame 是直角矩形）",
+          "class RoundedCard(tk.Canvas):" in src
+          and "card = RoundedCard(inner" in src
+          and "row = card.body" in src
+          and 'row = tk.Frame(inner, bg=light, padx=12, pady=9)' not in src)
+    _rc = re.search(r"\nclass RoundedCard\(tk\.Canvas\):.*?"
+                    r"(?=\nclass |\n# ──|\Z)", src, re.S)
+    _rc_code = _rc.group(0) if _rc else ""
+    # 🔴 只看 `_draw` 的函数体：类 docstring 里把 `delete("all")` 这个写法本身
+    #    写了出来讲原因，整段匹配会误伤（同 ⑩/⑪/⑬ 三轮教训）。
+    _rc_draw = _rc_code.split("    def _draw(self):")[-1]
+    check("🖥 🔴 圆角卡片 delete(\"all\") 会连内嵌 body 的窗口项一起删掉",
+          'delete("all")' not in _rc_draw
+          and 'delete("bg")' in _rc_draw and 'tags="bg"' in _rc_draw
+          and "tag_lower" in _rc_draw)
+    check("🖥 🔴 圆角卡片高度随内容长（只在变了才 configure，否则互推死循环）",
+          "def _fit(self):" in _rc_code
+          and "self.body.winfo_reqheight()" in _rc_code
+          and "if abs(cur - h) > 1:" in _rc_code
+          and 'self.body.bind("<Configure>"' in _rc_code)
+    # 🔴 性能护栏：`_fit` 里**不许** `update_idletasks()` —— 那是全量 idle flush，
+    #    每张卡都调就是 O(n²)（后 10 次 `_fit` 是前 10 次的 8.6 倍），
+    #    真机 110 条实测 2235ms → 去掉后 382ms（`_probe/card_perf2.py`）。
+    #    ⚠️ 只看**代码行**：`_fit` 的 docstring 里为了讲清原因把这个写法本身写了
+    #    出来，整段匹配会误伤（同 §52.9 那条教训）。
+    _rc_fit_raw = _rc_code.split("    def _fit(self):")[1].split("    def ")[0]
+    _rc_fit = (_rc_fit_raw.split('"""')[2]
+               if _rc_fit_raw.count('"""') >= 2 else _rc_fit_raw)
+    check("🖥 🔴 圆角卡片 `_fit` 里不许 update_idletasks（O(n²) 全量 flush）",
+          "update_idletasks" not in _rc_fit
+          and "winfo_reqheight()" in _rc_fit)
+    check("🖥 回收站行也用同一个圆角卡片（两处口径一致）",
+          "card = RoundedCard(inner, radius=10, pad=11, fill=light," in src
+          and src.count("card = RoundedCard(inner") >= 2)
+    # 🔴 折行性能护栏：宽度必须「按块量 + 累加」，不是一个块把整串再量一遍。
+    _sw = src.split("def _soft_wrap(text, width, size, weight=None):")[1].split(
+        "\ndef ")[0]
+    check("🖥 🔴 `_soft_wrap` 按块累加量宽（整串重量 = O(块数) 次 Tk 往返）",
+          "w_line + w_seg <= avail" in _sw
+          and "font.measure(line + seg)" not in _sw
+          and "w_piece + w_ch > avail" in _sw)
+    check("🖥 量字结果有缓存（`Font.measure` 是 Tk 往返，110 行实测 2643 次）",
+          "def _measure(size, weight, s):" in _sw or "def _measure(size, weight, s):" in src)
+    # 🔴 字体对象 / 量宽 / 度量三样都要缓存 —— `tkfont.Font(...)`、`measure`、
+    #    `metrics` 各是一趟 Tk 往返，`RoundedButton` 原来每个按钮各来一遍：
+    #    列表 110 行 223 个按钮实测 115ms（`_probe/card_profile.py`）。
+    check("🖥 🔴 字体 / 量宽 / 度量走缓存（223 个按钮实测 115ms）",
+          "def _tk_font(spec):" in src
+          and "def _font_measure(spec, s):" in src
+          and "def _font_metric(spec, name):" in src
+          and "tkfont.Font(font=font)" not in src)
+    check("🖥 🔴 字体缓存 key = 解析后元组（含用户调过的字号，改字号自动换 key）",
+          "return _tk_font(_font(size, weight))" in src)
+
+
+def test_release_consistency():
+    """[35] 发版一致性：版本号散在五个地方，发版时最容易漏改其中一处。
+
+    🔴 漏改的后果都不报错、只是**静默不一致**：
+      · `version.py` 的 VERSION 没改 → 「检查更新」永远认为已是最新（用户升不了级）；
+      · README 的更新日志链接没改 → 点进去 404；
+      · 功能清单 / 安装指南 的版本没改 → 用户拿到的文档对不上安装包。
+    """
+    print("\n[35] 发版一致性（VERSION / version.py / README / 两份用户文档 / 更新日志）")
+
+    vfile = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
+    check("VERSION 文件是 x.y.z", bool(re.fullmatch(r"\d+\.\d+\.\d+", vfile)), vfile)
+
+    _vsrc = open(os.path.join(ROOT, "version.py"), encoding="utf-8").read()
+    m = re.search(r'^VERSION = "([^"]+)"', _vsrc, re.M)
+    check("🔴 version.py 的 VERSION 与 VERSION 文件一致",
+          m is not None and m.group(1) == vfile,
+          f"VERSION={vfile} version.py={m.group(1) if m else None}")
+
+    # 安装脚本**不写死版本**，直接从 VERSION 文件读（保证安装包名跟着走）
+    _iss = open(os.path.join(ROOT, "packaging", "memo-bot.iss"),
+                encoding="utf-8").read()
+    check("🔴 安装脚本从 VERSION 文件读版本（不写死）",
+          'MyAppVersion Trim(FileRead(FileOpen(RepoDir + "\\VERSION")))' in _iss
+          and f'MyAppVersion "{vfile}"' not in _iss)
+
+    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    check("README 的更新日志链接指向当前版本的日志文件",
+          f"[更新日志](v{vfile}更新日志.md)" in readme)
+
+    logname = f"v{vfile}更新日志.md"
+    check("当前版本的更新日志文件存在", os.path.isfile(os.path.join(ROOT, logname)),
+          logname)
+    if os.path.isfile(os.path.join(ROOT, logname)):
+        _log = open(os.path.join(ROOT, logname), encoding="utf-8").read()
+        check("更新日志里有 `## v<当前版本>` 这一节", f"## v{vfile}" in _log)
+        check("更新日志保留「更早版本」表", "## 更早版本" in _log)
+
+    for name, label in (("功能清单.md", "功能清单"), ("安装指南.md", "安装指南")):
+        t = open(os.path.join(ROOT, name), encoding="utf-8").read()
+        check(f"{label} 标了当前版本 v{vfile}", f"v{vfile}" in t)
 
 
 def test_taskbar_icon():
@@ -4414,6 +4550,161 @@ def test_trash_restore():
           seg.count("_rebuild()") >= 2 and "self.refresh(self.app.state)" in seg)
 
 
+def test_split_tags():
+    """🔴 ⑯ 轮修复：桌面端编辑灵感正文也要像 bot 收消息一样把 `#标签` 抽出来。
+
+    这份 split_tags 是 bot 与桌面端 **共用** 的（迁到 store.py），所以这里既验
+    切分边界逻辑，也验「桌面端编辑路径真的走了它、且标签并回现有标签不丢手加的」。
+    """
+    print("\n[33] 「#」标签抽取（bot 与桌面端共用 split_tags）")
+    import store
+    sp = store.split_tags
+
+    c, tg = sp("参考这个配色 #设计 UI")
+    check("汉字/空白后 # 认，一个#一个标签（空格后算正文）",
+          c == "参考这个配色 UI" and tg == ["设计"])
+    c, tg = sp("#工作心得 更多内容")
+    check("🔴 标签写在开头也抽（不要求 # 前有正文，空格后即正文）",
+          c == "更多内容" and tg == ["工作心得"])
+    c, tg = sp("参考配色#设计")
+    check("汉字后直接跟 # 也认（无空格）", c == "参考配色" and tg == ["设计"])
+    c, tg = sp("C# 和 Python 都学")
+    check("字母后的 # 不动（C#）", c == "C# 和 Python 都学" and tg == [])
+    c, tg = sp("issue#42 已修")
+    check("字母后的 # 不动（issue#42）", c == "issue#42 已修" and tg == [])
+    c, tg = sp("看这里 #设计#UI")
+    check("连写 #a#b 一个#一个标签切开（# 也是结束符）",
+          c == "看这里" and tg == ["设计", "UI"])
+    c, tg = sp("配色＃设计")  # 全角 ＃ 也认
+    check("全角 ＃ 也认", c == "配色" and tg == ["设计"])
+    c, tg = sp("#设计 #UI")
+    check("整条都标签（正文掏空）也照抽，正文为空", c == "" and tg == ["设计", "UI"])
+    c, tg = sp("没有标签的一句")
+    check("没有 # 原样返回、空标签", c == "没有标签的一句" and tg == [])
+    # 标签数封顶：给 15 个、正文在前面，期望只留 10 个
+    c, tg = sp("正文 " + " ".join(f"#t{i}" for i in range(15)))
+    check("标签数封顶 TAG_MAX_PER_ITEM(10)", c == "正文" and len(tg) == 10)
+
+    # ── 桌面端编辑正文也抽标签（与 bot 一致）：模拟 _toggle_edit 的落库
+    _orig_db = store.DB
+    tmpd = tempfile.mkdtemp(prefix="memo_split_")
+    try:
+        store.DB = os.path.join(tmpd, "t.db")
+        store.init()
+        it = store.add_memo("g", "gn", "s", "sn", "原始正文",
+                            kind=store.KIND_IDEA, tags=["旧标签"])
+        iid = it["id"]
+        # 编辑正文，写进 #新标签（body 在 # 之前，抽出来的是干净的单标签）
+        new = "改了正文 #新标签"
+        body, picked = store.split_tags(new)
+        store.update_content(iid, body)
+        existing = list(store.get_item(iid)["tags"] or [])
+        merged = existing[:]
+        for t in picked:
+            if t not in merged:
+                merged.append(t)
+        store.set_item_tags(iid, merged)
+        row = store.get_item(iid)
+        check("🔴 桌面端编辑：正文摘除 #标签、标签并回现有（不丢手加的）",
+              row["content"] == "改了正文"
+              and set(row["tags"]) == {"旧标签", "新标签"})
+        # 编辑没写 # 时正文原样（不做额外空白归一）
+        store.update_content(iid, "  带首尾空格  ")
+        check("编辑没 # 时正文原样落库（保留首尾空格）",
+              store.get_item(iid)["content"] == "  带首尾空格  ")
+    finally:
+        store.DB = _orig_db
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+    # ── 源码护栏：保证这份修复不会被回归掉
+    _gui = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    check("🔴 桌面端编辑正文走 store.split_tags（修复 ⑯：#标签 桌面端也生效）",
+          "_store.split_tags(new)" in _gui)
+    _bot = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    _str = open(os.path.join(ROOT, "store.py"), encoding="utf-8").read()
+    check("🔴 split_tags 只在 store.py 定义一份（bot 只 import，不再自带）",
+          "def split_tags(text):" in _str
+          and "def split_tags(text):" not in _bot
+          and "    split_tags," in _bot)
+
+
+def test_tag_filter_ignores_bubbles_show():
+    """🔴 ⑰ 轮：选了标签时，`bubbles_show`（配置中心「思维流展示范围」）**不该限制**用户的显式查询。
+
+    旧行为：`_load_items` 先套 `gate_show=True`（按 bubbles_show 过滤桶），
+    再叠标签筛 ⇒ 用户选「工作」只看到 `bubbles_show` 允许的桶里的「工作」，
+    其他桶（done / decided）里同标签的全被吞了。
+    新行为：选了标签就 `gate_show=not self._tag`，让用户看到含该标签的全部（dropped 仍走回收站）。
+
+    这条测试分两层：
+    ① 源码护栏：钉住 `gate_show=not self._tag` 这个写法。
+    ② 数据层：模拟新行为 vs 旧行为在「open + done 都标了 #工作、bubbles_show=[open]」下的差异。
+    """
+    print("\n[34] 标签筛选无视 bubbles_show（用户 2026-10-16 反馈）")
+
+    # ① 源码护栏
+    _gui = open(os.path.join(ROOT, "memo_gui.py"), encoding="utf-8").read()
+    _load = _gui.split("def _load_items(self):", 1)[1]
+    _load = _load.split("def _list_items(self", 1)[0]
+    check("🔴 _load_items 用 `gate_show=not self._tag`（选了标签就关 bubbles_show 闸）",
+          "gate_show=not self._tag" in _load
+          and "gate_show=True" not in _load)
+    check("🔴 docstring 写明「bubbles_show 只影响默认展示」（解释为什么这条护栏要这么严）",
+          "bubbles_show" in _load and "默认展示" in _load)
+
+    # ② 数据层：模拟新旧两种行为对照
+    import store, settings as _s
+    _orig_db = store.DB
+    _s_orig = _s.get("bubbles_show")
+    tmpd = tempfile.mkdtemp(prefix="tag_filter_")
+    try:
+        store.DB = os.path.join(tmpd, "t.db")
+        store.init()
+        # 配置中心把思维流展示范围限到 open
+        _s.set_value("bubbles_show", ["open"])
+
+        def _mk(content, status, tag):
+            m = store.add_memo("g", "", "s", "", content, kind=store.KIND_IDEA)
+            if tag:
+                store.set_item_tags(m["id"], [tag])
+            if status != store.STATUS_OPEN:
+                store.set_idea_status([m["id"]], status)
+            return m
+
+        # open + done 各两条标 #工作；open 再加一条不带标签
+        o1 = _mk("open 工作 1", store.STATUS_OPEN, "工作")
+        o2 = _mk("open 工作 2", store.STATUS_OPEN, "工作")
+        o3 = _mk("open 无标签", store.STATUS_OPEN, None)
+        d1 = _mk("done 工作 1", store.STATUS_DONE, "工作")
+        d2 = _mk("done 工作 2", store.STATUS_DONE, "工作")
+        # 另一标签做对照
+        x1 = _mk("open 其他", store.STATUS_OPEN, "其他")
+
+        rows = store.query_items(limit=300)   # dropped 已 SQL 滤掉
+
+        # 旧行为（gate_show=True）：bubbles_show=[open] 只留 open → 2 条 #工作
+        old = [r for r in rows
+               if ("open" if r["status"] == "open" else "done") in ["open"]]
+        old_work = [r for r in old if "工作" in (r.get("tags") or [])]
+        # 新行为（gate_show=False）：不过 bubbles_show 闸，直接全量 → open 2 + done 2 = 4 条
+        new = list(rows)
+        new_work = [r for r in new if "工作" in (r.get("tags") or [])]
+
+        check("数据层：旧行为 #工作 只 2 条（漏掉 done 桶 2 条 = 用户报的 bug）",
+              len(old_work) == 2)
+        check("🔴 新行为 #工作 全 4 条（无视 bubbles_show = 用户期望）",
+              len(new_work) == 4)
+        # 不选标签时旧行为仍是默认限 open（这条不能回归）
+        check("不选标签时仍按 bubbles_show=[open] 限（默认展示不能被回归掉）",
+              len([r for r in rows
+                   if ("open" if r["status"] == "open" else "done") in ["open"]]) == 4)
+    finally:
+        store.DB = _orig_db
+        if _s_orig is not None:
+            _s.set_value("bubbles_show", _s_orig)
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("memo-bot 回归测试")
@@ -4438,8 +4729,11 @@ def main():
     test_quote_merge()
     test_account_alert()
     test_dirty_tracking()
+    test_release_consistency()
     test_taskbar_icon()
     test_trash_restore()
+    test_split_tags()
+    test_tag_filter_ignores_bubbles_show()
     test_settings()
     test_config_web()
     test_console_encoding()

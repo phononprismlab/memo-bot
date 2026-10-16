@@ -1085,6 +1085,83 @@ class RoundedArea(tk.Canvas):
         self.tag_lower("bg")
 
 
+class RoundedCard(tk.Canvas):
+    """圆角卡片外壳（列表 / 回收站里的一行）。
+
+    干嘛的：列表窗口和回收站里每一行原来是个 `tk.Frame` —— 一个直角矩形，
+               满屏圆角控件里就这些行是方角（用户 2026-10-16「列表里面的这种框
+               还不是圆角」）。这里给行套一层 Canvas 圆角外壳。
+    谁调用它：`BrainDrawerTab._open_list` 的 `_row`、`_open_trash` 的 `_row`。
+
+    🔴 内层是**真 `tk.Frame`**（`self.body`），调用方把内容摆进 `body` 里 ——
+       和 `RoundedArea` 一个套路（真控件在 ⇒ 绑定 / 光标 / 布局口径全不变）。
+    🔴 **高度必须跟着内容长**：正文 1~3 行、有没有「结论」行都不一定，
+       所以不能像 `RoundedArea` 那样靠外部显式 `refit()`，得在 `body` 的
+       `<Configure>` 里比 `winfo_reqheight()`：变了才 `configure(height=)`。
+       ⚠️ 不能无条件 configure —— Canvas 的 `<Configure>` 会回过来改 body 宽度，
+       两边互推就是**死循环**（界面卡死，且不报错）。
+    🔴 **`_fit()` 里不许 `update_idletasks()`** —— 那是全量 idle flush，列表
+       一多就是 O(n²)（详见 `_fit` 的 docstring，真机实测 2235ms → 382ms）。
+    🔴 `_draw()` 只 `delete("bg")`，绝不 `delete("all")` —— 内嵌的 `body` 是
+       `create_window` 挂的**窗口项**，会被一起删掉（§52.9 铁律①）。
+    """
+
+    def __init__(self, master, *, radius=10, pad=11, fill=None, line=None,
+                 parent_bg=None):
+        self._pad, self._radius = pad, radius
+        if parent_bg is None:
+            try:
+                parent_bg = master["bg"]
+            except (tk.TclError, KeyError):
+                parent_bg = "#f7f9fa"
+        self._bgc = parent_bg
+        self._fill = fill or "#ffffff"
+        self._line = line
+        super().__init__(master, highlightthickness=0, bd=0, bg=self._bgc)
+        self.body = tk.Frame(self, bg=self._fill)
+        self._win = self.create_window(pad, pad, window=self.body, anchor="nw")
+        self.bind("<Configure>", self._on_resize)
+        self.body.bind("<Configure>", lambda _e=None: self._fit())
+        self._draw()
+        self.after_idle(self._fit)
+
+    def _fit(self):
+        """把外壳高度贴到内层内容的请求高度（只在真的变了才 configure）。
+
+        🔴 **绝不在这里 `update_idletasks()`**（2026-10-16 性能修复，真机实测）：
+           它是**全量 idle flush** —— 第 n 张卡建好时 flush 的是「前面 n−1 张卡
+           攒下的所有待处理事件」，所以开 110 条列表是 **O(n²)**：合计 2235ms，
+           其中 1887ms 全耗在这个 flush 上，`_draw` 被连带触发 **6379 次**；
+           后 10 次 `_fit` 的均值是前 10 次的 **8.6 倍**（`_probe/card_perf2.py`）。
+           `winfo_reqheight()` 自己就会按需算几何请求，不需要先 flush ——
+           去掉这一行后同一入口 **2235ms → 382ms**，`_draw` 6379 → 220 次。
+        ⚠️ `self["height"]` 是字符串，读的时候兜住空串 / 非数字（配置被外部改过时）。
+        """
+        try:
+            h = self.body.winfo_reqheight() + self._pad * 2
+        except tk.TclError:
+            return
+        try:
+            cur = int(self["height"])
+        except (tk.TclError, ValueError):
+            return
+        if abs(cur - h) > 1:
+            self.configure(height=h)
+
+    def _on_resize(self, e):
+        self.itemconfigure(self._win, width=max(40, e.width - self._pad * 2))
+        self._draw()
+
+    def _draw(self):
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1:                      # 还没被 pack 量过尺寸，先按请求尺寸画
+            w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.delete("bg")
+        round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=self._fill,
+                   outline=self._line or self._fill, width=1, tags="bg")
+        self.tag_lower("bg")
+
+
 class FitScrolledFrame(ScrolledFrame):
     """`ScrolledFrame` 的「装得下就不出滚动条」版。
 
@@ -1321,10 +1398,13 @@ class RoundedButton(tk.Canvas):
             except (tk.TclError, KeyError):
                 parent_bg = fill or fg
         self._bgc = parent_bg
-        f = tkfont.Font(font=font)
-        self._tw = f.measure(text)
+        # 🔴 走缓存版：`tkfont.Font(...)` / `measure` / `metrics` 都是 Tk 往返，
+        #    原来每个按钮各来一遍 —— 列表 110 行 223 个按钮，实测 115ms
+        #    （`_probe/card_profile.py`）。这里只是查表，行为一字不变。
+        f = _tk_font(font)
+        self._tw = _font_measure(font, text)
         w = fixed_width or (self._tw + padx * 2)
-        h = f.metrics("linespace") + pady * 2
+        h = _font_metric(font, "linespace") + pady * 2
         self._fixed_w = fixed_width
         super().__init__(master, width=w, height=h, highlightthickness=0,
                          bd=0, bg=parent_bg, cursor="hand2")
@@ -1364,9 +1444,8 @@ class RoundedButton(tk.Canvas):
 
     def set_text(self, text):
         if text != self._text:
-            f = tkfont.Font(font=self._font)
             self._text = text
-            self._tw = f.measure(text)
+            self._tw = _font_measure(self._font, text)
             if not self._fixed_w:
                 self.configure(width=self._tw + self._padx * 2)
             self._draw()
@@ -1907,8 +1986,11 @@ class _PathList(ttk.Frame):
                「＋ 添加目录…」走系统的选目录对话框。
     谁调用它：`ConfigCenter._render_one_field`（`kind == "paths"`）。
     🔴 `.get()` 必须和 `_base_value()` 对 paths 的换算**一字不差**（换行串、
-       逐行 strip、丢空行），否则脏判据会把没改过的页判成脏 —— 一进页面
-       保存按钮就亮着。
+       逐行 strip、丢空行、**反斜杠归一为正斜杠**）—— 后者读的是 `.env` 落盘
+       后的值（`write_env` 用 `replace("\\", "/")` 归一），而 `_add` 拿
+       `os.path.normpath` 进来的是反斜杠。不归一的话保存后切页签会弹假脏：
+       `_sync_pending` 读出来的 `get()` 是反斜杠、`_base_value` 是正斜杠，
+       `_norm_val` 一比就脏。
     """
 
     def __init__(self, master, cc, paths, on_change):
@@ -1928,8 +2010,16 @@ class _PathList(ttk.Frame):
 
     # ── 读数 / 回填 ──────────────────────────────────────────────
     def get(self):
-        """按 `_base_value()` 的口径交出值：换行串、逐行 strip、丢空行。"""
-        return "\n".join(self._paths)
+        """按 `_base_value()` 的口径交出值：换行串、逐行 strip、丢空行、
+        反斜杠转正斜杠（和 `.env` 落盘后保持一致 —— `write_env` 走
+        `p.replace("\\", "/")` 归一、磁盘上只有正斜杠）。
+
+        🔴 不转的话脏判据会把保存后的页判成脏：`_add` 用 `os.path.normpath`
+           拿到的是反斜杠、新加的那条进 `_paths` 后内存里是反斜杠；`.env`
+           上的却是正斜杠；切页签走 `_sync_pending` 一比较就假脏，「保存
+           之后切页签依然弹未保存」（用户 2026-10-16 报的）。
+        """
+        return "\n".join(p.replace("\\", "/") for p in self._paths)
 
     def set(self, paths):
         if isinstance(paths, str):
@@ -4001,17 +4091,61 @@ def _clean_text(text):
 #    （「我可怎／么话啊」）。这里的规矩是**绝不**在中文之间插断点，
 #    且只在「整块放不下」时才折 —— 不会再犯。
 _BREAK_AFTER = set("/?&=.:,;!@#%+~|\\-_")
-_WRAP_FONTS = {}
+_WRAP_FONTS = {}       # 解析后的字体元组 → tkfont.Font（量宽 / 量行高共用）
+_WRAP_MEASURE = {}     # (字体元组, 文本) → 像素宽
+_WRAP_METRIC = {}      # (字体元组, 度量名) → 数值
+_WRAP_MEASURE_CAP = 60000      # 兜底上限：超了就整体清空（正常场景到不了）
+
+
+def _tk_font(spec):
+    """`tkfont.Font(font=spec)` 的缓存版。
+
+    🔴 为什么要缓存：每次 `tkfont.Font(...)` 都要在 Tcl 侧建一个字体对象（一趟
+       往返）。`RoundedButton.__init__` 原来**每建一个按钮**就建一个 —— 列表
+       110 行有 223 个按钮，实测这一项吃掉 115ms，是开列表的最大单项开销
+       （`_probe/card_profile.py`）。
+    🔴 key 用 `_font()` 出来的**解析后元组**（里面已含用户调过的字号）⇒ 改字号
+       后自动换 key，不会拿到旧字号的 Font。
+    """
+    key = spec if isinstance(spec, str) else (tuple(spec) if spec is not None
+                                              else "")
+    f = _WRAP_FONTS.get(key)
+    if f is None:
+        f = tkfont.Font(font=spec)
+        _WRAP_FONTS[key] = f
+    return f
+
+
+def _font_measure(spec, s):
+    """量 `s` 在 `spec` 字体下的像素宽（带缓存）—— `Font.measure` 也是 Tk 往返。"""
+    key = (spec if isinstance(spec, str) else tuple(spec), s)
+    v = _WRAP_MEASURE.get(key)
+    if v is None:
+        v = _tk_font(spec).measure(s)
+        if len(_WRAP_MEASURE) >= _WRAP_MEASURE_CAP:
+            _WRAP_MEASURE.clear()
+        _WRAP_MEASURE[key] = v
+    return v
+
+
+def _font_metric(spec, name):
+    """读字体度量（`linespace` / `ascent` 等，带缓存）。"""
+    key = (spec if isinstance(spec, str) else tuple(spec), name)
+    v = _WRAP_METRIC.get(key)
+    if v is None:
+        v = _tk_font(spec).metrics(name)
+        _WRAP_METRIC[key] = v
+    return v
 
 
 def _wrap_font(size, weight=None):
     """按字号取（并缓存）一个 Tk 字体对象，用来量像素宽。"""
-    key = (size, weight)
-    f = _WRAP_FONTS.get(key)
-    if f is None:
-        f = tkfont.Font(font=_font(size, weight))
-        _WRAP_FONTS[key] = f
-    return f
+    return _tk_font(_font(size, weight))
+
+
+def _measure(size, weight, s):
+    """量 `s` 在指定字号下的像素宽（带缓存），等价 `_wrap_font(size, weight).measure(s)`。"""
+    return _font_measure(_font(size, weight), s)
 
 
 def _is_cjk(ch):
@@ -4052,10 +4186,13 @@ def _soft_wrap(text, width, size, weight=None):
 
     `width` = 可用像素宽（调用方给的是 wraplength 同级的可用宽）。留 2px 余量，
     免得字体度量取整后仍比 Tk 的边界略宽、被 Tk 再折一次。
+
+    🔴 宽度用**各块累加**（`_measure` 按块量、带缓存），不是「每块都把整串再量
+       一遍」—— 后者是 O(块数) 次 Tk 往返，列表一多就吃掉 185ms。累加口径与
+       整串口径在真实语料上判定**完全一致**（`_probe/wrap_additivity.py`）。
     """
     if not text:
         return text
-    font = _wrap_font(size, weight)
     avail = max(40, int(width) - 2)
     lines = []
     for par in text.split("\n"):
@@ -4063,26 +4200,37 @@ def _soft_wrap(text, width, size, weight=None):
             lines.append("")
             continue
         line = ""
+        w_line = 0
         for seg, _brk in _wrap_chunks(par):
             if seg == " " and not line:
                 continue                      # 行首空格丢掉
-            if font.measure(line + seg) <= avail:
+            w_seg = _measure(size, weight, seg)
+            if w_line + w_seg <= avail:
                 line += seg
+                w_line += w_seg
                 continue
-            if font.measure(seg) > avail:     # 单块自己就超宽 → 硬切
+            if w_seg > avail:                 # 单块自己就超宽 → 硬切
                 if line:
                     lines.append(line.rstrip())
                     line = ""
+                    w_line = 0
                 piece = ""
+                w_piece = 0
                 for ch in seg:
-                    if piece and font.measure(piece + ch) > avail:
+                    w_ch = _measure(size, weight, ch)
+                    if piece and w_piece + w_ch > avail:
                         lines.append(piece)
                         piece = ""
+                        w_piece = 0
                     piece += ch
+                    w_piece += w_ch
                 line = piece
+                w_line = w_piece
             else:
                 lines.append(line.rstrip())
                 line = seg.lstrip()
+                # 换行后重开一行：这一行还剩多少宽要重新起算（一次量宽，不在热路径上）
+                w_line = _measure(size, weight, line) if line else 0
         lines.append(line.rstrip())
     # 去掉末尾可能多出来的空行
     while len(lines) > 1 and lines[-1] == "":
@@ -4759,8 +4907,18 @@ class BrainDrawerTab(ttk.Frame):
         return out
 
     def _load_items(self):
-        """轮播舞台的条目池：展示范围之内的全部（再叠标签筛选）。"""
-        out = self._collect(self._rows(), gate_show=True)
+        """轮播舞台的条目池。
+
+        🔴 选了标签 = 用户明确在问「这个标签下有什么」——
+           `bubbles_show`（配置中心里的「思维流展示范围」）**只影响默认展示**，
+           不该限制用户的显式查询。旧版：闸在标签筛**之前**套上，选了
+           「工作」也只看到 open 桶里那几个，done / decided 桶里同标签的
+           全被吞了（用户 2026-10-16 报的）。
+        `dropped` 还是走回收站（`_collect` 与 SQL 层两道闸分开）—— 两种
+        心智分开，不在本次讨论。
+        """
+        # 选了标签 → 关 bubbles_show 闸；否则照旧按展示范围套闸
+        out = self._collect(self._rows(), gate_show=not self._tag)
         if self._tag:
             out = [x for x in out if self._tag in x["tags"]]
         return out
@@ -5791,13 +5949,30 @@ class BrainDrawerTab(ttk.Frame):
             if editing["on"]:
                 new = editbox.get("1.0", "end").strip()
                 if new and new != it["content"]:
-                    _store.update_content(it["id"], new)
-                    it["content"] = new
-                    txt._orig_text = new
-                    # 🔴 立刻按当前宽度重折：`_fit_card` 有缓存键，改完字如果卡片
-                    #    尺寸没变（比如只改了个错别字），它会直接 return，正文就
-                    #    还是旧的。
-                    _body_fit(new, _fit.get("wl", 520))
+                    # 🔴 「#标签」约定：桌面端编辑正文也要和 bot 收消息一致 ——
+                    #    正文里写 #xxx 就抽成标签、并从正文摘除（store.split_tags
+                    #    返回清过的正文）；抽出来的标签并回现有标签（不打掉标签
+                    #    编辑器里手加的）。没抽到标签时保持原行为、正文原样落库，
+                    #    不做额外的空白归一。
+                    body, picked = _store.split_tags(new)
+                    if picked:
+                        _store.update_content(it["id"], body)
+                        it["content"] = body
+                        txt._orig_text = body
+                        existing = list(it.get("tags") or [])
+                        merged = existing[:]
+                        for t in picked:
+                            if t not in merged:
+                                merged.append(t)
+                        if merged != existing:
+                            _store.set_item_tags(it["id"], merged)
+                            it["tags"] = merged
+                        _body_fit(body, _fit.get("wl", 520))
+                    else:
+                        _store.update_content(it["id"], new)
+                        it["content"] = new
+                        txt._orig_text = new
+                        _body_fit(new, _fit.get("wl", 520))
                     self.refresh(self.app.state)
                     self.app.toast("已保存", True)
                 set_edit_mode(False)
@@ -6238,8 +6413,14 @@ class BrainDrawerTab(ttk.Frame):
         def _row(it):
             memo = it["kind"] == _store.KIND_MEMO
             st = it["status"]
-            row = tk.Frame(inner, bg=light, padx=12, pady=9)
-            row.pack(fill="x", pady=3)
+            # 🔴 圆角卡片外壳（原来是个 `tk.Frame`，直角矩形）—— 见 `RoundedCard`。
+            #    后面所有 `row.xxx` 都指内层真 Frame，布局口径一点没变。
+            card = RoundedCard(inner, radius=10, pad=11, fill=light,
+                               line=lerp_color(self._c("border"),
+                                               self._c("secondary"), 0.35),
+                               parent_bg=self._c("bg"))
+            card.pack(fill="x", pady=3)
+            row = card.body
 
             # 左：文字（点开卡片）
             left = tk.Frame(row, bg=light)
@@ -6448,8 +6629,13 @@ class BrainDrawerTab(ttk.Frame):
 
         def _row(it):
             memo = it["kind"] == _store.KIND_MEMO
-            row = tk.Frame(inner, bg=light, padx=12, pady=9)
-            row.pack(fill="x", pady=3)
+            # 🔴 和分类列表同一个圆角外壳（原来也是 `tk.Frame` 直角）—— 见 `RoundedCard`。
+            card = RoundedCard(inner, radius=10, pad=11, fill=light,
+                               line=lerp_color(self._c("border"),
+                                               self._c("secondary"), 0.35),
+                               parent_bg=self._c("bg"))
+            card.pack(fill="x", pady=3)
+            row = card.body
             var = tk.BooleanVar(value=False)
             sel[it["id"]] = var
             # 🔴 这里要的是**勾选**，不是开关。`*-round-toggle` 画出来是 iOS 那种

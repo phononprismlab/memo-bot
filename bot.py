@@ -67,6 +67,7 @@ from store import (
     STATUS_DECIDED,
     pick_boomerang,
     count_boomerang,
+    split_tags,
 )
 import store as _store
 import moyu
@@ -191,85 +192,10 @@ def handle_event(group_id, group_name, sender_id, sender_name, message):
     return add_memo(group_id, group_name, sender_id, sender_name, content)
 
 
-# ── 「#」标签：写灵感时 # 后面的内容自动变成标签 ────────────────────
-# 约定（用户 2026-10-12）：
-#   · `#` 落在**词边界**时开启一段「标签区」，直到下一个 `#` 或结尾；
-#   · 标签区内部再按「标点 / 空格 / 换行」切成**多个**标签名；
-#   · 标签区从正文里摘掉，只留正文落库。
-# 🔴 词边界 = 空白 / 标点 / **汉字**。汉字算边界是因为中文里「配色#设计」
-#    的 # 就是标签起手（没有空格也认）；而拉丁字母 / 数字后面**不算** ——
-#    「C#」「issue#42」这种 # 是词的一部分，不能剪（真机上两种都出现过）。
-_TAG_OPEN = "#＃"
-_BOUNDARY = set(" \t\r\n,，。;；:：、.．!！?？~～…·/\\|｜+＋()（）[]【】{}「」『』\"'“”‘’<>《》")
-# 标签区内部的分隔符 = 边界字符 + # 自己（「#设计#UI」连写也要切开）
-_TAG_SEP = _BOUNDARY | set(_TAG_OPEN)
-TAG_MAX_PER_ITEM = 10      # 一条最多切几个标签，防「整段话全是 #」的 abusive 输入
-
-
-def _is_tag_boundary(ch):
-    """# 能不能在这个字符后面开标签区（空白 / 标点 / 汉字算，字母数字不算）。"""
-    if ch in _BOUNDARY:
-        return True
-    o = ord(ch)
-    # 常用汉字区（基本区 + 扩展 A + 兼容表 + 扩展 B 起头）—— 标签名本身
-    # 可以含汉字，这里只看「# 前面那个字符」是不是汉字。
-    return (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF
-            or 0xF900 <= o <= 0xFAFF or 0x20000 <= o <= 0x2A6DF)
-
-
-def split_tags(text):
-    """把 `#标签` 片段从正文里摘出来 → `(正文, [标签名...])`。
-
-    干嘛的：聊天里写「参考这个配色 #设计」时，# 后面是用户的分类意图，
-            不该混在正文里。标签落库后，搜索灵感 / 脑内抽屉都能用。
-    谁调用它：bot.py 收灵感的两条入库路径（_store_media / @ 带图兜底）。
-
-    例：
-        "参考这个配色 #设计 UI"   → ("参考这个配色", ["设计", "UI"])
-        "参考配色#设计"           → ("参考配色", ["设计"])       # 汉字后直接跟 #
-        "C# 和 Python 都学"       → ("C# 和 Python 都学", [])   # 字母后的 # 不动
-        "issue#42 已修"           → ("issue#42 已修", [])       # 同理
-        "#设计 #UI 参考"          → 原样返回（整条都是标签、没正文）
-        "没有标签"                → ("没有标签", [])
-    🔴 全是标签、没正文时**原样返回**（不切）—— 空正文的条目在抽屉里
-       就是一张空白卡片，不如把原文留着。
-    """
-    body = text or ""
-    if not any(ch in _TAG_OPEN for ch in body):
-        return body, []
-    tags, keep = [], []
-    i, n, last = 0, len(body), 0
-    while i < n:
-        if body[i] in _TAG_OPEN and (i == 0 or _is_tag_boundary(body[i - 1])):
-            j = i + 1
-            while j < n and body[j] not in _TAG_OPEN:   # 标签区到下一个 # 或结尾
-                j += 1
-            keep.append(body[last:i])
-            # 区内按「标点 / 空格 / 换行 / #」切成多个名字
-            part = []
-            for ch in body[i + 1:j]:
-                if ch in _TAG_SEP:
-                    if part:
-                        nm = "".join(part)
-                        if nm not in tags and len(tags) < TAG_MAX_PER_ITEM:
-                            tags.append(nm)
-                        part = []
-                else:
-                    part.append(ch)
-            if part and len(tags) < TAG_MAX_PER_ITEM:
-                nm = "".join(part)
-                if nm not in tags:
-                    tags.append(nm)
-            last = j
-            i = j
-            continue
-        i += 1
-    keep.append(body[last:])
-    content = re.sub(r"[ \t]+", " ", "".join(keep)).strip()
-    if not content:                      # 全是标签、没正文 → 不切，原文照存
-        return body, []
-    return content, tags
-
+# ── 「#」标签切分 ───────────────────────────────────────────────
+# 🔴 split_tags（含 _TAG_OPEN / _BOUNDARY / _TAG_SEP / TAG_MAX_PER_ITEM /
+#    _is_tag_boundary）已迁到 store.py，bot 与桌面端 GUI **共用同一份**；
+#    本文件只 from store import，详见 store.split_tags 的 docstring。
 
 # ── 收图：把消息里的图片落盘 ──────────────────────────────────────
 # 🔴 **只在「这条消息确实会入库」时才下载** —— 被忽略表拦掉的、被指令吃掉的、
@@ -395,7 +321,7 @@ HELP_BASE = (
     "你好 —— 看我都能干什么（说明里写清了：我没有语言生成能力）\n"
     "帮助 —— 显示本菜单\n"
     "群 / 私聊都可用；不带 @ 的普通发言（含私聊）会自动收作「灵感」，不打扰\n"
-    "写灵感带 # 号：# 后面的内容自动存成标签（空格 / 标点分隔多个）"
+    "写灵感带 # 号：# 后面的词自动存成标签（打完标签补个空格；可写多个）"
 )
 MEMO_LIST_CMDS = {"查待办", "查看待办", "待办列表", "列待办"}
 IDEA_LIST_CMDS = {"查灵感", "查看灵感", "灵感列表", "列灵感"}
@@ -913,11 +839,12 @@ def self_test():
             print(f"  {s.message!r}\n    -> {('已记录: ' + r['content']) if r else '忽略（非待办）'}")
         print("\n=== 「#」标签切分（split_tags）===")
         for s in ("参考这个配色 #设计 UI",
+                  "#工作心得 更多内容",
                   "参考配色#设计",
                   "C# 和 Python 都学",
                   "issue#42 已修",
                   "#设计 #UI 参考",
-                  "设计、UI、参考 三个词 #设计,UI,参考",
+                  "三个词 #设计 #UI #参考",
                   "没有标签"):
             c, tg = split_tags(s)
             print(f"  {s!r}\n    -> 正文 {c!r} / 标签 {tg}")
@@ -1554,17 +1481,20 @@ async def _store_media(message, t, scope, urls, text, mentioned, quote=None):
             except Exception as e:                  # noqa: BLE001  回执失败不影响入库
                 print(f"[引用·回执失败] {type(e).__name__}: {e}", flush=True)
             refers_to = None
+    # 「# 标签」：正文按约定切给标签列（词边界之外的 # 不当标签，见 split_tags）。
+    # 🔴 **只切用户自己敲的那一段，引用块不参与** —— 标签名是从 `#` 一路吃到
+    #    「空格 / 下一个 `#` / **全文末尾**」的，要是把引用块也算进去，引用内容
+    #    里的 `#` 或紧随其后的空白边界都会咬掉一段。引用块是快照，原样保留才对。
+    body, tags = split_tags(body)
+    # 🔴 空判据放在**切标签之后**：正文被标签掏空（body 空但 tags 有）是**有效条目**，
+    #    要存（用户可以把标签写在任意位置、甚至只发一个标签）；真正什么都没有
+    #    （body 空 + tags 空，又没图没引用）才丢弃，不留一张纯空白卡片。
     # 🔴 `quote_snapshot` 也算「有内容」—— **只引用、不写正文**时 body 是空的，
     #    但它必须存下来（v0.3.2 修的就是「只引用一条消息，机器人完全没反应」）。
-    if not body and not quote_snapshot:
+    if not body and not tags and not quote_snapshot:
         if not pics:
             return                                  # 没文本也没图也没引用 → 确实没东西可存
         body = f"[图片 ×{len(pics)}]" if len(pics) > 1 else "[图片]"
-    # 「# 标签」：正文按约定切给标签列（词边界之外的 # 不当标签，见 split_tags）。
-    # 🔴 **只切用户自己敲的那一段，引用块不参与** —— 标签区是从 `#` 一路吃到
-    #    下一个 `#` 或**全文末尾**的，要是把引用块也算进去，引用内容末尾一个 `#`
-    #    就会把后面的正文一起吞成标签名。引用块是快照，原样保留才对。
-    body, tags = split_tags(body)
     if quote_snapshot:
         # 引用块拼在**标签切分之后** —— 顺序反了会把引用块里的 # 也切走
         body, _block = compose_quote(quote_snapshot, body)
